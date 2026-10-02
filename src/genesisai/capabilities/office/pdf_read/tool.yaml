@@ -1,0 +1,4 @@
+name: pdf_read
+enabled: true
+category: office
+description: 读取 PDF 页数、元数据和可提取页面文字

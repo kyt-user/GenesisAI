@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "genesisai"
+version = "0.1.0"
+description = "Single-agent CLI for public research and local document organization"
+requires-python = ">=3.11"
+dependencies = ["openai>=2.0,<3", "httpx>=0.28,<1", "PyYAML>=6,<7", "python-dotenv>=1,<2", "rich>=13,<15", "trafilatura>=2,<3", "brotli>=1,<2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+office = ["pypdf>=6,<7", "python-docx>=1.2,<2", "openpyxl>=3.1,<4", "python-pptx>=1,<2", "reportlab>=4,<5"]
+
+[project.scripts]
+genesisai = "genesisai.app.cli:entry"
+genesis = "genesisai.app.cli:entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+genesisai = ["prompt/templates/**/*.prompt.yaml", "prompt/templates/legacy/*.md", "runtime/builtin_tools/core/*/tool.yaml", "skills/builtin/*/skill.yaml", "skills/builtin/*/SKILL.md", "capabilities/*/*/tool.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = ["live: opt-in public network and real model checks"]
+norecursedirs = ["tests/product_acceptance_dataset", ".genesis", "build", "dist"]

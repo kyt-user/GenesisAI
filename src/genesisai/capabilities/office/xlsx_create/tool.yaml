@@ -1,0 +1,4 @@
+name: xlsx_create
+enabled: true
+category: office
+description: 创建基础 XLSX 并验证工作表和值与公式结构

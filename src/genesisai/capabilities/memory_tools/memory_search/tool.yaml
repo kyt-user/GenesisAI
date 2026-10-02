@@ -1,0 +1,4 @@
+name: memory_search
+enabled: true
+category: memory
+description: 按关键词和类型检索项目 Memory 摘要，不默认加载正文

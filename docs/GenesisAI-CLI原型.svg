@@ -1,0 +1,154 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1120" viewBox="0 0 1600 1120">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#07111f"/>
+      <stop offset="1" stop-color="#0b1627"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#43e6a8"/>
+      <stop offset="1" stop-color="#42bff5"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="28" flood-color="#000814" flood-opacity="0.48"/>
+    </filter>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .mono { font-family: "Cascadia Mono", "JetBrains Mono", "Microsoft YaHei UI", monospace; }
+      .sans { font-family: Inter, "Microsoft YaHei UI", "Segoe UI", sans-serif; }
+      .muted { fill: #76869d; }
+      .soft { fill: #aebbd0; }
+      .bright { fill: #e9f2ff; }
+      .green { fill: #48e0a4; }
+      .cyan { fill: #55c7f3; }
+      .amber { fill: #ffc760; }
+      .red { fill: #ff7b83; }
+      .tiny { font-size: 16px; }
+      .small { font-size: 18px; }
+      .base { font-size: 20px; }
+      .medium { font-size: 22px; }
+      .title { font-size: 28px; font-weight: 700; letter-spacing: 1px; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1120" fill="#040912"/>
+  <circle cx="140" cy="170" r="240" fill="#0b4e49" opacity="0.18"/>
+  <circle cx="1480" cy="980" r="300" fill="#123e67" opacity="0.17"/>
+
+  <g filter="url(#shadow)">
+    <rect x="55" y="42" width="1490" height="1036" rx="22" fill="url(#bg)" stroke="#26364c" stroke-width="2"/>
+    <rect x="55" y="42" width="1490" height="58" rx="22" fill="#101c2d"/>
+    <rect x="55" y="79" width="1490" height="21" fill="#101c2d"/>
+  </g>
+
+  <!-- Window chrome -->
+  <circle cx="88" cy="71" r="7" fill="#ff6b74"/>
+  <circle cx="113" cy="71" r="7" fill="#ffc45c"/>
+  <circle cx="138" cy="71" r="7" fill="#47d597"/>
+  <text x="800" y="78" text-anchor="middle" class="mono small soft">GenesisAI — D:\Projects\my-app</text>
+
+  <!-- Brand and session header -->
+  <rect x="82" y="125" width="1436" height="100" rx="14" fill="#0c1929" stroke="#263951"/>
+  <g transform="translate(108,149)">
+    <path d="M24 0 L48 24 L24 48 L0 24 Z" fill="none" stroke="url(#brand)" stroke-width="4"/>
+    <circle cx="24" cy="24" r="7" fill="#48e0a4" filter="url(#glow)"/>
+  </g>
+  <text x="174" y="167" class="sans title bright">GENESISAI</text>
+  <text x="174" y="198" class="mono small muted">single-agent developer CLI · session 7F2A</text>
+
+  <g class="mono tiny">
+    <rect x="758" y="146" width="205" height="34" rx="17" fill="#11283a" stroke="#24506a"/>
+    <circle cx="779" cy="163" r="5" fill="#48e0a4"/>
+    <text x="794" y="169" class="cyan">deepseek-v4-flash</text>
+
+    <rect x="978" y="146" width="118" height="34" rx="17" fill="#322817" stroke="#72582b"/>
+    <text x="997" y="169" class="amber">MODE: ASK</text>
+
+    <rect x="1111" y="146" width="132" height="34" rx="17" fill="#132a25" stroke="#285c4c"/>
+    <text x="1131" y="169" class="green">● main clean</text>
+
+    <rect x="1258" y="146" width="229" height="34" rx="17" fill="#171f31" stroke="#34415a"/>
+    <text x="1277" y="169" class="soft">context 18% · tools 2/10</text>
+  </g>
+  <text x="758" y="205" class="mono tiny muted">Skill: test-fix</text>
+  <text x="930" y="205" class="mono tiny muted">Memory: project · 6 entries</text>
+  <text x="1238" y="205" class="mono tiny muted">/status  /tools  /diff  /help</text>
+
+  <!-- User request -->
+  <line x1="108" y1="258" x2="1490" y2="258" stroke="#203146"/>
+  <text x="108" y="295" class="mono base green">❯</text>
+  <text x="142" y="295" class="mono base bright">修复当前失败的单元测试，并告诉我改了什么</text>
+
+  <!-- Planning block -->
+  <rect x="108" y="325" width="1382" height="112" rx="12" fill="#0b1726" stroke="#25374e"/>
+  <rect x="108" y="325" width="5" height="112" rx="2" fill="#55c7f3"/>
+  <text x="134" y="357" class="sans small cyan" font-weight="700">计划</text>
+  <text x="210" y="357" class="mono tiny muted">已匹配 Skill</text>
+  <rect x="336" y="338" width="104" height="27" rx="13" fill="#102d3d"/>
+  <text x="350" y="357" class="mono tiny" fill="#55c7f3">test-fix</text>
+  <text x="134" y="393" class="mono small soft">1 读取测试输出   2 定位相关代码   3 最小修改   4 运行测试   5 检查 diff</text>
+  <text x="134" y="421" class="mono tiny muted">按需加载：</text>
+  <text x="245" y="421" class="mono tiny green">file_search</text>
+  <text x="365" y="421" class="mono tiny green">file_read</text>
+  <text x="462" y="421" class="mono tiny green">apply_patch</text>
+  <text x="582" y="421" class="mono tiny green">test_run</text>
+  <text x="680" y="421" class="mono tiny green">git_diff</text>
+
+  <!-- Timeline -->
+  <line x1="127" y1="468" x2="127" y2="776" stroke="#2c4159" stroke-width="2"/>
+
+  <circle cx="127" cy="478" r="7" fill="#48e0a4"/>
+  <text x="153" y="485" class="mono small bright">搜索测试失败位置</text>
+  <text x="425" y="485" class="mono tiny muted">file_search</text>
+  <text x="585" y="485" class="mono tiny green">✓ 3 matches · 41 ms</text>
+
+  <circle cx="127" cy="528" r="7" fill="#48e0a4"/>
+  <text x="153" y="535" class="mono small bright">读取相关实现和测试</text>
+  <text x="425" y="535" class="mono tiny muted">file_read × 2</text>
+  <text x="585" y="535" class="mono tiny green">✓ 186 lines · 18 ms</text>
+
+  <circle cx="127" cy="578" r="7" fill="#ffc760"/>
+  <text x="153" y="585" class="mono small bright">准备修改</text>
+  <text x="297" y="585" class="mono tiny muted">apply_patch</text>
+  <text x="445" y="585" class="mono tiny amber">需要确认</text>
+
+  <!-- Confirmation card -->
+  <rect x="153" y="608" width="1337" height="160" rx="12" fill="#211c13" stroke="#85682e" stroke-width="1.5"/>
+  <rect x="153" y="608" width="6" height="160" rx="3" fill="#ffc760"/>
+  <text x="181" y="642" class="sans small amber" font-weight="700">◆ 允许本次文件修改？</text>
+  <text x="181" y="675" class="mono tiny soft">src/genesisai/tools/registry.py</text>
+  <text x="181" y="706" class="mono tiny muted">+12  −4   ·   修正重复工具名校验，并保留原始错误上下文</text>
+
+  <rect x="181" y="724" width="160" height="30" rx="7" fill="#2d6e55" stroke="#48e0a4"/>
+  <text x="199" y="745" class="mono tiny bright">[1] 允许一次</text>
+  <rect x="353" y="724" width="119" height="30" rx="7" fill="#2b2025" stroke="#7a3c49"/>
+  <text x="372" y="745" class="mono tiny soft">[2] 拒绝</text>
+  <rect x="484" y="724" width="144" height="30" rx="7" fill="#192231" stroke="#3a4a60"/>
+  <text x="503" y="745" class="mono tiny soft">[3] 查看 diff</text>
+  <text x="1270" y="745" class="mono tiny muted">仅本次 · 参数已冻结</text>
+
+  <!-- Continue after approval -->
+  <circle cx="127" cy="807" r="7" fill="#48e0a4"/>
+  <text x="153" y="814" class="mono small bright">修改已应用</text>
+  <text x="328" y="814" class="mono tiny green">✓ hash verified</text>
+
+  <circle cx="127" cy="854" r="7" fill="#48e0a4"/>
+  <text x="153" y="861" class="mono small bright">运行相关测试</text>
+  <text x="328" y="861" class="mono tiny muted">pytest tests/test_registry.py -q</text>
+  <text x="682" y="861" class="mono tiny green">✓ 8 passed · 0.72s</text>
+
+  <!-- Final result -->
+  <rect x="108" y="890" width="1382" height="116" rx="12" fill="#0d211d" stroke="#285746"/>
+  <rect x="108" y="890" width="5" height="116" rx="2" fill="#48e0a4"/>
+  <text x="134" y="922" class="sans small green" font-weight="700">✓ 任务完成</text>
+  <text x="134" y="954" class="mono tiny soft">修复工具注册表的重复名称校验；修改 1 个文件（+12 −4）。</text>
+  <text x="134" y="982" class="mono tiny soft">验证：8 passed   ·   Memory：已记录测试命令   ·   输入 /diff 查看完整变更</text>
+
+  <!-- Input line -->
+  <rect x="82" y="1027" width="1436" height="40" rx="10" fill="#0a1422" stroke="#2b3d55"/>
+  <text x="105" y="1053" class="mono base green">❯</text>
+  <text x="139" y="1053" class="mono small muted">继续输入任务，或使用 /help 查看命令</text>
+  <rect x="1490" y="1039" width="2" height="17" fill="#48e0a4"/>
+</svg>

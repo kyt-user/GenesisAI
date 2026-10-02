@@ -1,0 +1,4 @@
+name: memory_write
+enabled: true
+category: memory
+description: 写入用户明确要求记住或具有可靠来源的项目 Memory

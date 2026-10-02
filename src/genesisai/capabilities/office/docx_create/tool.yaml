@@ -1,0 +1,4 @@
+name: docx_create
+enabled: true
+category: office
+description: 创建基础 DOCX 并重新打开验证产物结构

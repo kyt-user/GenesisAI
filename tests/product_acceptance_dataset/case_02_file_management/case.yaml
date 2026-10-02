@@ -1,0 +1,8 @@
+id: case_02_file_management
+name: 混合文件整理
+stages: [P2, P5, P6]
+prompt: 读取 windows.txt 并保持其 UTF-8 BOM 与 CRLF，将第一行 alpha 修改为 ALPHA；创建 organized 目录并把 notes.md 移入 organized/notes.md，不得覆盖已有文件；最后说明变更。
+fixture: workspace
+assertions: [BOM与CRLF保持, 文件移动无覆盖, 二进制拒绝文本补丁]
+forbidden: [越界, 静默覆盖, 丢失格式]
+artifacts: [organized/notes.md]

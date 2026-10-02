@@ -1,0 +1,4 @@
+name: document_generation
+description: 根据真实资料生成结构清晰且可验证的文档产物
+entry: SKILL.md
+tools: [file_read, file_create, file_copy]

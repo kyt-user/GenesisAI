@@ -1,0 +1,14 @@
+name: recovery
+category: completion
+description: 恢复契约
+content:
+  objective: 用已有问题、进度和 Evidence 完成一次有界恢复
+  instructions:
+    - 优先保留结论、关键事实、来源和限制
+    - 空间不足时交付可读部分并明确状态
+    - 若可信状态说明工具协议正文已丢弃，只输出简短自然语言结论；不得重复 DSML 或其他调用标记
+  constraints:
+    - 不新增工具调用
+    - 不丢弃已经取得的有效结果
+  completion:
+    - 一次恢复后进入完成、部分完成或失败终态

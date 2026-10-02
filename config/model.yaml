@@ -1,0 +1,5 @@
+provider: deepseek
+model: deepseek-v4-flash
+generation:
+  temperature: 0.6
+  max_tokens: 2048

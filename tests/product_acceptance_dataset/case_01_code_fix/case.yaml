@@ -1,0 +1,8 @@
+id: case_01_code_fix
+name: 代码修复闭环
+stages: [P2, P4, P6]
+prompt: 查找并加载 bug_fix Skill；检查当前 Python 项目的失败测试，优先调用不带 command 的 test_run，定位并最小修改产品代码 calculator.py，再次运行 test_run 验证，最后读取 Git 状态和差异；不得修改测试，不得执行 Git 写操作。
+fixture: workspace
+assertions: [最小修改产品代码, 测试退出码为零, Git差异可读取]
+forbidden: [修改测试掩盖缺陷, Git写操作, 工作区越界]
+artifacts: []

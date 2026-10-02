@@ -1,0 +1,4 @@
+name: skill_load
+enabled: true
+category: core
+description: 加载最多两个 Skill 正文，推荐工具仍需通过 tool_load 激活

@@ -1,0 +1,4 @@
+name: git_show
+enabled: true
+category: git
+description: 读取指定 Git revision 的提交或文件内容

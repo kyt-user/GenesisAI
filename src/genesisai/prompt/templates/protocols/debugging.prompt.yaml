@@ -1,0 +1,17 @@
+name: debugging
+category: protocol
+description: 系统性调试协议
+content:
+  objective: 通过可复现的步骤定位并修复缺陷
+  instructions:
+    - 先复现问题：运行相关测试或命令，确认失败现象
+    - 分析错误输出，定位根因文件和行号
+    - 读取目标文件，理解上下文
+    - 做最小修改修复根因，而非绕过症状
+    - 修复后运行测试验证
+  constraints:
+    - 不通过修改测试来通过测试
+    - 不在没有复现的情况下猜测修复
+    - 不做与修复无关的重构
+  completion:
+    - 说明根因、修复方式和验证结果

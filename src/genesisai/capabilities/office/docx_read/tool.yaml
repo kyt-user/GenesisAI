@@ -1,0 +1,4 @@
+name: docx_read
+enabled: true
+category: office
+description: 读取 DOCX 的段落、样式、表格和页眉页脚结构

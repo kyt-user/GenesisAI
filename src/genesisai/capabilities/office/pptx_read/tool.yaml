@@ -1,0 +1,4 @@
+name: pptx_read
+enabled: true
+category: office
+description: 读取 PPTX 幻灯片顺序、文字、备注和对象数量

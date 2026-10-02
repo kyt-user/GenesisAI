@@ -1,0 +1,4 @@
+name: docx_edit
+enabled: true
+category: office
+description: 从 DOCX 原件生成有限文字替换副本并验证

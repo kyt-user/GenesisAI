@@ -1,0 +1,4 @@
+name: git_diff
+enabled: true
+category: git
+description: 读取未暂存或已暂存 Git diff，不修改索引和工作区

@@ -1,0 +1,11 @@
+name: state_prepare
+category: state
+description: 准备状态
+content:
+  objective: 确认当前目标、工作区、约束和所需能力
+  instructions:
+    - 优先复用当前 Session 已有答案、来源和状态
+  constraints:
+    - 不在准备阶段宣称任务已经完成
+  completion:
+    - 进入直接回答、计划或执行状态

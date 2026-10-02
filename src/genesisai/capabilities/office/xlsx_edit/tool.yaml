@@ -1,0 +1,4 @@
+name: xlsx_edit
+enabled: true
+category: office
+description: 从 XLSX 原件生成指定单元格修改副本并验证

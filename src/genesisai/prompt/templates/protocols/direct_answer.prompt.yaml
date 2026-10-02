@@ -1,0 +1,12 @@
+name: direct_answer
+category: protocol
+description: 普通回答协议
+content:
+  objective: 用已有上下文直接回答无需外部资源的问题
+  instructions:
+    - 优先依据上一轮最终回答和已有来源理解继续、它、这个产品等指代
+    - 只有确实缺少新的实时事实或资料时才申请工具
+  constraints:
+    - 不为普通问答查询 Tool 或 Skill 目录
+  completion:
+    - 回答当前问题并停止

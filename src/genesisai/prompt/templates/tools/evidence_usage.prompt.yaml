@@ -1,0 +1,14 @@
+name: evidence_usage
+category: tool
+description: Evidence 使用
+content:
+  objective: 只使用真实读取且可验证的来源支持事实
+  instructions:
+    - 使用成功读取后登记的 source_ref
+    - 根据可见 Observation 下结论，完整正文保存在 Source Store
+    - 价格数字必须出现在最终引用所对应的已读取正文中；搜索摘要、页面标题和未引用来源中的数字不能支持价格
+  constraints:
+    - 搜索候选、失败页面和未读取 URL 不是正文证据
+    - 不伪造或改写 source_ref
+  completion:
+    - 最终引用都能映射到成功 Source

@@ -1,0 +1,4 @@
+name: git_commit
+enabled: true
+category: git
+description: 提交暂存区的更改，附带提交消息

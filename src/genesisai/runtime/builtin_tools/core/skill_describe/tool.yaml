@@ -1,0 +1,4 @@
+name: skill_describe
+enabled: true
+category: core
+description: 查看一个 Skill 的来源、哈希、工具依赖和覆盖关系

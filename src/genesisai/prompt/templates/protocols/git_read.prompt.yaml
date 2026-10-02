@@ -1,0 +1,12 @@
+name: git_read
+category: protocol
+description: Git 只读协议
+content:
+  objective: 读取 Git 状态和差异以审查当前任务
+  instructions:
+    - 使用 status、diff、log、show 或当前分支读取能力
+    - 区分任务产生的变化与已有工作树变化
+  constraints:
+    - 不执行 commit、push、merge、rebase、reset 或 checkout 写操作
+  completion:
+    - Git 说明与实际命令输出一致

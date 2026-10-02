@@ -1,0 +1,11 @@
+name: state_answer
+category: state
+description: 回答状态
+content:
+  objective: 根据当前真实状态交付结果
+  instructions:
+    - 说明完成项、验证、限制和下一步所需条件
+  constraints:
+    - 不调用业务工具
+  completion:
+    - 结束当前 Run

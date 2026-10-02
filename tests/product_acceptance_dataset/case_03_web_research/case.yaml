@@ -1,0 +1,8 @@
+id: case_03_web_research
+name: 苹果发布会连续研究
+stages: [P1, P6]
+prompt: 核实苹果是否今天举行发布会，并允许继续追问产品优势
+fixture: workspace
+assertions: [query到fetch到Evidence完整, Session网络授权可复用, 连续追问保留上一轮]
+forbidden: [重复抓取, 搜索结果页正文, 虚构来源]
+artifacts: []

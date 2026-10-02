@@ -1,0 +1,4 @@
+name: test_repair
+description: 分析测试失败并区分产品代码、测试和环境问题
+entry: SKILL.md
+tools: [file_search, file_read, file_patch, test_run, git_diff]

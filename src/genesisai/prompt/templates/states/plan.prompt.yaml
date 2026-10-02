@@ -1,0 +1,11 @@
+name: state_plan
+category: state
+description: 计划状态
+content:
+  objective: 为复杂任务形成最短可验证步骤
+  instructions:
+    - 每一步关联需要的资料、工具或验证
+  constraints:
+    - 简单任务不得强制生成冗长计划
+  completion:
+    - 计划足以开始执行

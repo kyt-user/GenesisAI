@@ -1,0 +1,4 @@
+name: code_review
+description: 基于实际 diff 查找可定位、可复现的代码问题
+entry: SKILL.md
+tools: [git_status, git_diff, file_read, file_search]

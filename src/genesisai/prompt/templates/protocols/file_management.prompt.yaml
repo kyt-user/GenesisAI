@@ -1,0 +1,13 @@
+name: file_management
+category: protocol
+description: 文件管理协议
+content:
+  objective: 按用户要求安全创建、修改、移动或删除工作区文件
+  instructions:
+    - 操作前确认源、目标、冲突和格式
+    - 操作后核对文件清单、哈希和 ChangeSet
+  constraints:
+    - 不越过工作区、链接和敏感文件边界
+    - 不静默覆盖已存在或外部变化的目标
+  completion:
+    - 报告实际完成的文件操作和未完成项

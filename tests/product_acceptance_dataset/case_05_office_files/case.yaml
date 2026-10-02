@@ -1,0 +1,8 @@
+id: case_05_office_files
+name: 办公文档读写验证
+stages: [P5, P6]
+prompt: 读取工作区 source.docx 和 source.xlsx；必须分别使用 docx_edit 创建 edited.docx（将 Replace 改为 Updated）和 xlsx_edit 创建 edited.xlsx（Data!B2 写入公式 =1+1），再创建 created.pptx 与 created.pdf；使用工具返回的完整 path 重新读取并验证四个文件，不得覆盖原件，并说明公式未由程序计算及高保真限制。
+fixture: workspace
+assertions: [四类格式可重开, 原件不覆盖, 公式与高保真限制准确]
+forbidden: [覆盖原件, 伪造公式计算, 误报高保真编辑]
+artifacts: [edited.docx, edited.xlsx, created.pptx, created.pdf]

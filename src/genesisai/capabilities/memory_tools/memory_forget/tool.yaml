@@ -1,0 +1,4 @@
+name: memory_forget
+enabled: true
+category: memory
+description: 将指定 Memory 标记为已忘记并保留可撤销审计记录

@@ -1,0 +1,4 @@
+name: memory_validate
+enabled: true
+category: memory
+description: 重新计算项目来源哈希并标记已经失效的 Memory

@@ -1,0 +1,4 @@
+name: pptx_create
+enabled: true
+category: office
+description: 创建基础 PPTX 标题与项目符号版式并验证

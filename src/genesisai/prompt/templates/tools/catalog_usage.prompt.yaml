@@ -1,0 +1,17 @@
+name: catalog_usage
+category: tool
+description: Tool Catalog 使用
+content:
+  objective: 只加载当前任务需要的业务工具
+  instructions:
+    - 可信能力目录已有所需的精确工具名时，直接 tool_load 一次加载；已 Active 的工具直接使用，不再搜索加载
+    - 仅目录不足以选择时使用 tool_search；category 只能是 filesystem、web、development、git、memory、office 或 core
+    - 一项任务跨多个类别时分别搜索，每次把搜索结果中确实需要的正式工具名交给 tool_load
+    - Active Tools 将超过 8 个或任务进入新阶段时，用 tool_load 的 replace=true 原子替换为下一阶段所需工具
+    - tool_describe 只接受 tool_search 返回的精确工具名；不得猜测 file_write、file_edit、apply_patch 等名称
+    - 工具名称和参数以当前模型请求中的正式定义为准
+  constraints:
+    - 不重复搜索同一能力
+    - 不猜测未提供的工具名或参数
+  completion:
+    - 找到足够工具后继续执行任务

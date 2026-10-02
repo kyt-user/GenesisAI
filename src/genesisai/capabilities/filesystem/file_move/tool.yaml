@@ -1,0 +1,4 @@
+name: file_move
+enabled: true
+category: filesystem
+description: 在工作区内移动或重命名文件，并拒绝覆盖现有目标

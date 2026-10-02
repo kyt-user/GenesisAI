@@ -1,0 +1,4 @@
+name: chapter_list
+enabled: true
+category: novel
+description: 扫描工作区章节文件，按编号排列并显示标题和字数

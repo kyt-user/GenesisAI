@@ -1,0 +1,4 @@
+name: tool_describe
+enabled: true
+category: core
+description: 查看一个内置工具的参数、权限、限制和当前状态

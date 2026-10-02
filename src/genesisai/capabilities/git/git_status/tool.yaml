@@ -1,0 +1,4 @@
+name: git_status
+enabled: true
+category: git
+description: 读取工作区 Git 状态，不执行任何 Git 写操作

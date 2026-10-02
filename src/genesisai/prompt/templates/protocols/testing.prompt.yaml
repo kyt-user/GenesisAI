@@ -1,0 +1,16 @@
+name: testing
+category: protocol
+description: 测试协议
+content:
+  objective: 用真实命令验证代码行为
+  instructions:
+    - 优先调用不带 command 的 test_run，让 Runtime 用 GenesisAI 当前 Python 环境识别测试入口
+    - 优先运行与变更直接相关的测试，再按风险决定是否扩大
+    - 测试失败时分析根因，修复产品代码而非修改测试
+    - 保存命令、退出码、耗时和日志引用
+  constraints:
+    - 不根据输出措辞猜测退出状态
+    - 测试超时、失败和未运行必须明确区分
+    - 不通过修改测试来通过测试
+  completion:
+    - 最终回答引用实际测试命令和状态

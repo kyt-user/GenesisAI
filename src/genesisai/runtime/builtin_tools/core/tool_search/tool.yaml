@@ -1,0 +1,4 @@
+name: tool_search
+enabled: true
+category: core
+description: 按名称、分类和描述搜索 GenesisAI 内置工具目录

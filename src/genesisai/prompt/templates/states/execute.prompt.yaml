@@ -1,0 +1,12 @@
+name: state_execute
+category: state
+description: 执行状态
+content:
+  objective: 按当前目标调用最少工具取得进展
+  instructions:
+    - 每次调用使用当前提供的正式 Schema
+    - 修改后继续进入验证而不是直接声称完成
+  constraints:
+    - 不绕过权限和工作区边界
+  completion:
+    - 获得足够结果后进入验证或回答

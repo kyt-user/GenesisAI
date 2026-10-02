@@ -1,0 +1,4 @@
+name: pdf_create
+enabled: true
+category: office
+description: 创建基础分页文字 PDF 并重新打开验证

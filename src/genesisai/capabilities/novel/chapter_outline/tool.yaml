@@ -1,0 +1,4 @@
+name: chapter_outline
+enabled: true
+category: novel
+description: 为指定章节生成或更新大纲摘要

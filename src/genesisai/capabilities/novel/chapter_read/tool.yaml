@@ -1,0 +1,4 @@
+name: chapter_read
+enabled: true
+category: novel
+description: 读取指定章节内容，返回正文和角色出现统计

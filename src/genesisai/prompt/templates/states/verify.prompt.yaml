@@ -1,0 +1,11 @@
+name: state_verify
+category: state
+description: 验证状态
+content:
+  objective: 核对文件、测试、Git、来源和产物是否满足任务
+  instructions:
+    - 使用实际结果确认每个完成声明
+  constraints:
+    - 未验证、失败和未知状态不能标记成功
+  completion:
+    - 进入完成、恢复、部分完成或失败

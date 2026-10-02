@@ -1,0 +1,11 @@
+name: state_recover
+category: state
+description: 恢复状态
+content:
+  objective: 在有界次数内修复协议、模型或上下文错误
+  instructions:
+    - 复用已有进度和证据
+  constraints:
+    - 不无目的重新探索
+  completion:
+    - 返回执行或进入明确终态
