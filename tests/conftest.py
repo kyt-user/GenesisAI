@@ -13,7 +13,7 @@ def no_network(monkeypatch):
 def _local_state_root(monkeypatch):
     """Force session state into workspace/.genesis for test isolation."""
     from pathlib import Path as _Path
-    from genesisai.state import store as _store_mod
+    from genesisai.core.state import store as _store_mod
 
     def _local_root(workspace):
         return _Path(workspace).resolve() / '.genesis'
@@ -21,3 +21,9 @@ def _local_state_root(monkeypatch):
     monkeypatch.setattr(_store_mod, 'workspace_state_root', _local_root)
     from genesisai.app import cli as _cli_mod
     monkeypatch.setattr(_cli_mod, 'workspace_state_root', _local_root)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_model_config(tmp_path, monkeypatch):
+    """Keep CLI-managed model config out of the developer's real user directory."""
+    monkeypatch.setenv('GENESISAI_CONFIG_DIR', str(tmp_path / 'genesisai-config'))

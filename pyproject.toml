@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["openai>=2.0,<3", "httpx>=0.28,<1", "PyYAML>=6,<7", "python-dotenv>=1,<2", "rich>=13,<15", "trafilatura>=2,<3", "brotli>=1,<2"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8,<10"]
+dev = ["pytest>=8,<10", "import-linter>=2,<3"]
 office = ["pypdf>=6,<7", "python-docx>=1.2,<2", "openpyxl>=3.1,<4", "python-pptx>=1,<2", "reportlab>=4,<5"]
 
 [project.scripts]
@@ -21,7 +21,26 @@ genesis = "genesisai.app.cli:entry"
 where = ["src"]
 
 [tool.setuptools.package-data]
-genesisai = ["prompt/templates/**/*.prompt.yaml", "prompt/templates/legacy/*.md", "runtime/builtin_tools/core/*/tool.yaml", "skills/builtin/*/skill.yaml", "skills/builtin/*/SKILL.md", "capabilities/*/*/tool.yaml"]
+genesisai = ["core/prompt/templates/**/*.prompt.yaml", "core/prompt/templates/legacy/*.md", "core/extensions/skills/builtin/*/skill.yaml", "core/extensions/skills/builtin/*/SKILL.md", "core/extensions/tools/*/*/tool.yaml"]
+
+[tool.importlinter]
+root_package = "genesisai"
+
+[[tool.importlinter.contracts]]
+name = "五层单向依赖"
+type = "layers"
+layers = [
+  "genesisai.app",
+  "genesisai.core",
+  "genesisai.agent",
+  "genesisai.model",
+  "genesisai.shared",
+]
+
+[[tool.importlinter.contracts]]
+name = "shared 不得依赖其它层"
+type = "independence"
+modules = ["genesisai.shared"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

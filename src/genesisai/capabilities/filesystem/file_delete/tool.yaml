@@ -1,4 +1,0 @@
-name: file_delete
-enabled: true
-category: filesystem
-description: 删除工作区内单个文件，删除前保存可撤销备份并逐次确认

@@ -1,4 +1,0 @@
-name: python_project
-enabled: true
-category: development
-description: 检查 Python 项目结构、pyproject 元数据、测试框架和项目虚拟环境，给出默认验证方式

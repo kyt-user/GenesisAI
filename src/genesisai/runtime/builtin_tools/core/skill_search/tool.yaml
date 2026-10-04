@@ -1,4 +1,0 @@
-name: skill_search
-enabled: true
-category: core
-description: 检索可用 Skill 的名称、摘要、来源和覆盖关系

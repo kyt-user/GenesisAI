@@ -1,4 +1,0 @@
-name: file_create
-enabled: true
-category: filesystem
-description: 在用户指定的工作区创建新的 UTF-8 文本、报告、配置或源码文件（含 .py、.java、.html、.css、.js），禁止覆盖和二进制文件

@@ -7,10 +7,10 @@ from rich.console import Console
 from genesisai.agent.runner import Runner
 from genesisai.app.terminal_view import CliView
 from genesisai.model.providers.deepseek import DeepSeekClient
-from genesisai.runtime.tool_runtime import ToolRuntime
+from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response
 from genesisai.shared.security import Access
-from genesisai.state.store import Store
+from genesisai.core.state.store import Store
 
 
 def test_reasoning_is_hidden_and_html_stream_is_markup_safe():

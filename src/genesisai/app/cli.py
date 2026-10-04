@@ -9,14 +9,16 @@ from rich.console import Console
 from genesisai.app.terminal_view import CliSnapshot, CliView
 from genesisai.shared.changes import undo_changes
 from genesisai.app.maintenance import clean_runtime, doctor
-from genesisai.memory.manager import MemoryError, MemoryManager
 from genesisai.model.config import build_model
+from genesisai.model.settings import load_settings
+from genesisai.app import onboarding
 from genesisai.agent.runner import Runner
 from genesisai.shared.security import Access
-from genesisai.skills.registry import SkillError, SkillRegistry
-from genesisai.state.store import HostLock, Store, workspace_state_root
-from genesisai.runtime.tool_runtime import ToolRuntime
-from genesisai.project_docs import AgentDocsManager
+from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
+from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
+from genesisai.core.state.store import HostLock, Store, workspace_state_root
+from genesisai.core.tools.tool_runtime import ToolRuntime
+from genesisai.core.project_docs import AgentDocsManager
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -91,9 +93,7 @@ def build_cli_session(
         confirm_search=confirm_search,
         confirm_shell=confirm_shell,
     )
-    tool_snapshot = runtime.snapshot()
-    with MemoryManager(actual_workspace) as memory:
-        memory_count = len(memory.search())
+    inventory = runtime.inventory()
     skills = SkillRegistry(actual_workspace, runtime.registry)
     snapshot = CliSnapshot(
         session_id=store.id,
@@ -103,10 +103,9 @@ def build_cli_session(
         output=str(output),
         permission_mode=runtime.permission_mode,
         registered_tools=len(runtime.registry),
-        active_tools=len(tool_snapshot['core']) + len(tool_snapshot['active']),
-        memory_entries=memory_count,
-        skill_name=','.join(store.data['tool_runtime']['active_skills']) or '可按需加载',
-        git_state='工具可用' if any(item.name.startswith('git_') and item.enabled for item in runtime.registry.values()) else '不可用',
+        enabled_tools=len(inventory['enabled']),
+        skill_name=','.join(store.data['tool_runtime']['active_skills']) or '未加载',
+        git_state='工具可用' if 'run_commands' in runtime.registry and runtime.registry.get('run_commands').enabled else '不可用',
         agent_docs_status=(AgentDocsManager(actual_workspace).summary().get('active_status') or '就绪')
         if AgentDocsManager.exists(actual_workspace) else '未初始化',
     )
@@ -126,16 +125,16 @@ def apply_permission_command(runtime, text):
 
 
 def load_environment(explicit=None, workspace=None):
-    """先加载工作区共享密钥，再补充可选的项目环境变量。"""
+    """先加载工作区 .env，再补充本项目 .env（不读取项目以外的上级目录）。"""
     if explicit:
         load_dotenv(Path(explicit), override=False)
         return
-    # 进程中已有的变量优先。工作区 .env 供同级项目共享；
-    # GenesisAI/.env 只补充项目变量，不覆盖已经加载的值。
+    # 进程中已有的变量优先。工作区 .env 优先，GenesisAI/.env 只补充
+    # 尚未设置的变量；不读取项目上级目录，避免历史遗留 .env 污染密钥。
     candidates = []
     if workspace:
         candidates.append(Path(workspace).resolve() / '.env')
-    candidates.extend((PROJECT_ROOT.parents[1] / '.env', PROJECT_ROOT / '.env'))
+    candidates.append(PROJECT_ROOT / '.env')
     for candidate in candidates:
         if candidate.is_file():
             load_dotenv(candidate, override=False)
@@ -144,6 +143,8 @@ def load_environment(explicit=None, workspace=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='GenesisAI：面向小型项目开发的单 Agent CLI')
     parser.add_argument('--config', type=Path, help='模型 YAML，默认读取 config/model.yaml')
+    parser.add_argument('--config-dir', type=Path, help='用户配置目录，默认 ~/.genesisai')
+    parser.add_argument('--auth', action='store_true', help='交互式选择模型提供商/模型并写入配置后退出')
     parser.add_argument('--env-file', type=Path, help='显式 .env 路径；默认读取工作区根目录及本项目 .env')
     parser.add_argument('--workspace', type=Path, help='明确指定目标项目目录；非交互模式必须提供')
     parser.add_argument('--input', type=Path, action='append', default=[], help='授权读取目录/文件，可重复')
@@ -178,6 +179,13 @@ def main(argv=None):
         view.render_error(str(exc), title='工作区错误')
         return 2
     load_environment(args.env_file, actual_workspace)
+    if args.auth:
+        configured = onboarding.run_onboarding(console, directory=args.config_dir)
+        if configured is None:
+            view.render_error('已取消模型配置。', title='模型配置')
+            return 2
+        view.render_model_settings(configured)
+        return 0
     state_root = workspace_state_root(actual_workspace)
     try:
         with HostLock(state_root):
@@ -194,7 +202,19 @@ def main(argv=None):
             output = str(output_path)
             if args.session and (roots != d['grants'] or output != d['output']):
                 raise ValueError('恢复时不能更改授权根目录或输出目录，请创建新会话')
-            model, remote = build_model(args.config)
+            current_settings = load_settings(args.config_dir)
+            needs_config = current_settings is None or not onboarding.has_credentials(current_settings)
+            if needs_config and interactive and not args.prompt:
+                current_settings = onboarding.run_onboarding(
+                    console, directory=args.config_dir, initial=current_settings
+                ) or current_settings
+            if current_settings is not None and not onboarding.has_credentials(current_settings) and not interactive:
+                raise ValueError('模型配置缺少 API Key；请运行 python cli.py --auth 完成配置')
+            model, remote = (
+                build_model(args.config, settings=current_settings)
+                if current_settings is not None
+                else build_model(args.config)
+            )
             # 即使没有授权本地输入目录，远程提供商仍会收到用户提示词。
             # 因此应对整段远程会话取得授权，而不只是对本地文件外发授权。
             if remote and not args.allow_remote_data:
@@ -255,6 +275,14 @@ def main(argv=None):
                 show(result)
                 return result
 
+            def apply_model_settings(new_settings):
+                nonlocal model, remote, current_settings
+                model, remote = build_model(args.config, settings=new_settings)
+                current_settings = new_settings
+                state.runner.model = model
+                state.snapshot = replace(state.snapshot, model_name=getattr(model, 'model', new_settings.model))
+                view.render_model_settings(new_settings)
+
             if args.prompt:
                 run_and_show(lambda: state.runner.start(args.prompt))
                 return 0 if state.store.data['status'] == 'completed' else 2
@@ -312,7 +340,23 @@ def main(argv=None):
                     elif command == '/history':
                         view.render_history(state.store.data['messages'])
                     elif command == '/model':
-                        view.render_model(state.snapshot)
+                        if not interactive:
+                            view.render_model(state.snapshot)
+                        elif current_settings is None:
+                            updated = onboarding.run_onboarding(console, directory=args.config_dir)
+                            if updated is not None:
+                                apply_model_settings(updated)
+                        else:
+                            updated = onboarding.select_model_only(console, current_settings, directory=args.config_dir)
+                            if updated is not None:
+                                apply_model_settings(updated)
+                    elif command == '/auth':
+                        if interactive:
+                            updated = onboarding.run_onboarding(console, directory=args.config_dir, initial=current_settings)
+                            if updated is not None:
+                                apply_model_settings(updated)
+                        else:
+                            view.render_error('配置需要交互式终端；请运行 python cli.py --auth。', title='模型配置')
                     elif command.startswith('/permissions'):
                         apply_permission_command(state.runtime, text)
                         state.snapshot = replace(state.snapshot, permission_mode=state.runtime.permission_mode)
@@ -322,7 +366,7 @@ def main(argv=None):
                             confirm_shell=state.runtime.confirm_shell,
                         )
                     elif command == '/tools':
-                        view.render_tools(state.runtime.snapshot())
+                        view.render_tools(state.runtime.inventory())
                     elif command in {'/project', '/project status'}:
                         manager = AgentDocsManager(actual_workspace)
                         value = manager.context() if manager.available else {
@@ -354,14 +398,6 @@ def main(argv=None):
                             confirm_shell=True,
                         )
                         view.render_startup(state.snapshot)
-                        # 告知用户记忆连续性。
-                        with MemoryManager(actual_workspace) as manager:
-                            active_count = len(manager.search())
-                            if active_count:
-                                view.render_data('Memory 搬运', {
-                                    'note': '项目记忆已自动保留到新会话，下次提问时将注入相关摘要。',
-                                    'active_entries': active_count,
-                                })
                     elif command.startswith('/skills'):
                         registry = SkillRegistry(actual_workspace, state.runtime.registry)
                         parts = text.split(maxsplit=2)
@@ -384,57 +420,20 @@ def main(argv=None):
                             raise ValueError('用法：/skills list|search 词|show 名称|load 名称[,名称]|unload [名称]')
                         state.snapshot = replace(state.snapshot, skill_name=','.join(state.store.data['tool_runtime']['active_skills']) or None)
                         view.render_data('Skills', value)
-                    elif command.startswith('/memory'):
-                        with MemoryManager(actual_workspace) as manager:
-                            parts = text.split(maxsplit=3)
-                            action = parts[1].casefold() if len(parts) > 1 else 'list'
-                            if action == 'list':
-                                value = manager.search()
-                            elif action == 'search':
-                                value = manager.search(parts[2] if len(parts) > 2 else '')
-                            elif action == 'show' and len(parts) > 2:
-                                value = manager.read(parts[2])
-                            elif action == 'forget' and len(parts) > 2:
-                                value = manager.forget(parts[2], run_id=state.store.data.get('run_id'))
-                            elif action == 'validate':
-                                value = {'changed': manager.validate_sources()}
-                            elif action == 'changes':
-                                value = manager.recent_changes(limit=20)
-                            elif action == 'category' and len(parts) > 2:
-                                from genesisai.memory.manager import MEMORY_TYPES
-                                requested = {t.casefold() for t in parts[2].split(',')}
-                                valid = requested & {t.casefold() for t in MEMORY_TYPES}
-                                value = manager.by_category(*valid, limit=50) if valid else {'error': '未知类别', 'valid_types': sorted(MEMORY_TYPES)}
-                            elif action == 'undo':
-                                value = manager.undo(run_id=state.store.data.get('run_id'))
-                            elif action == 'add' and len(parts) > 3 and '|' in parts[3]:
-                                title, content = [item.strip() for item in parts[3].split('|', 1)]
-                                value = manager.add(type=parts[2], title=title, summary=title, content=content, run_id=state.store.data.get('run_id'))
+                    elif command.startswith('/workflow'):
+                        registry = WorkflowRegistry(actual_workspace)
+                        parts = text.split(maxsplit=1)
+                        if len(parts) < 2 or not parts[1].strip():
+                            view.render_data('Workflows', {'workflows': registry.summary(), 'diagnostics': registry.diagnostics})
+                        else:
+                            try:
+                                prompt = registry.expand(parts[1].strip())
+                            except WorkflowError as exc:
+                                view.render_data('Workflows', {'error': str(exc), 'workflows': registry.summary()})
                             else:
-                                raise ValueError('用法：/memory list|search 词|show ID|category 类型|add 类型 标题|正文|forget ID|validate|changes|undo')
-                            state.snapshot = replace(state.snapshot, memory_entries=len(manager.search()))
-                        view.render_data('Memory', value)
+                                run_and_show(lambda: state.runner.start(prompt), '正在展开工作流...')
                     elif command == '/diff':
                         view.render_changes(state.store.data.get('changes', []), state.store.data.get('run_id'))
-                    elif command.startswith('/bible'):
-                        with MemoryManager(actual_workspace) as manager:
-                            from genesisai.memory.manager import CREATIVE_TYPES
-                            parts = text.split(maxsplit=2)
-                            action = parts[1].casefold() if len(parts) > 1 else 'characters'
-                            if action == 'characters':
-                                value = manager.by_category(*({'character'} & CREATIVE_TYPES), limit=50)
-                            elif action == 'show' and len(parts) > 2:
-                                results = manager.search(parts[2], limit=5)
-                                value = manager.read(results[0]['id']) if results else {'error': '未找到'}
-                            elif action == 'threads':
-                                value = manager.by_category(*({'plot_thread'} & CREATIVE_TYPES), limit=50)
-                            elif action == 'timeline':
-                                value = manager.by_category(*({'world_setting'} & CREATIVE_TYPES), limit=50)
-                            elif action == 'settings':
-                                value = manager.by_category(*({'world_setting', 'style_rule'} & CREATIVE_TYPES), limit=50)
-                            else:
-                                value = manager.by_category(*CREATIVE_TYPES, limit=50)
-                        view.render_data('Story Bible', value)
                     elif command == '/approve':
                         run_and_show(lambda: state.runner.confirm(True), '正在执行已批准操作...')
                     elif command == '/reject':
@@ -454,7 +453,7 @@ def main(argv=None):
                 except (EOFError, KeyboardInterrupt):
                     view.render_goodbye()
                     break
-                except (ValueError, MemoryError, SkillError, OSError) as exc:
+                except (ValueError, SkillError, OSError) as exc:
                     view.render_error(str(exc))
             return 0
     except (ValueError, RuntimeError, OSError) as exc:

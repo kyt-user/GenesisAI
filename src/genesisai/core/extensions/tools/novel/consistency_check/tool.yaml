@@ -1,0 +1,4 @@
+name: consistency_check
+enabled: true
+category: novel
+description: 检查章节文本中的角色名一致性和潜在矛盾

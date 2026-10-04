@@ -4,16 +4,15 @@ import time
 import pytest
 
 from genesisai.agent.completion import CompletionValidator
-from genesisai.prompt.context_budgeter import ContextBudgeter, PROFILES, select_initial_profile
+from genesisai.core.prompt.context_budgeter import ContextBudgeter, PROFILES, select_initial_profile
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.shared.messages import Response, ToolCall
-from genesisai.prompt.composer import PromptComposer
-from genesisai.agent.research import ResearchController
+from genesisai.core.prompt.composer import PromptComposer
+from genesisai.core.research import ResearchController
 from genesisai.agent.runner import Runner
 from genesisai.shared.security import Access
-from genesisai.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, migrate_session
-from genesisai.runtime.registry import CORE_NAMES
-from genesisai.runtime.tool_runtime import ToolRuntime
+from genesisai.core.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, migrate_session
+from genesisai.core.tools.tool_runtime import ToolRuntime
 
 
 class FakeModel:
@@ -98,23 +97,16 @@ def test_p11_v2_migrates_losslessly_to_v3(tmp_path):
     migrated = migrate_session(old)
     assert CURRENT_SESSION_SCHEMA_VERSION == 3
     assert migrated["messages"] == old["messages"]
-    assert migrated["tool_runtime"] == old["tool_runtime"]
+    assert migrated["tool_runtime"] == {"active_skills": []}
     assert migrated["run_runtime"]["phase"] == "done"
-
-
-def test_p11_fetch_dependency_is_loaded_atomically(runtime_env):
-    _, runtime = runtime_env
-    runtime.load_tools(["search_fetch"])
-    assert {"search_query", "search_fetch"}.issubset(runtime.catalog.active_names)
 
 
 def test_p11_unregistered_and_search_pages_are_rejected(runtime_env):
     store, runtime = runtime_env
     store.data["run_runtime"] = ResearchController.empty_state("web_quick")
     store.save()
-    runtime.load_tools(["search_fetch"])
-    missing = runtime.execute({"id": "f1", "name": "search_fetch", "arguments": json.dumps({"url": "https://example.com/a"})})
-    search_page = runtime.execute({"id": "f2", "name": "search_fetch", "arguments": json.dumps({"url": "https://www.google.com/search?q=x"})})
+    missing = runtime.execute({"id": "f1", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://example.com/a"})})
+    search_page = runtime.execute({"id": "f2", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://www.google.com/search?q=x"})})
     assert missing["error"]["code"] == "candidate_not_registered"
     assert search_page["error"]["code"] == "search_result_page_forbidden"
 
@@ -137,9 +129,8 @@ def test_p11_query_registers_candidates_and_fetch_creates_evidence(runtime_env):
     runtime.network = Network()
     store.data["run_runtime"] = ResearchController.empty_state("web_quick")
     store.save()
-    runtime.load_tools(["search_query", "search_fetch"])
-    query = runtime.execute({"id": "q1", "name": "search_query", "arguments": json.dumps({"query": "Apple event"})})
-    fetch = runtime.execute({"id": "f1", "name": "search_fetch", "arguments": json.dumps({"url": "https://apple.example/news"})})
+    query = runtime.execute({"id": "q1", "name": "fetch_web_content", "arguments": json.dumps({"query": "Apple event"})})
+    fetch = runtime.execute({"id": "f1", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://apple.example/news"})})
     assert query["ok"] and store.data["run_runtime"]["candidate_count"] == 1
     assert fetch["ok"] and len(fetch["data"]["text"]) <= 4000
     assert fetch["source_refs"] == store.data["run_runtime"]["evidence_refs"]
@@ -148,13 +139,14 @@ def test_p11_query_registers_candidates_and_fetch_creates_evidence(runtime_env):
     assert evidence["content_hash"] and evidence["status"] == "ready"
 
 
-def test_p11_direct_answer_uses_no_business_tools(runtime_env):
+def test_p11_direct_answer_dispatches_full_tool_set(runtime_env):
     store, runtime = runtime_env
     model = FakeModel(Response(content="你好，我可以帮你。", finish_reason="stop", usage={"total_tokens": 12}))
     result = Runner(model, runtime).start("你好")
     assert result["status"] == "completed"
     assert len(model.contexts) == 1
-    assert {item["function"]["name"] for item in model.tools[0]} == set(CORE_NAMES)
+    offered = {item["function"]["name"] for item in model.tools[0]}
+    assert {"read_files", "editor", "fetch_web_content"}.issubset(offered)
     assert store.data["run_runtime"]["profile"] == "direct_answer"
 
 

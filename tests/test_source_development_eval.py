@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from genesisai.evals.source_development import load_dataset, run_all
+from genesisai.app.evals.source_development import load_dataset, run_all
 
 
 DATASET = Path(__file__).parent / "source_development_dataset" / "manifest.yaml"

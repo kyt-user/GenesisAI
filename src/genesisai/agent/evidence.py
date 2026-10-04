@@ -6,7 +6,7 @@ import hashlib
 import time
 from urllib.parse import urlsplit
 
-from genesisai.state.store import uid
+from genesisai.shared.ids import uid
 
 
 class EvidenceBundle:

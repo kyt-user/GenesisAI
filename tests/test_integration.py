@@ -10,10 +10,10 @@ import pytest
 
 from genesisai.app.cli import main
 from genesisai.shared.messages import Response
-from genesisai.state.store import Store
-from genesisai.capabilities.web.providers.brave import BraveSearchProvider
-from genesisai.capabilities.web.providers.duckduckgo import DuckDuckGoSearchProvider
-from genesisai.capabilities.web.contracts import SearchQuery, SearchError
+from genesisai.core.state.store import Store
+from genesisai.core.extensions.tools.web.providers.brave import BraveSearchProvider
+from genesisai.core.extensions.tools.web.providers.duckduckgo import DuckDuckGoSearchProvider
+from genesisai.core.extensions.tools.web.contracts import SearchQuery, SearchError
 from test_acceptance import FakeModel, call, response
 
 
@@ -112,7 +112,7 @@ def test_A01_direct_cli_help():
 
 def test_bing_rss_parser():
     import httpx
-    from genesisai.capabilities.web.providers.bing import BingSearchProvider
+    from genesisai.core.extensions.tools.web.providers.bing import BingSearchProvider
     client=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,content=b'<rss><channel><item><title>Python</title><link>https://www.python.org/</link><description>Official</description></item></channel></rss>')))
     hit=BingSearchProvider(client).search(SearchQuery('python'))[0]
     assert hit.provider=='bing_rss' and hit.url=='https://www.python.org/'
@@ -124,6 +124,19 @@ def test_shared_workspace_env_precedes_project_env(tmp_path,monkeypatch):
     shared=tmp_path/'shared.env'; shared.write_text('DEEPSEEK_API_KEY=shared\n',encoding='utf-8')
     cli.load_environment(shared)
     assert os.environ['DEEPSEEK_API_KEY']=='shared'
+
+
+def test_load_environment_ignores_parent_directory(tmp_path,monkeypatch):
+    # 历史遗留：项目根目录的上级目录 .env 不得被读取，避免过期密钥污染。
+    import genesisai.app.cli as cli
+    monkeypatch.delenv('DEEPSEEK_API_KEY',raising=False)
+    (tmp_path/'.env').write_text('DEEPSEEK_API_KEY=stale\n',encoding='utf-8')  # 项目上一级
+    repo=tmp_path/'a'/'repo'; repo.mkdir(parents=True)
+    (repo/'.env').write_text('DEEPSEEK_API_KEY=fresh\n',encoding='utf-8')
+    workspace=tmp_path/'ws'; workspace.mkdir()
+    monkeypatch.setattr(cli,'PROJECT_ROOT',repo)
+    cli.load_environment(workspace=workspace)
+    assert os.environ['DEEPSEEK_API_KEY']=='fresh'
 
 
 def test_default_model_uses_project_config(monkeypatch):
@@ -142,14 +155,14 @@ def test_default_model_uses_project_config(monkeypatch):
 
 def test_model_yaml_rejects_unknown_and_invalid_generation(tmp_path):
     from genesisai.model.config import load_model_config
-    base='''provider: ollama
-model: local-model
+    base='''provider: qwen
+model: qwen-turbo
 generation:
   temperature: 0.2
   max_tokens: 2048
 '''
     valid=tmp_path/'valid.yaml'; valid.write_text(base,encoding='utf-8')
-    assert load_model_config(valid).provider == 'ollama'
+    assert load_model_config(valid).provider == 'qwen'
     unknown=tmp_path/'unknown.yaml'; unknown.write_text(base+'surprise: true\n',encoding='utf-8')
     with pytest.raises(ValueError,match='未知字段'):
         load_model_config(unknown)

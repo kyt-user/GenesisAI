@@ -1,4 +1,0 @@
-name: search_query
-enabled: true
-category: web
-description: 查询公开网络并返回必须继续抓取的候选结果

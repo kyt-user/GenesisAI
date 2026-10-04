@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 
 from genesisai.app.cli import select_workspace
-from genesisai.capabilities.shell.python_support import automatic_test_command, inspect_python_project
-from genesisai.evals.python_development import load_dataset, run_all
-from genesisai.project_docs import AgentDocsError, AgentDocsManager
-from genesisai.state.store import workspace_state_root
+from genesisai.core.extensions.tools.shell.python_support import automatic_test_command, inspect_python_project
+from genesisai.app.evals.python_development import load_dataset, run_all
+from genesisai.core.project_docs import AgentDocsError, AgentDocsManager
+from genesisai.core.state.store import workspace_state_root
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -101,9 +101,9 @@ def test_noninteractive_cli_can_initialize_agent_docs(tmp_path, monkeypatch):
 def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
     from genesisai.shared.messages import Response
-    from genesisai.runtime.tool_runtime import ToolRuntime
+    from genesisai.core.tools.tool_runtime import ToolRuntime
     from genesisai.shared.security import Access
-    from genesisai.state.store import Store
+    from genesisai.core.state.store import Store
     from test_acceptance import FakeModel, call
 
     workspace = tmp_path / "agent_tests_workspace"
@@ -129,9 +129,8 @@ def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, mon
         Access([workspace], workspace, store.root, workspace_root=workspace),
         providers=[], confirm_writes=False, confirm_search=False,
     )
-    runtime.load_tools(["file_create"])
-    result = runtime.execute(call("file_create", {
-        "path": "hello.txt", "content": "hello", "source_refs": [],
+    result = runtime.execute(call("editor", {
+        "operation": "create", "path": "hello.txt", "content": "hello", "source_refs": [],
     }, "create_hello"))
 
     assert result["ok"] is True

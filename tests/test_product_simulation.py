@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from genesisai.evals.simulation import load_dataset, run_all
+from genesisai.app.evals.simulation import load_dataset, run_all
 
 
 DATASET = Path(__file__).parent / "product_acceptance_dataset"
@@ -12,7 +12,7 @@ def test_dataset_is_strict_and_has_five_isolated_cases():
     cases = load_dataset(DATASET)
     assert [case[0]["id"] for case in cases] == [
         "case_01_code_fix", "case_02_file_management", "case_03_web_research",
-        "case_04_memory_and_skill", "case_05_office_files",
+        "case_04_skill", "case_05_office_files",
     ]
     assert all("version" not in case for case, _ in cases)
 

@@ -1,4 +1,0 @@
-name: file_read
-enabled: true
-category: filesystem
-description: 分段读取文件正文并登记可引用的本地来源

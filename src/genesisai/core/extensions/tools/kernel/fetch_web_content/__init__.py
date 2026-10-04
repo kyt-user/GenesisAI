@@ -1,0 +1,1 @@
+"""fetch_web_content 内核工具。"""

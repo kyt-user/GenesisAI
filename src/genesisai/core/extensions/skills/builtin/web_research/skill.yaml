@@ -1,0 +1,4 @@
+name: web_research
+description: 查询公开网络、抓取正文并生成可核对引用
+entry: SKILL.md
+tools: [fetch_web_content, editor]

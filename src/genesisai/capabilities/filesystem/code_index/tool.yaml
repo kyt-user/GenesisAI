@@ -1,4 +1,0 @@
-name: code_index
-enabled: true
-category: filesystem
-description: 提取代码结构索引：类、函数签名、导入关系和 TODO 标记

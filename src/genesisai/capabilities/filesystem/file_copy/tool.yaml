@@ -1,4 +1,0 @@
-name: file_copy
-enabled: true
-category: filesystem
-description: 将授权原件逐字节复制到输出目录并登记产物

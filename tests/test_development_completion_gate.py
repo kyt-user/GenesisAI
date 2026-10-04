@@ -27,10 +27,9 @@ def test_development_answer_without_file_change_is_bounded_partial(tmp_path):
 
 def test_plan_only_cannot_complete_execution_request(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path, planned=False)
-    runtime.load_tools(["project_plan"])
     model = FakeModel(
         tool_response(
-            "project_plan",
+            "plan",
             {"steps": ["创建 main.py"], "acceptance": ["语法检查通过"], "non_goals": []},
             "plan",
         ),
@@ -47,11 +46,10 @@ def test_plan_only_cannot_complete_execution_request(tmp_path):
 
 def test_source_create_and_real_verification_can_complete(tmp_path):
     workspace, manager, _, store, runtime = development_env(tmp_path)
-    runtime.load_tools(["file_create"])
     model = FakeModel(
         tool_response(
-            "file_create",
-            {"path": "main.py", "content": "print('ok')\n", "source_refs": []},
+            "editor",
+            {"operation": "create", "path": "main.py", "content": "print('ok')\n", "source_refs": []},
             "create",
         ),
         Response(content="源码已写入。"),
@@ -69,7 +67,6 @@ def test_source_create_and_real_verification_can_complete(tmp_path):
 
 def test_html_source_uses_deterministic_static_verification(tmp_path):
     workspace, manager, _, store, runtime = development_env(tmp_path)
-    runtime.load_tools(["file_create"])
     html = (
         "<!doctype html><html><body><input id=\"guess\">"
         "<script>const answer = 42; function check() { return answer; }</script>"
@@ -77,8 +74,8 @@ def test_html_source_uses_deterministic_static_verification(tmp_path):
     )
     model = FakeModel(
         tool_response(
-            "file_create",
-            {"path": "index.html", "content": html, "source_refs": []},
+            "editor",
+            {"operation": "create", "path": "index.html", "content": html, "source_refs": []},
             "create_html",
         ),
         Response(content="页面已写入并通过静态验收。"),
@@ -91,5 +88,5 @@ def test_html_source_uses_deterministic_static_verification(tmp_path):
     create_result = store.data["calls"]["create_html"]["result"]["data"]
     assert create_result["validation"]["framework"] == "frontend_static"
     assert create_result["validation"]["passed"] is True
-    assert all(item["tool"] != "test_run" for item in store.data["run_runtime"]["tool_activity"])
+    assert all(item["tool"] != "run_commands" for item in store.data["run_runtime"]["tool_activity"])
     assert manager.__class__(workspace).active_task()["status"] == "verified"

@@ -1,0 +1,4 @@
+name: plan
+enabled: true
+category: kernel
+description: 写入 agent_docs 实施计划：步骤、验收标准与非目标

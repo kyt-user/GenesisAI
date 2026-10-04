@@ -1,0 +1,8 @@
+id: case_04_skill
+name: 项目Skill覆盖与验证
+stages: [P3, P4]
+prompt: 查找并加载项目级 project_check Skill（覆盖内置同名 Skill），依照它在工作区运行 pytest，并报告真实测试结果。
+fixture: workspace
+assertions: [项目Skill覆盖内置, 测试通过]
+forbidden: [脚本自动执行, 保存密钥, 保存项目全文]
+artifacts: []

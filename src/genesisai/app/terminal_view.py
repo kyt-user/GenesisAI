@@ -27,9 +27,8 @@ class CliSnapshot:
     output: str
     permission_mode: str
     registered_tools: int
-    active_tools: int | None = None
+    enabled_tools: int | None = None
     skill_name: str | None = None
-    memory_entries: int | None = None
     git_state: str | None = None
     context_percent: int | None = None
     agent_docs_status: str | None = None
@@ -83,14 +82,11 @@ class CliView:
         capabilities = Text()
         capabilities.append("Skill: ", style="dim")
         capabilities.append(self._value(snapshot.skill_name), style="cyan")
-        capabilities.append("   Memory: ", style="dim")
-        memory = f"{snapshot.memory_entries} entries" if snapshot.memory_entries is not None else "待接入"
-        capabilities.append(memory, style="cyan")
         capabilities.append("   Git: ", style="dim")
         capabilities.append(self._value(snapshot.git_state), style="cyan")
         capabilities.append("   Tools: ", style="dim")
-        active = snapshot.active_tools if snapshot.active_tools is not None else snapshot.registered_tools
-        capabilities.append(f"{active}/{snapshot.registered_tools}", style="cyan")
+        enabled = snapshot.enabled_tools if snapshot.enabled_tools is not None else snapshot.registered_tools
+        capabilities.append(f"{enabled}/{snapshot.registered_tools}", style="cyan")
         capabilities.append("   Agent Docs: ", style="dim")
         capabilities.append(self._value(snapshot.agent_docs_status, "未初始化"), style="cyan")
         if snapshot.context_percent is not None:
@@ -151,14 +147,16 @@ class CliView:
             ("/status", "查看会话、轮次、工具调用和 Token"),
             ("/budget", "查看当前 Profile、预算、用量和停止原因"),
             ("/trace", "查看脱敏执行链摘要"),
-            ("/compact", "压缩早期对话并保留目标、来源和变更引用"),
+            ("/compact", "按 cline 策略折叠早期对话，保留 typed 提示与结论性回答"),
             ("/undo", "预览本任务撤销；/undo apply 安全执行"),
             ("/doctor", "检查模型配置、目录、密钥状态和可选依赖"),
             ("/clean", "预览旧日志清理；/clean run 执行"),
             ("/history", "查看本地会话历史"),
-            ("/model", "查看当前模型"),
+            ("/model", "查看模型；交互模式下可选择切换"),
+            ("/auth", "重新选择提供商、密钥与模型并写入用户配置"),
             ("/permissions", "查看权限；可用 network|writes|shell ask|allow 切换"),
-            ("/tools", "查看 Core、Active、Available 和 Disabled 工具"),
+            ("/tools", "查看启用与禁用的工具"),
+            ("/workflow", "列出或展开 .genesis/workflows 中的工作流"),
             ("/resume", "恢复安全检查点"),
             ("/approve", "允许一次；待确认时也可输入 approve、yes 或 y"),
             ("/allow network", "批准当前网络调用并允许本会话后续公开网络请求"),
@@ -169,7 +167,6 @@ class CliView:
             ("/cancel", "取消当前运行"),
             ("/exit", "保存状态并退出"),
             ("/skills", "Skill 列表、检索、查看、加载与卸载"),
-            ("/memory", "Memory 列表、检索、查看、写入、失效与撤销"),
             ("/project", "查看 agent_docs 活动任务；/project init 初始化"),
             ("/diff", "查看本任务记录的文件变更"),
         ]
@@ -196,6 +193,26 @@ class CliView:
         body.append("OpenAI compatible", style="white")
         self.console.print(Panel(body, title="模型", title_align="left", border_style="cyan"))
 
+    def render_model_settings(self, settings, *, path: str | None = None) -> None:
+        """展示 CLI 当前生效的提供商、模型、密钥与写入位置。"""
+        from genesisai.model.providers.catalog import get_provider
+        from genesisai.model.settings import settings_path
+
+        provider = get_provider(settings.provider)
+        label = provider.label if provider else settings.provider
+        body = Text()
+        body.append("提供商  ", style="dim")
+        body.append(label, style="bold cyan")
+        body.append("\n模型    ", style="dim")
+        body.append(settings.model, style="bold white")
+        body.append("\n接口    ", style="dim")
+        body.append(settings.base_url or "默认", style="white")
+        body.append("\n密钥    ", style="dim")
+        body.append(settings.masked_key(), style="green")
+        body.append("\n配置    ", style="dim")
+        body.append(str(path or settings_path()), style="dim")
+        self.console.print(Panel(body, title="模型配置", title_align="left", border_style="green"))
+
     def render_permissions(self, *, confirm_writes: bool, confirm_search: bool, confirm_shell: bool = True) -> None:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="dim")
@@ -211,10 +228,10 @@ class CliView:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(style="white")
-        styles = {"core": "bright_green", "active": "cyan", "available": "white", "disabled": "red"}
-        labels = {"core": "Core", "active": "Active", "available": "Available", "disabled": "Disabled"}
+        styles = {"enabled": "bright_green", "disabled": "red"}
+        labels = {"enabled": "Enabled", "disabled": "Disabled"}
         total = 0
-        for group in ("core", "active", "available", "disabled"):
+        for group in ("enabled", "disabled"):
             entries = snapshot.get(group, [])
             total += len(entries)
             if entries:
@@ -225,7 +242,7 @@ class CliView:
             else:
                 value = "—"
             table.add_row(Text(labels[group], style=styles[group]), value)
-        footer = Text("\n首次请求仅发送 Core；Agent 使用 tool_load 后，工具从下一轮进入 Active。", style="dim")
+        footer = Text("\n所有已启用工具在每次模型请求中全量下发；不可用工具按平台/依赖自动剔除。", style="dim")
         self.console.print(Panel(Group(table, footer), title=f"Tools · {total}", title_align="left", border_style="cyan"))
 
     def render_changes(self, changes: list[dict], run_id: str | None) -> None:
@@ -275,7 +292,6 @@ class CliView:
         table.add_row("阶段", str(runtime.get("phase", "—")))
         table.add_row("停止原因", str(runtime.get("stop_reason") or "—"))
         table.add_row("Skill", self._value(snapshot.skill_name))
-        table.add_row("Memory", f"{snapshot.memory_entries} entries" if snapshot.memory_entries is not None else "待接入")
         table.add_row("Git", self._value(snapshot.git_state))
         self.console.print(Panel(table, title="状态", title_align="left", border_style=style, box=box.ROUNDED))
 
@@ -288,8 +304,8 @@ class CliView:
         table.add_column(style="white")
         table.add_row("Profile", str(runtime.get("profile", "—")))
         table.add_row("阶段", str(runtime.get("phase", "—")))
-        for key in ("model_calls", "tool_searches", "tool_loads", "search_queries", "search_fetches", "token_budget"):
-            label = {"model_calls": "模型调用", "tool_searches": "tool_search", "tool_loads": "tool_load", "search_queries": "search_query", "search_fetches": "search_fetch", "token_budget": "Token"}[key]
+        for key in ("model_calls", "search_queries", "search_fetches", "token_budget"):
+            label = {"model_calls": "模型调用", "search_queries": "网络检索", "search_fetches": "网页抓取", "token_budget": "Token"}[key]
             used = usage.get(key if key != "token_budget" else "total_tokens", 0)
             table.add_row(label, f"{used} / {budget.get(key, '—')}（余 {max(0, budget.get(key, 0) - used) if isinstance(budget.get(key), int) else '—'}）")
         table.add_row("候选 / Evidence", f"{runtime.get('candidate_count', 0)} / {len(runtime.get('evidence_refs', []))}")
@@ -427,7 +443,8 @@ class CliView:
         body.append("\n目标    ", style="dim")
         body.append(str(preview.get("target", "未知")), style="white")
         args = preview.get("args") or {}
-        if tool_name == "file_create":
+        operation = preview.get("operation")
+        if tool_name == "editor" and operation == "create":
             content = str(args.get("content", ""))
             body.append(f"\n内容    {len(content)} 字符", style="dim")
             if content:
@@ -435,7 +452,7 @@ class CliView:
                 body.append(content[:800], style="bright_black")
                 if len(content) > 800:
                     body.append("\n…预览已截断", style="dim")
-        elif tool_name == "file_copy":
+        elif tool_name == "editor" and operation == "copy":
             body.append("\n来源    ", style="dim")
             body.append(str(args.get("source", "未知")), style="white")
         body.append("\n\n")
@@ -448,7 +465,7 @@ class CliView:
         body.append(" /exit 暂缓 ", style="white on #26354a")
         body.append("    仅本次 · 参数已冻结", style="dim")
         body.append('\n中文：确认/同意；拒绝/不同意（完整匹配）', style='dim')
-        if tool_name in {'search_query', 'search_fetch'}:
+        if tool_name == 'fetch_web_content':
             body.append('\n/allow network run  允许本轮后续网络请求', style='cyan')
             body.append('\n/allow network      允许本会话后续网络请求', style='cyan')
         self.console.print(

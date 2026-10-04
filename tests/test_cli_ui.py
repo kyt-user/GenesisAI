@@ -9,7 +9,7 @@ from rich.console import Console
 from genesisai.app.cli import main
 from genesisai.app.terminal_view import CliSnapshot, CliView
 from genesisai.shared.messages import Response
-from genesisai.state.store import Store
+from genesisai.core.state.store import Store
 from test_acceptance import FakeModel, call, response
 
 
@@ -27,7 +27,7 @@ def snapshot():
         output="D:/project/output",
         permission_mode="ASK",
         registered_tools=10,
-        active_tools=3,
+        enabled_tools=3,
     )
 
 
@@ -41,15 +41,14 @@ def test_cli_header_uses_real_values_and_marks_reserved_features():
     assert "test-model" in output
     assert "Tools: 3/10" in output
     assert "Skill: 待接入" in output
-    assert "Memory: 待接入" in output
 
 
 def test_confirmation_card_keeps_target_and_actions_visible():
     view, stream = recording_view()
 
     view.render_confirmation(
-        "file_create",
-        {"target": "D:/project/output/report.md", "args": {"content": "# 报告"}},
+        "editor",
+        {"target": "D:/project/output/report.md", "operation": "create", "args": {"content": "# 报告"}},
     )
 
     output = stream.getvalue()
@@ -62,16 +61,14 @@ def test_confirmation_card_keeps_target_and_actions_visible():
 def test_tools_view_shows_all_runtime_layers():
     view, stream = recording_view()
     view.render_tools({
-        "core": [{"name": "tool_search", "category": "core", "description": "查找"}],
-        "active": [{"name": "file_read", "category": "filesystem", "description": "读取"}],
-        "available": [{"name": "file_list", "category": "filesystem", "description": "列举"}],
-        "disabled": [{"name": "search_query", "category": "web", "description": "搜索", "reason": "已禁用"}],
+        "enabled": [{"name": "read_files", "category": "kernel", "description": "读取"}],
+        "disabled": [{"name": "fetch_web_content", "category": "kernel", "description": "搜索", "reason": "已禁用"}],
     })
 
     output = stream.getvalue()
-    assert all(label in output for label in ("Core", "Active", "Available", "Disabled"))
-    assert "search_query（已禁用）" in output
-    assert "下一轮进入 Active" in output
+    assert all(label in output for label in ("Enabled", "Disabled"))
+    assert "fetch_web_content（已禁用）" in output
+    assert "read_files" in output
 
 
 def test_reserved_commands_do_not_call_model(tmp_path, monkeypatch):
@@ -79,7 +76,7 @@ def test_reserved_commands_do_not_call_model(tmp_path, monkeypatch):
 
     model = FakeModel()
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
-    commands = iter(["/model", "/permissions", "/tools", "/skills", "/memory", "/diff", "/exit"])
+    commands = iter(["/model", "/permissions", "/tools", "/skills", "/diff", "/exit"])
     monkeypatch.setattr("rich.console.Console.input", lambda *args, **kwargs: next(commands))
 
     assert main(["--workspace", str(tmp_path / "work")]) == 0
@@ -104,7 +101,7 @@ def test_new_command_creates_fresh_session_and_preserves_old_one(tmp_path, monke
     new = next(item for item in payloads if any(message.get("content") == "new question" for message in item["messages"]))
     assert any(message.get("content") == "old answer" for message in old["messages"])
     assert all(message.get("content") not in {"old question", "old answer"} for message in new["messages"])
-    assert new["tool_runtime"]["active_tools"] == []
+    assert new["tool_runtime"] == {"active_skills": []}
     assert old["id"] != new["id"]
     assert old["output"] == new["output"] == str(work.resolve())
 
@@ -146,8 +143,7 @@ def test_plain_approve_alias_continues_pending_call(tmp_path, monkeypatch, appro
     import genesisai.app.cli as cli
 
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_create"]}, "load_write_alias")),
-        response(call("file_create", {"path": "alias.md", "content": "ok", "source_refs": []}, "write_alias")),
+        response(call("editor", {"operation": "create", "path": "alias.md", "content": "ok", "source_refs": []}, "write_alias")),
         Response(content="done"),
     )
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
@@ -164,8 +160,7 @@ def test_plain_reject_alias_rejects_only_pending_call(tmp_path, monkeypatch, rej
     import genesisai.app.cli as cli
 
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_create"]}, "load_reject_alias")),
-        response(call("file_create", {"path": "reject.md", "content": "no", "source_refs": []}, "write_reject")),
+        response(call("editor", {"operation": "create", "path": "reject.md", "content": "no", "source_refs": []}, "write_reject")),
         Response(content="rejected"),
     )
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
@@ -185,8 +180,7 @@ def test_new_command_is_blocked_while_confirmation_is_pending(tmp_path, monkeypa
 
     view, stream = recording_view()
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_create"]}, "load_pending_new")),
-        response(call("file_create", {"path": "pending.md", "content": "x", "source_refs": []}, "pending_new")),
+        response(call("editor", {"operation": "create", "path": "pending.md", "content": "x", "source_refs": []}, "pending_new")),
     )
     monkeypatch.setattr(cli, "Console", lambda: view.console)
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
@@ -222,12 +216,10 @@ def test_new_session_keeps_grants_resets_runtime_permission_and_refreshes_ui(tmp
     assert "逐次确认" in stream.getvalue()
 
 
-def test_new_session_clears_active_tools_and_first_request_is_core_only(tmp_path, monkeypatch):
+def test_new_session_resets_session_and_dispatches_full_tool_set(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
-    from genesisai.runtime.registry import CORE_NAMES
 
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_read"]}, "load_before_new")),
         Response(content="old done"),
         Response(content="new done"),
     )
@@ -239,12 +231,11 @@ def test_new_session_clears_active_tools_and_first_request_is_core_only(tmp_path
     assert main(["--workspace", str(work)]) == 0
 
     tool_names = lambda definitions: [item["function"]["name"] for item in definitions]
-    assert tool_names(model.tool_definitions[0]) == list(CORE_NAMES)
-    assert tool_names(model.tool_definitions[1]) == [*CORE_NAMES, "file_read"]
-    assert tool_names(model.tool_definitions[2]) == list(CORE_NAMES)
+    assert "read_files" in tool_names(model.tool_definitions[0])
+    assert tool_names(model.tool_definitions[0]) == tool_names(model.tool_definitions[1])
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in (work / ".genesis" / "sessions").glob("*.json")]
     new = next(item for item in payloads if any(message.get("content") == "new task" for message in item["messages"]))
-    assert new["tool_runtime"]["active_tools"] == []
+    assert new["tool_runtime"] == {"active_skills": []}
 
 
 def test_other_plain_text_cannot_approve_pending_call(tmp_path, monkeypatch):
@@ -252,8 +243,7 @@ def test_other_plain_text_cannot_approve_pending_call(tmp_path, monkeypatch):
 
     view, stream = recording_view()
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_create"]}, "load_not_approval")),
-        response(call("file_create", {"path": "blocked.md", "content": "x", "source_refs": []}, "not_approval")),
+        response(call("editor", {"operation": "create", "path": "blocked.md", "content": "x", "source_refs": []}, "not_approval")),
         Response(content="done"),
     )
     monkeypatch.setattr(cli, "Console", lambda: view.console)
@@ -272,8 +262,7 @@ def test_yes_writes_preauthorizes_only_output_creation(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
 
     model = FakeModel(
-        response(call("tool_load", {"names": ["file_create"]}, "load_yes_writes")),
-        response(call("file_create", {"path": "allowed.md", "content": "ok", "source_refs": []}, "yes_writes")),
+        response(call("editor", {"operation": "create", "path": "allowed.md", "content": "ok", "source_refs": []}, "yes_writes")),
         Response(content="done"),
     )
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
@@ -290,7 +279,7 @@ def test_yes_writes_preauthorizes_only_output_creation(tmp_path, monkeypatch):
 
 def test_yes_search_preauthorizes_public_search(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
-    from genesisai.runtime.tool_runtime import ToolRuntime as RealToolRuntime
+    from genesisai.core.tools.tool_runtime import ToolRuntime as RealToolRuntime
 
     class Provider:
         name = "fixture"
@@ -302,8 +291,7 @@ def test_yes_search_preauthorizes_public_search(tmp_path, monkeypatch):
         return RealToolRuntime(store, access, providers=[Provider()], **kwargs)
 
     model = FakeModel(
-        response(call("tool_load", {"names": ["search_query"]}, "load_yes_search")),
-        response(call("search_query", {"query": "Apple"}, "yes_search")),
+        response(call("fetch_web_content", {"query": "Apple"}, "yes_search")),
         Response(content="done"),
     )
     monkeypatch.setattr(cli, "ToolRuntime", runtime_factory)
@@ -321,7 +309,7 @@ def test_yes_search_preauthorizes_public_search(tmp_path, monkeypatch):
 
 def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
-    from genesisai.runtime.tool_runtime import ToolRuntime as RealToolRuntime
+    from genesisai.core.tools.tool_runtime import ToolRuntime as RealToolRuntime
 
     class Provider:
         name = "fixture"
@@ -340,8 +328,7 @@ def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monke
     assert denied_model.contexts == []
 
     pending_model = FakeModel(
-        response(call("tool_load", {"names": ["search_query"]}, "load_remote_search")),
-        response(call("search_query", {"query": "public"}, "remote_search")),
+        response(call("fetch_web_content", {"query": "public"}, "remote_search")),
     )
     monkeypatch.setattr(cli, "ToolRuntime", runtime_factory)
     monkeypatch.setattr(cli, "build_model", lambda path: (pending_model, True))

@@ -1,0 +1,4 @@
+name: list_files
+enabled: true
+category: kernel
+description: 分页列出授权目录中的文件路径和大小，自动跳过版本控制与依赖目录

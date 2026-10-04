@@ -1,0 +1,4 @@
+name: run_commands
+enabled: true
+category: kernel
+description: 在工作区执行受控命令数组或检查 Python 项目结构（不经过 shell 插值）

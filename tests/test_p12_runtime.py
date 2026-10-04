@@ -7,8 +7,8 @@ import time
 from io import StringIO
 from rich.console import Console
 from genesisai.app.terminal_view import CliView
-from genesisai.runtime.permissions import PermissionPolicy
-from genesisai.agent.research import ResearchController
+from genesisai.core.tools.permissions import PermissionPolicy
+from genesisai.core.research import ResearchController
 
 from test_p11_agent_runtime import runtime_env, FakeModel, tool_call
 from genesisai.shared.messages import Response
@@ -28,9 +28,8 @@ def seed_page(runtime, url="https://example.com/product"):
             return dict(url=url, title="Fixture product A", text="Product A specifications without price. " * 30, truncated=False)
 
     runtime.network = Network()
-    runtime.load_tools(["search_fetch"])
     runtime.research.register_user_urls(url)
-    result = runtime.execute(call("search_fetch", {"url": url}, "first"))
+    result = runtime.execute(call("fetch_web_content", {"url": url}, "first"))
     assert result["ok"]
     return url
 
@@ -39,7 +38,7 @@ def test_cached_success_never_crashes_or_requests_approval(runtime_env):
     store, runtime = runtime_env
     url = seed_page(runtime)
     runtime.confirm_search = True
-    result = runtime.execute(call("search_fetch", {"url": url}, "cached"))
+    result = runtime.execute(call("fetch_web_content", {"url": url}, "cached"))
     assert result["ok"] and result["data"]["cached"]
     assert runtime.network.calls == 1
     assert store.data["run_runtime"]["usage"]["search_fetches"] == 1
@@ -48,9 +47,8 @@ def test_cached_success_never_crashes_or_requests_approval(runtime_env):
 
 def test_invalid_url_is_rejected_before_approval(runtime_env):
     _, runtime = runtime_env
-    runtime.load_tools(["search_fetch"])
     runtime.confirm_search = True
-    result = runtime.execute(call("search_fetch", {"url": "https://example.com/unknown"}, "bad"))
+    result = runtime.execute(call("fetch_web_content", {"url": "https://example.com/unknown"}, "bad"))
     assert not result.get("pending")
     assert result["error"]["code"] == "candidate_not_registered"
 
@@ -70,7 +68,7 @@ def test_price_followup_can_search_without_magic_words(runtime_env, prompt):
             return [{"url": "https://example.com/buy", "title": "Product A price", "snippet": "Fixture"}]
 
     runtime.providers = [Provider()]
-    runner.model = FakeModel(Response(tool_calls=[tool_call("search_query", {"query": "Product A price"}, "price")]), Response(content="价格尚未核实"))
+    runner.model = FakeModel(Response(tool_calls=[tool_call("fetch_web_content", {"query": "Product A price"}, "price")]), Response(content="价格尚未核实"))
     runner.start(prompt)
     results = [json.loads(m["content"]) for m in store.data["messages"] if m["role"] == "tool" and m["tool_call_id"] == "price"]
     assert results[0]["ok"]
@@ -81,7 +79,7 @@ def test_price_followup_can_search_without_magic_words(runtime_env, prompt):
 def test_invalid_outer_results_are_protocol_errors(runtime_env, monkeypatch, payload):
     _, runtime = runtime_env
     monkeypatch.setattr(runtime.executor, 'execute', lambda *a: payload)
-    result = runtime.execute(call('tool_search', {'query': 'files'}, 'invalid'))
+    result = runtime.execute(call('list_files', {'path': '.'}, 'invalid'))
     assert result['error']['code'] == 'invalid_result'
 
 
@@ -96,7 +94,6 @@ def query_provider(runtime):
 
     provider = Provider()
     runtime.providers = [provider]
-    runtime.load_tools(['search_fetch'])
     return provider
 
 
@@ -104,8 +101,8 @@ def waiting_runner(runtime):
     runtime.confirm_search = True
     provider = query_provider(runtime)
     model = FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'product A price'}, 'q1')]),
-        Response(tool_calls=[tool_call('search_query', {'query': 'product A versions'}, 'q2')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'product A price'}, 'q1')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'product A versions'}, 'q2')]),
         Response(content='[[PARTIAL]] 尚未取得价格正文'),
     )
     runner = Runner(model, runtime)
@@ -122,7 +119,7 @@ def test_run_grant_executes_pending_once_and_expires(runtime_env):
     assert runtime.policy.network_run_id is None
     with pytest.raises(ValueError):
         runner.confirm(True)
-    runner.model = FakeModel(Response(tool_calls=[tool_call('search_query', {'query': 'new question'}, 'q3')]))
+    runner.model = FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'query': 'new question'}, 'q3')]))
     assert runner.start('再问一个问题')['status'] == 'awaiting_confirmation'
     assert provider.calls == 2
 
@@ -132,10 +129,10 @@ def test_session_grant_and_revocation_are_independent(runtime_env):
     runner, provider = waiting_runner(runtime)
     runtime.set_permission('network', 'allow')
     assert runner.confirm(True)['status'] == 'partial'
-    assert not runtime.policy.requires_confirmation(runtime.registry.get('search_query').spec)
-    assert runtime.policy.requires_confirmation(runtime.registry.get('shell_run').spec)
+    assert not runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
+    assert runtime.policy.requires_confirmation(runtime.registry.get('run_commands').spec)
     runtime.set_permission('network', 'ask')
-    assert runtime.policy.requires_confirmation(runtime.registry.get('search_query').spec)
+    assert runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
     assert provider.calls == 2
 
 
@@ -173,9 +170,9 @@ def test_run_grant_does_not_restore_or_override_writes(runtime_env):
     runner, _ = waiting_runner(runtime)
     runtime.confirm_writes = True
     runtime.policy.allow_network_run()
-    assert runtime.policy.requires_confirmation(runtime.registry.get('file_create').spec)
+    assert runtime.policy.requires_confirmation(runtime.registry.get('editor').spec)
     restored = PermissionPolicy(store=store)
-    assert restored.requires_confirmation(runtime.registry.get('search_query').spec)
+    assert restored.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
     runner.cancel()
     assert runtime.policy.network_run_id is None
 
@@ -220,9 +217,9 @@ def test_third_same_domain_page_and_cached_offset(runtime_env):
     for index in range(2):
         other = f'https://example.com/page{index}'
         runtime.research.register_user_urls(other)
-        assert runtime.execute(call('search_fetch', {'url': other}, f'page{index}'))['ok']
+        assert runtime.execute(call('fetch_web_content', {'url': other}, f'page{index}'))['ok']
     assert len(store.data['run_runtime']['evidence_refs']) == 3
-    result = runtime.execute(call('search_fetch', {'url': url, 'offset': 10, 'limit': 20}, 'offset'))
+    result = runtime.execute(call('fetch_web_content', {'url': url, 'offset': 10, 'limit': 20}, 'offset'))
     assert result['data']['text'] == ('Product A specifications without price. ' * 30)[10:30]
 
 
@@ -267,21 +264,20 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     provider, network = Provider(), Network()
     runtime.providers, runtime.network = [provider], network
     runtime.confirm_search = True
-    runtime.load_tools(['search_fetch'])
     def answer(text):
         return lambda _: Response(content=text + ' [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'Product A specifications'}, 'r1q')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/product'}, 'r1f')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'Product A specifications'}, 'r1q')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/product'}, 'r1f')]),
         answer('Product A synthetic specifications'),
     ), runtime, on_event=lambda kind, value: events.append((kind, value)))
     assert runner.start('看看产品 A')['status'] == 'awaiting_confirmation'
     runtime.set_permission('network', 'allow')
     assert runner.confirm(True)['status'] == 'completed'
     runner.model = FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/buy'}, 'r1bad')]),
-        Response(tool_calls=[tool_call('search_query', {'query': 'Product A price'}, 'r2q')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/buy'}, 'r2f')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/buy'}, 'r1bad')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'Product A price'}, 'r2q')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/buy'}, 'r2f')]),
         answer('中国大陆 256GB 起售价 CNY 4999；512GB CNY 5999'),
     )
     result = runner.start('其售价多少')
@@ -303,8 +299,7 @@ def test_cli_network_approval_paths(tmp_path, monkeypatch, approve):
     import genesisai.app.cli as cli
     from test_acceptance import FakeModel as CliModel
     model = CliModel(
-        Response(tool_calls=[tool_call('tool_load', {'names': ['search_query']}, 'load')]),
-        Response(tool_calls=[tool_call('search_query', {'query': 'fixture'}, 'q')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'fixture'}, 'q')]),
         Response(content='[[PARTIAL]] 未抓取正文'),
     )
     stream = StringIO()
@@ -340,10 +335,9 @@ def test_frozen_parameters_cannot_change_after_approval(runtime_env):
 
 def test_repeated_bad_url_cannot_issue_network(runtime_env):
     _, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     runtime.confirm_search = True
     for i in range(3):
-        result = runtime.execute(call('search_fetch', {'url': 'https://example.com/missing'}, f'bad{i}'))
+        result = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/missing'}, f'bad{i}'))
         assert not result.get('pending') and result['error']['code'] == 'candidate_not_registered'
 
 
@@ -363,7 +357,7 @@ def test_forced_stop_reason_is_preserved(runtime_env, reason):
 def test_success_result_optional_fields_are_normalized(runtime_env, monkeypatch):
     _, runtime = runtime_env
     monkeypatch.setattr(runtime.research, 'before_execute', lambda c: {'ok': True, 'data': {'cached': True}})
-    result = runtime.execute(call('tool_search', {'query': 'files'}, 'minimal'))
+    result = runtime.execute(call('list_files', {'path': '.'}, 'minimal'))
     assert result['ok'] and result['error'] is None and result['source_refs'] == []
 
 
@@ -371,10 +365,10 @@ def test_search_budget_does_not_cancel_fetch_after_second_query(runtime_env):
     store, runtime = runtime_env
     query_provider(runtime)
     for i in range(2):
-        assert runtime.execute(call('search_query', {'query': f'query {i}'}, f'query{i}'))['ok']
+        assert runtime.execute(call('fetch_web_content', {'query': f'query {i}'}, f'query{i}'))['ok']
     assert store.data['run_runtime']['phase'] == 'explore'
     runtime.network.fetch = lambda url: dict(url=url, text='Fixture CNY 4999', title='Fixture', truncated=False)
-    assert runtime.execute(call('search_fetch', {'url': 'https://example.com/buy'}, 'fetch'))['ok']
+    assert runtime.execute(call('fetch_web_content', {'url': 'https://example.com/buy'}, 'fetch'))['ok']
 
 
 def test_new_session_resets_startup_preapproval(tmp_path, monkeypatch):
@@ -401,7 +395,7 @@ def test_actual_capabilities_are_in_model_context(runtime_env):
     runner = Runner(FakeModel(Response(content='能力取决于工具目录')), runtime)
     runner.start('你能做什么')
     text = runner.model.contexts[0][0].content
-    assert '工具能力状态' in text and 'available' in text and 'search_fetch' in text
+    assert '工具能力状态' in text and 'available' in text and 'fetch_web_content' in text
 
 
 def test_failed_public_page_is_bounded_and_partial(runtime_env):
@@ -412,9 +406,9 @@ def test_failed_public_page_is_bounded_and_partial(runtime_env):
         raise ToolError('http_error', 'HTTP 404', True)
     runtime.network.fetch = missing
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'Product A'}, 'q')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/buy'}, 'f')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/buy'}, 'f2')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'Product A'}, 'q')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/buy'}, 'f')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/buy'}, 'f2')]),
         Response(content='[[PARTIAL]] 购买页不可用，售价未核实'),
     ), runtime)
     result = runner.start('产品 A 多少钱')
@@ -438,7 +432,7 @@ def test_cached_new_spans_count_as_progress_but_duplicates_do_not(runtime_env):
     url = seed_page(runtime)
     before = store.data['run_runtime']['usage']['observations']
     for i in range(3):
-        runtime.execute(call('search_fetch', {'url': url, 'offset': 10, 'limit': 20}, f'span{i}'))
+        runtime.execute(call('fetch_web_content', {'url': url, 'offset': 10, 'limit': 20}, f'span{i}'))
     assert store.data['run_runtime']['usage']['observations'] == before + 1
 
 
@@ -446,7 +440,7 @@ def test_followup_context_keeps_answer_and_compacts_previous_pages(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='之前的答案')), runtime)
     runner.start('产品规格')
-    store.data['messages'].insert(-1, {'role': 'assistant', 'content': None, 'tool_calls': [call('search_fetch', {'url': 'https://example.com/fixture'}, 'fixture')]})
+    store.data['messages'].insert(-1, {'role': 'assistant', 'content': None, 'tool_calls': [call('fetch_web_content', {'url': 'https://example.com/fixture'}, 'fixture')]})
     store.data['messages'].insert(-1, {'role': 'tool', 'tool_call_id': 'fixture', 'content': json.dumps({'ok': True, 'data': {'text': 'Z' * 4000}})})
     runner.model = FakeModel(Response(content='继续回答'))
     runner.start('它的价格呢')

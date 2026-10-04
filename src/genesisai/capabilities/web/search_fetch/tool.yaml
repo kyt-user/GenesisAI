@@ -1,4 +1,0 @@
-name: search_fetch
-enabled: true
-category: web
-description: 安全抓取公开网页正文并登记可引用的网络来源

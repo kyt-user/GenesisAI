@@ -1,4 +1,0 @@
-name: shell_run
-enabled: true
-category: development
-description: 在工作区内直接执行无 shell 插值的命令数组，记录退出码、超时和完整日志

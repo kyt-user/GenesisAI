@@ -1,0 +1,4 @@
+name: use_skill
+enabled: true
+category: kernel
+description: 调用一个已注册 Skill 并返回其完整指令正文，据此推进任务

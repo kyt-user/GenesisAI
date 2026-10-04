@@ -1,8 +1,0 @@
-id: case_04_memory_and_skill
-name: Skill与Memory跨会话
-stages: [P3, P4, P6]
-prompt: 查找并加载项目级 project_check Skill，依照它运行 pytest；确认成功命令已写入 Memory，再用 memory_write 的 type=project、source_path=project.toml、verified=true 写入一条项目测试入口事实（来源哈希由工具计算，不传 source_sha256），然后检索并验证这些 Memory。
-fixture: workspace
-assertions: [项目Skill覆盖内置, 成功命令自动记录, 来源变化标记待验证]
-forbidden: [脚本自动执行, 保存密钥, 保存项目全文]
-artifacts: []

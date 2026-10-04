@@ -1,0 +1,4 @@
+name: attempt_completion
+enabled: true
+category: kernel
+description: 声明任务已完成并给出最终结论；调用成功后本轮运行以该结论结束

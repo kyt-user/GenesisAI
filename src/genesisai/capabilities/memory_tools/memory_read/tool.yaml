@@ -1,4 +1,0 @@
-name: memory_read
-enabled: true
-category: memory
-description: 按 ID 加载一个已选择的 Memory 正文及其验证元数据

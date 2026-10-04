@@ -4,6 +4,8 @@
 状态：P0、P1、P1.1 已形成当前基线；P2～P6 任务集与阶段验收标准已编写；P7 作为独立产品仿真总验收；代码实施尚未开始
 适用范围：GenesisAI 从“网络搜索与本地资料整理 CLI”升级为“面向程序员的本地单 Agent CLI”
 
+> 更新说明（2026-10-04，重构后回填）：本轮工具加载机制已由「按需加载（Tool Selector + Active Tools + `tool_search`/`tool_describe`/`tool_load` 元工具 + 四态机 + `active_limit`）」改为**全量下发**，详见 §8（已整体重写）。§3、§4、§12、§18 中涉及「按需加载 / Active Tools / Tool Selector / 先加载后调用」的描述均为**历史方案**，以 §8 与《GenesisAI 五层架构重构规格》为准。
+
 ## 1. 文档目的
 
 本文定义 GenesisAI 下一轮升级的产品边界、总体架构、核心模块、实施顺序和验收标准。后续代码改造应以本文为主线；具体阶段开始前，可以再拆分为任务清单和测试清单。
@@ -95,7 +97,7 @@ GenesisAI 保持单 Agent 设计。这里的单 Agent 指一个主 Agent 使用 
 - `finish_reason=length`、部分回答、错误工具参数和多次网络失败没有形成可交付的恢复路径；
 - 缺少可复现的真实模型评测集、调用指标和“必须产生最终答案”的发布门禁；
 - Office 文件以读取为主，创建和局部修改能力尚未分级；
-- 当前仍保留 Ollama、百炼等适配代码，与“首版只支持 OpenAI 兼容协议”的产品范围需要统一。
+- 已按“首版只支持 OpenAI 兼容协议”收敛提供方：`model/providers/` 保留 `deepseek` / `qwen`，移除 `ollama` / `bailian` 适配（详见规格 D2、§11.5）。
 
 ## 5. 总体架构
 
@@ -230,62 +232,43 @@ generation:
 
 `generation.max_tokens` 只控制单次模型输出，不能充当整个 Run 的 Token 预算。总模型调用次数、累计 Token、工具调用次数和分类预算由 Agent Runtime 统一限制。默认参数必须通过真实 DeepSeek 任务集验证；不能只根据单轮聊天效果确定温度和输出长度。
 
-## 8. Tool Catalog 与按需加载
+## 8. Tool Catalog 与全量下发
+
+> 本节已按《GenesisAI 五层架构重构规格》§1.2 与 §5 整体重写。早期「按需加载（tool_search / tool_describe / tool_load + Core/Active/Available/Disabled 四态 + Active Tools 上限 8）」设计因产品约束变更而**全部作废**。
 
 ### 8.1 设计目标
 
-GenesisAI 不在每次模型请求中发送所有工具的完整定义。工具先注册到目录，由 Agent 根据当前任务查询和加载实际需要的工具。
+首次模型请求即携带**全部启用且可用工具的完整定义**，不再有「先加载后调用」的两阶段流程。
 
-受 OpenAI 兼容 Tool Calling 协议限制，模型只能直接调用当前请求中已经声明的工具。因此按需加载采用两阶段流程：
+DeepSeek / Qwen 等云模型上下文足够大（全量工具定义约 5.5K token），延迟下发的收益不再成立；两阶段加载引入的元工具、Active 缓存与会话持久化成为纯粹的复杂度与故障点。因此首版改为全量下发。
 
 ```text
-模型获得核心目录工具
-  → 查询候选工具
-  → Runner 加载候选工具完整 Schema
-  → 下一次模型调用使用具体工具
+组装期扫描注册表
+  → 计算 enabled 且平台/依赖可用
+  → 首轮模型请求携带全部完整定义
+  → 模型直接调用具体工具
 ```
 
-### 8.2 工具分层
+### 8.2 工具目录结构
 
-| 层级 | 含义 | 生命周期 |
-| --- | --- | --- |
-| Core | 工具搜索、查看、加载及任务控制 | 始终可用 |
-| Active | 当前任务已经加载的具体工具 | 当前任务内缓存 |
-| Available | 已注册但尚未发送给模型的工具 | 需要时加载 |
-| Disabled | 被配置、平台或依赖禁用的工具 | 不可调用 |
-
-始终可见的 Core 工具固定为三个：
-
-- `tool_search`：按名称、分类和描述搜索目录；
-- `tool_describe`：查看候选工具的用途、参数概览和风险；
-- `tool_load`：请求 Runner 在下一轮加载具体工具。
-
-P1 不按用户输入自动猜测和预加载业务工具。Agent 必须显式调用 `tool_load`，加载结果从下一轮模型请求开始生效。
-
-### 8.3 工具目录结构
+工具执行引擎位于 `core/tools/`（L4）：
 
 ```text
-src/genesisai/tools/
-├── registry.py
-├── catalog.py
-├── loader.py
-├── executor.py
+core/tools/
+├── registry.py      # 扫描 tool.yaml + Spec，严格校验后建立内存目录
+├── catalog.py       # enabled/available 判据 + 全量 definitions()
+├── loader.py        # 执行期惰性 import，避免可选依赖启动即崩
+├── executor.py      # 参数校验、权限、台账、unknown_execution 防重放
 ├── permissions.py
 ├── ledger.py
-├── runtime.py
-├── core/
-├── filesystem/
-├── development/
-├── git/
-├── web/
-├── documents/
-└── memory/
+├── base.py
+└── tool_runtime.py  # 组装入口
 ```
 
-每个具体工具拥有独立目录和 `tool.yaml`：
+每个工具保持独立目录和 `tool.yaml`：
 
 ```text
-filesystem/file_read/
+core/extensions/tools/kernel/read_files/
 ├── tool.yaml
 ├── spec.py
 └── implementation.py
@@ -294,60 +277,97 @@ filesystem/file_read/
 每份 `tool.yaml` 必须且只能声明四个字段：
 
 - `name`：与目录一致的唯一工具名；
-- `enabled`：是否允许加载；
-- `category`：工具分类；
+- `enabled`：是否允许下发；
+- `category`：工具分类（`kernel` / `office` / `novel` / `mcp`）；
 - `description`：与真实能力一致的简短说明。
 
-工具不设置版本字段，也不设置顶层 `catalog.yaml`。参数 Schema、权限、路径、网络、副作用、超时和平台限制由同目录 `spec.py` 固定；Python 实现入口由目录约定推导，不允许 YAML 指向任意模块。Registry 启动时扫描 `tool.yaml` 和 Spec，严格校验后建立内存目录。
+工具不设置版本字段，也不设置顶层 `catalog.yaml`。参数 Schema、权限、路径、网络、副作用、超时和平台限制由同目录 `spec.py` 固定；Python 实现入口由目录约定推导。Registry 启动时扫描 `tool.yaml` 和 Spec，严格校验后建立内存目录。
 
-### 8.4 预选和回退
+`catalog.definitions()` 返回全部 `enabled` 且平台/依赖可用的工具完整定义：
 
-P1 中 Agent 使用 `tool_search`、`tool_describe` 和 `tool_load` 完成显式发现，Active Tools 上限固定为 8。P4 接入 Skills 时可以在不绕过 Catalog 和 Loader 的前提下增加 Skill 推荐，具体规则在 P4 文档确定。
+```python
+def definitions(self) -> list[dict]:
+    """全量下发：返回所有 enabled 且平台/依赖可用的工具完整定义。"""
+    return [d.definition() for d in self.registry.values() if self.enabled(d)]
+```
 
-工具被加载不代表调用自动获准。每一次具体调用仍必须通过权限检查。
+依赖缺失的工具（如未安装 office 可选依赖时的 pptx 工具）按不可用原因自动剔除，不进入请求。
+
+### 8.3 内核收敛（对齐 Cline 9 内核）
+
+工具目录从 50 个收敛为 **9 个通用内核工具**，余下领域能力由外部扩展缝或独立工具包承载。收敛属于**行为变更**：
+
+| 内核工具 | 权限 | 吸收原工具 |
+| --- | --- | --- |
+| `read_files` | read | `file_read`（多文件 + 分页） |
+| `list_files` | read | `file_list` |
+| `search_codebase` | read | `file_search` + `code_index`（文件名/正文/结构索引） |
+| `editor` | write | `file_create` + `file_patch` + `file_move` + `file_delete` + `file_copy` + `directory_create` |
+| `run_commands` | shell | `shell_run` + `test_run` + `python_project` + `git_*` |
+| `fetch_web_content` | network | `search_query` + `search_fetch` |
+| `use_skill` | core | skills 缝 |
+| `memory` | write | `memory_read/write/search/forget/validate` + `project_plan` |
+| `attempt_completion` | core | `submit_and_exit` 同构 |
+
+- `editor` 通过 `operation` 参数分派 `create/patch/move/delete/copy/mkdir`；单次调用只声明统一权限，具体操作在 prepare 阶段给出预览。
+- `memory` 通过 `operation` 分派 `search/read/write/forget/validate/plan`。
+- `run_commands` 通过 `operation` 分派 `run/inspect`，并承载 git 等命令式读取。
+- 每个内核工具只声明单一 permission（`core/read/write/network/shell`）；网络工具 `network=True`，写/命令类工具 `side_effect=True`。
+
+### 8.4 保留为工具包的领域能力
+
+`office`（10 个）与 `novel`（4 个）保留为**独立工具包**（`category=office/novel`），不并入内核；它们同保持三件套约定，并在依赖缺失时自动不可用。
+
+### 8.5 外部扩展缝
+
+内核之外的领域能力由四条扩展缝挂载，其工具汇入同一 `ToolRegistry`，并走同一条 executor/permissions/ledger 管线：
+
+- **Skills（可执行）**：`core/extensions/skills/`，内核工具 `use_skill(name)` 一次返回指令正文；
+- **Rules（系统提示注入）**：`core/extensions/rules/`，组装期读取 `AGENTS.md`（项目级 + 用户级），免工具调用注入；
+- **MCP（动态桥接）**：`core/extensions/mcp/`，读取 `.genesis/mcp.json`，动态注册 `category="mcp"` 工具；
+- **Workflows（斜杠工作流）**：`.genesis/workflows/*.md` + `/workflow <name>` 展开。
+
+### 8.6 权限与安全不变
+
+全量下发只影响「哪些工具定义进入请求」，不影响调用授权。每一次具体调用仍必须通过权限检查；`executor` 保持 `unknown_execution` 防重放、台账与确认冻结。会话 `store["tool_runtime"]` 只保留 `active_skills`（上限 2），早期 `active_tools` 字段已从会话 Schema 移除。
 
 ## 9. Tools 能力规划
 
 ### 9.1 文件与代码
 
-- `file_list`：受控列举、分页和过滤；
-- `file_search`：文件名和文本搜索；
-- `file_read`：按范围读取；P2 再增加代码行号；
-- `file_create`：在输出目录创建新文件并禁止覆盖；
-- `file_write`：明确授权后的整体写入，后续阶段实现；
-- `apply_patch`：小范围、可审查的代码修改；
-- `file_copy`：复制资料和生成副本；
-- `file_move`：后续在明确确认下提供；
-- `file_delete`：不作为首批默认工具。
+> 内核收敛后不再单列文件工具，统一由 `read_files` / `list_files` / `search_codebase` / `editor` 承载（映射见 §8.3）。
+
+- `list_files`：受控列举、分页和过滤；
+- `search_codebase`：文件名、正文检索与代码结构索引；
+- `read_files`：按范围读取多文件并分页，含代码行号；
+- `editor`：单一编辑内核，经 `operation` 分派 `create/patch/move/delete/copy/mkdir`。
 
 文件修改必须保留原有编码、BOM、换行符和权限。写入前记录内容哈希，执行前再次核对，防止覆盖用户或其他进程的并发修改；写入后生成 diff 或等价变更摘要。
 
 ### 9.2 开发命令
 
-- `shell_run`：执行受控命令；
-- `test_run`：运行项目测试并结构化提取结果；
-- `build_run`：运行已识别的构建命令；
-- `lint_run`：运行格式或静态检查命令；
-- `process_cancel`：终止由当前任务启动的长时间进程。
+> 原 `shell_run` / `test_run` / `python_project` 合并为内核工具 `run_commands`。
+
+- `run_commands`（`operation=run`）：执行受控命令，并结构化提取测试结果；
+- `run_commands`（`operation=inspect`）：只读环境探测（解释器、依赖、项目结构）。
 
 Shell 必须指定工作目录、超时和输出上限，默认限定在项目内。执行器应优先使用参数数组，避免不必要的命令字符串拼接。命令的退出码、标准输出、标准错误、耗时和截断状态必须真实记录。
 
 ### 9.3 Git
 
-- `git_status`：查看工作区状态；
-- `git_diff`：查看未暂存、已暂存或指定范围变更；
-- `git_log`：读取有限历史；
-- `git_show`：读取指定提交；
-- `git_branch`：只读分支信息；
-- `git_commit`：后续作为需要明确授权的写操作。
+Git 能力并入 `run_commands`（经 shell 权限运行 `git` 子命令），不再单列工具：
 
-首批 Git 工具以只读查看为主。切换分支、重置、清理、推送和强制操作不进入默认自动执行范围。
+- 只读查看：`git status` / `git diff` / `git log` / `git show` / `git branch`；
+- `git commit` 等写操作需要明确授权后才会执行。
+
+首批 Git 能力以只读查看为主。切换分支、重置、清理、推送和强制操作不进入默认自动执行范围。
 
 ### 9.4 网络
 
-- `search_query`：查询公开搜索服务；
-- `search_fetch`：抓取并提取公开页面；
-- `web_download`：后续按文件类型和路径策略提供。
+> 原 `search_query` / `search_fetch` 合并为内核工具 `fetch_web_content`。
+
+- `fetch_web_content`（`query`）：查询公开搜索服务；
+- `fetch_web_content`（`url`）：抓取并提取公开页面。
 
 搜索结果必须登记标题、最终 URL、查询时间、访问时间和提取状态。网页内容默认只进入当前上下文；只有稳定结论或用户明确要求保存的内容才进入 Memory。网页和下载内容作为不可信资料处理，不能提升工具权限。
 
@@ -355,9 +375,9 @@ Shell 必须指定工作目录、超时和输出上限，默认限定在项目�
 
 ```text
 问题与时效判断
-→ search_query 生成候选
+→ fetch_web_content(query) 生成候选
 → URL 规范化、域名与内容去重
-→ search_fetch 读取少量候选正文
+→ fetch_web_content(url) 读取少量候选正文
 → Evidence Bundle 更新
 → 缺口与冲突判断
 → 补检或最终回答
@@ -365,7 +385,7 @@ Shell 必须指定工作目录、超时和输出上限，默认限定在项目�
 
 第一版规则：
 
-- `search_fetch` 只接受用户明确给出的 URL，或本 Run 中 `search_query` 返回并登记的候选 URL；禁止模型自行拼接 Bing、DuckDuckGo 等搜索结果页 URL 代替 `search_query`；
+- `fetch_web_content` 的抓取模式只接受用户明确给出的 URL，或本 Run 中检索模式返回并登记的候选 URL；禁止模型自行拼接 Bing、DuckDuckGo 等搜索结果页 URL 代替检索；
 - 同一规范化 URL 最多抓取一次，同一内容哈希或 SimHash 只保留一份，同一域名默认最多选择两份有效来源；
 - 403、404、不支持格式和正文为空属于该候选失败，不对同一 URL 重试；超时和 5xx 最多重试一次；
 - 官方来源能够直接回答时优先使用官方来源；重要事实需要至少一个权威来源，存在争议时再增加独立来源；
@@ -975,11 +995,12 @@ P1.1 是 P1 的产品可用性补充，代码、自动测试和真实 DeepSeek �
 
 ### 18.2 Tools
 
-- [ ] 初始模型请求只携带 `tool_search`、`tool_describe`、`tool_load` 三个 Core 工具。
-- [ ] Agent 可以搜索、查看并加载具体工具。
-- [ ] 未加载工具不能被直接调用。
-- [ ] 禁用、重复、Schema 错误和缺少依赖的工具有明确诊断。
-- [ ] Tool 加载不绕过调用权限。
+> 工具加载设计已按《GenesisAI 五层架构重构规格》§5 与本文 §8 改为**全量下发**（旧「按需加载」已作废）；以下为交付形态的验收项。
+
+- [ ] 首轮模型请求即携带**全部启用且可用工具的完整定义**，不再有 `tool_search` / `tool_describe` / `tool_load` 元工具与「先加载后调用」两阶段流程。
+- [ ] 工具面收敛为 **9 个内核工具**（`read_files`/`list_files`/`search_codebase`/`editor`/`run_commands`/`fetch_web_content`/`use_skill`/`memory`/`attempt_completion`）+ 保留工具包 `office`/`novel` + 运行期 `category="mcp"` 动态工具。
+- [ ] 全量下发不绕过调用授权：每次工具调用仍须通过权限检查、台账与 `unknown_execution` 防重放。
+- [ ] 禁用、重复、Schema 错误和缺少依赖的工具有明确诊断（依赖缺失自动不可用）。
 
 ### 18.3 Prompt、研究与上下文
 
@@ -1088,9 +1109,11 @@ P1.1 是 P1 的产品可用性补充，代码、自动测试和真实 DeepSeek �
 8. Memory 没有保存整个仓库副本、密钥或模型推理文本。
 9. xiaoerAI 文件没有被修改，也不是 GenesisAI 的运行时依赖。
 
+> **回填（2026-10-04，真实 DeepSeek 冒烟已通过）**：以 `deepseek-v4-flash` 在真实仓库执行，逐条对应：1) 内核工具全量下发（`Tools 23/23`），仅调用 `run_commands`/`read_files`/`editor`；2) 读写均在工作区边界内；3) `editor` 以 `expected_sha256` 校验，修改前后 sha256 可追踪；4) `python -m pytest -q` 真实执行（退出码 1→0，`2 failed`→`2 passed`）；5) 最终回答列出缺陷、修改与验证结果；6) `git diff` 与汇报一致（仅 `calc.py` 一行）；7) 已验证测试命令已写入 Memory（`type=command`）；8) Memory 仅存命令与其来源，未含仓库副本/密钥/推理文本；9) 未触碰 xiaoerAI。
+
 ## 20. 完成定义
 
-本轮升级完成时，GenesisAI 应能作为一个可实际使用的单 Agent 开发 CLI：它能理解真实仓库，通过目录发现并按需加载 Tools，遵循 Skill 完成代码修改和验证，并使用 JSON 与 Markdown 保存轻量、可审查、可迁移的项目 Memory。
+本轮升级完成时，GenesisAI 应能作为一个可实际使用的单 Agent 开发 CLI：它能理解真实仓库，首轮即全量下发工具定义并通过内核工具完成代码修改与验证，遵循 Skill 复用稳定流程，并使用 JSON 与 Markdown 保存轻量、可审查、可迁移的项目 Memory。
 
 “任务完成”必须有实际证据：文件变更真实存在、相关验证实际运行、失败和限制如实说明、权限没有被绕过、长期 Memory 只记录经过允许且具备来源的信息。
 

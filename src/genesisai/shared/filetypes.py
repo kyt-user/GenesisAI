@@ -4,7 +4,14 @@ from pathlib import Path
 import zipfile
 
 from genesisai.shared.security import ToolError
-from genesisai.capabilities.filesystem.shared import TEXT_SUFFIXES
+
+
+TEXT_SUFFIXES = {
+    '.txt', '.md', '.markdown', '.csv', '.json', '.yaml', '.yml', '.toml', '.xml',
+    '.py', '.pyi', '.js', '.jsx', '.ts', '.tsx', '.java', '.kt', '.kts', '.c', '.h',
+    '.cpp', '.hpp', '.cs', '.go', '.rs', '.rb', '.php', '.sh', '.ps1', '.bat', '.cmd',
+    '.ini', '.cfg', '.conf', '.sql', '.html', '.css', '.scss', '.vue',
+}
 
 
 def detect_file_type(path):

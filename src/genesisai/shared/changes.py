@@ -6,7 +6,7 @@ import os
 import shutil
 from pathlib import Path
 
-from genesisai.state.store import sha, uid
+from genesisai.shared.ids import sha, uid
 
 
 def backup_file(store, path):

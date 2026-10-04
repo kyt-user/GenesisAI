@@ -9,12 +9,12 @@ from genesisai.app.cli import load_environment
 from genesisai.model.config import build_model
 from genesisai.agent.runner import Runner
 from genesisai.shared.security import Access
-from genesisai.state.store import HostLock, Store, atomic_json
-from genesisai.runtime.tool_runtime import ToolRuntime
-from genesisai.capabilities.web.network import Network
-from genesisai.capabilities.web.providers.duckduckgo import DuckDuckGoSearchProvider
-from genesisai.capabilities.web.providers.bing import BingSearchProvider
-from genesisai.capabilities.web.contracts import SearchQuery
+from genesisai.core.state.store import HostLock, Store, atomic_json
+from genesisai.core.tools.tool_runtime import ToolRuntime
+from genesisai.core.extensions.tools.web.network import Network
+from genesisai.core.extensions.tools.web.providers.duckduckgo import DuckDuckGoSearchProvider
+from genesisai.core.extensions.tools.web.providers.bing import BingSearchProvider
+from genesisai.core.extensions.tools.web.contracts import SearchQuery
 
 
 def main():

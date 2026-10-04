@@ -8,10 +8,10 @@ from test_p12_runtime import call, query_provider
 from genesisai.shared.messages import Response
 from genesisai.agent.runner import Runner
 from genesisai.shared.security import ToolError
-from genesisai.capabilities.web.contracts import SearchError, SearchQuery
-from genesisai.capabilities.web.providers.bing import BingSearchProvider
-from genesisai.capabilities.web.providers.brave import BraveSearchProvider
-from genesisai.capabilities.web.providers.duckduckgo import DuckDuckGoSearchProvider
+from genesisai.core.extensions.tools.web.contracts import SearchError, SearchQuery
+from genesisai.core.extensions.tools.web.providers.bing import BingSearchProvider
+from genesisai.core.extensions.tools.web.providers.brave import BraveSearchProvider
+from genesisai.core.extensions.tools.web.providers.duckduckgo import DuckDuckGoSearchProvider
 
 
 def test_brave_distinguishes_missing_credentials_without_exposing_key():
@@ -29,8 +29,8 @@ def test_provider_reason_is_safe_and_repeated_candidates_are_explicit(runtime_en
         def search(self, *args, **kwargs):
             raise SearchError('provider_auth_error', 'DO_NOT_LOG_SECRET', reason='missing_credentials')
     runtime.providers = [Missing(), provider]
-    first = runtime.execute(call('search_query', {'query': 'product'}, 'q1'))
-    second = runtime.execute(call('search_query', {'query': 'product price'}, 'q2'))
+    first = runtime.execute(call('fetch_web_content', {'query': 'product'}, 'q1'))
+    second = runtime.execute(call('fetch_web_content', {'query': 'product price'}, 'q2'))
     assert first['data']['diagnostics']['new_candidates'] == 1
     assert second['data']['diagnostics']['repeated_candidates'] is True
     assert second['data']['fallback_errors'][0]['reason'] == 'missing_credentials'
@@ -47,7 +47,7 @@ def test_unknown_provider_reason_cannot_leak_exception_text(runtime_env):
         def search(self, *args, **kwargs):
             raise SearchError('provider_unavailable', 'secret', reason='SECRET_REASON')
     runtime.providers = [Broken(), provider]
-    result = runtime.execute(call('search_query', {'query': 'fixture'}, 'q'))
+    result = runtime.execute(call('fetch_web_content', {'query': 'fixture'}, 'q'))
     assert 'reason' not in result['data']['fallback_errors'][0]
 
 
@@ -89,7 +89,6 @@ def test_duckduckgo_http_failures_are_classified(status, code, reason, retryable
 
 def test_all_provider_failures_are_persisted_and_traced_without_secrets(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query'])
     class Provider:
         def __init__(self, name, code, reason, retryable):
             self.name, self.code, self.reason, self.retryable = name, code, reason, retryable
@@ -99,7 +98,7 @@ def test_all_provider_failures_are_persisted_and_traced_without_secrets(runtime_
         Provider('one', 'provider_unavailable', 'timeout', True),
         Provider('two', 'provider_invalid_response', 'parse_error', False),
     ]
-    result = runtime.execute(call('search_query', {'query': 'fixture'}, 'all_failed'))
+    result = runtime.execute(call('fetch_web_content', {'query': 'fixture'}, 'all_failed'))
     diagnostics = store.data['run_runtime']['search_diagnostics']
     trace = (store.root / 'traces' / f'{store.id}.jsonl').read_text(encoding='utf-8')
     assert result['error']['code'] == 'search_unavailable'
@@ -114,7 +113,6 @@ def test_all_provider_failures_are_persisted_and_traced_without_secrets(runtime_
 
 def test_failed_url_cannot_bypass_two_attempt_limit_with_new_call_ids(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     runtime.research.register_user_urls('https://example.com/unavailable')
     class Network:
         calls = 0
@@ -122,9 +120,9 @@ def test_failed_url_cannot_bypass_two_attempt_limit_with_new_call_ids(runtime_en
             self.calls += 1
             raise ToolError('fetch_failed', 'HTTP 503', True)
     runtime.network = Network()
-    first = runtime.execute(call('search_fetch', {'url': 'https://example.com/unavailable'}, 'failure_1'))
-    second = runtime.execute(call('search_fetch', {'url': 'https://example.com/unavailable'}, 'failure_2'))
-    third = runtime.execute(call('search_fetch', {'url': 'https://example.com/unavailable'}, 'failure_3'))
+    first = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, 'failure_1'))
+    second = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, 'failure_2'))
+    third = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, 'failure_3'))
     assert first['error']['code'] == second['error']['code'] == 'fetch_failed'
     assert third['error']['code'] == 'retry_exhausted'
     assert runtime.network.calls == 2
@@ -137,7 +135,6 @@ def test_failed_url_cannot_bypass_two_attempt_limit_with_new_call_ids(runtime_en
 
 def test_failed_candidate_does_not_block_registered_alternative(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     runtime.research.register_user_urls('https://example.com/unavailable https://example.com/price')
     class Network:
         def fetch(self, url):
@@ -145,15 +142,14 @@ def test_failed_candidate_does_not_block_registered_alternative(runtime_env):
                 raise ToolError('fetch_failed', 'HTTP 503', True)
             return {'url': url, 'title': 'Price', 'text': 'Mainland China 256GB CNY 4999', 'truncated': False}
     runtime.network = Network()
-    assert not runtime.execute(call('search_fetch', {'url': 'https://example.com/unavailable'}, 'bad'))['ok']
-    result = runtime.execute(call('search_fetch', {'url': 'https://example.com/price'}, 'good'))
+    assert not runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, 'bad'))['ok']
+    result = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/price'}, 'good'))
     assert result['ok'] and result['source_refs']
     assert store.data['run_runtime']['stop_reason'] is None
 
 
 def test_repeated_search_after_exhausted_candidates_forces_external_failure(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query', 'search_fetch'])
     class Provider:
         name = 'fixture'
         def search(self, *args, **kwargs):
@@ -162,23 +158,22 @@ def test_repeated_search_after_exhausted_candidates_forces_external_failure(runt
         def fetch(self, url):
             raise ToolError('fetch_failed', 'HTTP 503', True)
     runtime.providers, runtime.network = [Provider()], Network()
-    assert runtime.execute(call('search_query', {'query': 'fixture price'}, 'query_1'))['ok']
+    assert runtime.execute(call('fetch_web_content', {'query': 'fixture price'}, 'query_1'))['ok']
     for number in (1, 2):
-        assert not runtime.execute(call('search_fetch', {'url': 'https://example.com/unavailable'}, f'fetch_{number}'))['ok']
-    repeated = runtime.execute(call('search_query', {'query': 'fixture official price'}, 'query_2'))
+        assert not runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, f'fetch_{number}'))['ok']
+    repeated = runtime.execute(call('fetch_web_content', {'query': 'fixture official price'}, 'query_2'))
     assert repeated['data']['diagnostics']['repeated_candidates'] is True
     assert store.data['run_runtime']['stop_reason'] == 'external_source_unavailable'
 
 
 def test_all_search_providers_failing_has_distinct_stop_reason(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query'])
     class Provider:
         name = 'fixture'
         def search(self, *args, **kwargs):
             raise SearchError('provider_unavailable', 'secret', retryable=True, reason='connection_error')
     runtime.providers = [Provider()]
-    result = runtime.execute(call('search_query', {'query': 'fixture'}, 'query'))
+    result = runtime.execute(call('fetch_web_content', {'query': 'fixture'}, 'query'))
     assert result['error']['code'] == 'search_unavailable'
     assert store.data['run_runtime']['stop_reason'] == 'search_service_unavailable'
 
@@ -187,13 +182,13 @@ def test_previous_run_activity_does_not_include_older_failures(runtime_env):
     store, runtime = runtime_env
     query_provider(runtime)
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': 'https://example.com/guessed'}, 'old_failure')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/guessed'}, 'old_failure')]),
         Response(content='[[PARTIAL]] 尚未取得正文'),
     ), runtime)
     runner.start('查询资料')
     older_id = store.data['run_id']
     runner.model = FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'price'}, 'new_search')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'price'}, 'new_search')]),
         Response(content='[[PARTIAL]] 尚未取得价格正文'),
     )
     runner.start('价格多少')
@@ -209,7 +204,7 @@ def test_previous_run_activity_does_not_include_older_failures(runtime_env):
 @pytest.mark.parametrize('repeated', [False, True])
 def test_serialized_tool_markup_is_never_executed_or_displayed(runtime_env, repeated):
     store, runtime = runtime_env
-    markup = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="search_fetch">not-a-call</｜｜DSML｜｜ invoke>'
+    markup = '<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name="fetch_web_content">not-a-call</｜｜DSML｜｜ invoke>'
     runner = Runner(FakeModel(Response(content=markup), Response(content=markup if repeated else '[[PARTIAL]] 没有取得价格正文。')), runtime)
     result = runner.start('价格多少')
     assert result['status'] == ('failed' if repeated else 'partial')
@@ -222,13 +217,13 @@ def test_serialized_tool_markup_is_never_executed_or_displayed(runtime_env, repe
 
 def test_serialized_tool_recovery_respects_round_limit(runtime_env):
     _, runtime = runtime_env
-    runner = Runner(FakeModel(Response(content='<｜DSML｜invoke name="search_fetch">')), runtime, max_rounds=1)
+    runner = Runner(FakeModel(Response(content='<｜DSML｜invoke name="fetch_web_content">')), runtime, max_rounds=1)
     result = runner.start('查询资料')
     assert result['status'] == 'failed' and 'DSML' not in result['answer']
 
 
 def test_page_link_discovery_is_same_origin_bounded_and_prefers_main():
-    from genesisai.capabilities.web.links import discover_links
+    from genesisai.core.extensions.tools.web.links import discover_links
     html = '<nav><a href="/account">Account</a></nav><main><a href="/buy">Buy</a><a href="/buy#same">Duplicate</a></main>'
     html += '<a href="https://evil.example/send">Send</a><a href="http://example.com/insecure">Downgrade</a><a href="javascript:alert(1)">JS</a>'
     links = discover_links(html, 'https://example.com/')
@@ -243,13 +238,13 @@ def test_discovered_links_have_provenance_and_still_require_approval(runtime_env
     runtime.research.register_user_urls('https://example.com/')
     runtime.network.fetch = lambda url: dict(url=url, title='Fixture', text='Fixture ' + url, truncated=False,
                                            links=[{'url': 'https://example.com/buy', 'title': 'Buy'}, {'url': 'https://evil.example/', 'title': 'Bad'}])
-    page = runtime.execute(call('search_fetch', {'url': 'https://example.com/'}, 'home'))
+    page = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/'}, 'home'))
     candidate = store.data['run_runtime']['candidates']['https://example.com/buy']
     assert candidate['source_type'] == 'page_link'
     assert candidate['parent_source_ref'] == page['source_refs'][0]
     assert 'https://evil.example/' not in store.data['run_runtime']['candidates']
     runtime.confirm_search = True
-    purchase = runtime.execute(call('search_fetch', {'url': 'https://example.com/buy'}, 'buy'))
+    purchase = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/buy'}, 'buy'))
     assert purchase['pending'] is True
 
 
@@ -260,9 +255,9 @@ def test_link_discovery_stops_after_two_hops(runtime_env):
     runtime.network.fetch = lambda url: dict(url=url, title='Fixture', text='Fixture ' + url, truncated=False,
                                            links=[{'url': 'https://example.com/' + str(int(url[-1]) + 1), 'title': 'Next'}])
     for i in range(3):
-        assert runtime.execute(call('search_fetch', {'url': f'https://example.com/{i}'}, f'f{i}'))['ok']
+        assert runtime.execute(call('fetch_web_content', {'url': f'https://example.com/{i}'}, f'f{i}'))['ok']
     assert 'https://example.com/3' not in store.data['run_runtime']['candidates']
-    cached = runtime.execute(call('search_fetch', {'url': 'https://example.com/2'}, 'cached'))
+    cached = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/2'}, 'cached'))
     assert cached['data']['links'] == []
 
 
@@ -286,8 +281,8 @@ def test_no_tools_request_explicitly_disables_model_tool_choice():
 
 
 def test_old_link_lists_are_compacted_without_mutating_stored_result(runtime_env):
-    from genesisai.prompt.context_budgeter import ContextBudgeter
-    from genesisai.prompt.composer import PromptComposer
+    from genesisai.core.prompt.context_budgeter import ContextBudgeter
+    from genesisai.core.prompt.composer import PromptComposer
     store, _ = runtime_env
     payload = {'data': {'links': [{'url': f'https://example.com/{i}', 'title': str(i)} for i in range(30)]}}
     item = {'role': 'tool', 'content': json.dumps(payload)}
@@ -297,16 +292,16 @@ def test_old_link_lists_are_compacted_without_mutating_stored_result(runtime_env
 
 
 def test_current_context_compacts_older_observations_and_reports_cost(runtime_env):
-    from genesisai.prompt.context_budgeter import ContextBudgeter
-    from genesisai.prompt.composer import PromptComposer
+    from genesisai.core.prompt.context_budgeter import ContextBudgeter
+    from genesisai.core.prompt.composer import PromptComposer
     store, _ = runtime_env
     def observation(character):
         return json.dumps({'ok': True, 'data': {'text': character * 5000, 'links': [], 'hits': []}}, ensure_ascii=False)
     store.data['messages'] = [
         {'role': 'user', 'content': '价格是多少'},
-        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'one', 'name': 'search_fetch', 'arguments': '{}'}]},
+        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'one', 'name': 'fetch_web_content', 'arguments': '{}'}]},
         {'role': 'tool', 'content': observation('A'), 'tool_call_id': 'one'},
-        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'two', 'name': 'search_fetch', 'arguments': '{}'}]},
+        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'two', 'name': 'fetch_web_content', 'arguments': '{}'}]},
         {'role': 'tool', 'content': observation('B'), 'tool_call_id': 'two'},
     ]
     messages = ContextBudgeter(store, PromptComposer()).build('web_quick')
@@ -332,10 +327,9 @@ def test_model_trace_contains_only_context_size_report(runtime_env):
 
 def test_unrelated_followup_resets_usage_without_old_evidence_forcing_answer(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     runtime.research.register_user_urls('https://example.com/product')
     runtime.network.fetch = lambda url: {'url': url, 'title': 'Product', 'text': 'Product fixture facts', 'truncated': False}
-    assert runtime.execute(call('search_fetch', {'url': 'https://example.com/product'}, 'product'))['ok']
+    assert runtime.execute(call('fetch_web_content', {'url': 'https://example.com/product'}, 'product'))['ok']
     previous_refs = list(store.data['run_runtime']['evidence_refs'])
     store.data['run_runtime']['usage']['search_queries'] = 2
     runner = Runner(FakeModel(Response(content='历史事件回答')), runtime)
@@ -348,14 +342,13 @@ def test_unrelated_followup_resets_usage_without_old_evidence_forcing_answer(run
 
 def test_search_service_failure_explanation_uses_latest_stop_reason(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query'])
     class Provider:
         name = 'fixture'
         def search(self, *args, **kwargs):
             raise SearchError('provider_unavailable', 'secret', retryable=True, reason='connection_error')
     runtime.providers = [Provider()]
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'current fact'}, 'search')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'current fact'}, 'search')]),
         Response(content='[[PARTIAL]] 搜索服务当前不可用，尚未取得资料。'),
     ), runtime)
     assert runner.start('查询当前事实')['status'] == 'partial'
@@ -369,7 +362,6 @@ def test_search_service_failure_explanation_uses_latest_stop_reason(runtime_env)
 
 def test_two_domains_without_target_field_remain_partial(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query', 'search_fetch'])
     urls = ['https://one.example/info', 'https://two.example/info']
     class Provider:
         name = 'fixture'
@@ -378,9 +370,9 @@ def test_two_domains_without_target_field_remain_partial(runtime_env):
     runtime.providers = [Provider()]
     runtime.network.fetch = lambda url: {'url': url, 'title': 'Information', 'text': url + ' specifications only; no price field.', 'truncated': False}
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'item price'}, 'query')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': urls[0]}, 'one')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': urls[1]}, 'two')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'item price'}, 'query')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': urls[0]}, 'one')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': urls[1]}, 'two')]),
         Response(content='[[PARTIAL]] 两个正文均未列出价格。'),
     ), runtime)
     result = runner.start('这个项目的价格是多少')
@@ -391,7 +383,6 @@ def test_two_domains_without_target_field_remain_partial(runtime_env):
 
 def test_non_product_research_uses_the_same_evidence_path(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query', 'search_fetch'])
     url = 'https://history.example/event'
     class Provider:
         name = 'fixture'
@@ -402,8 +393,8 @@ def test_non_product_research_uses_the_same_evidence_path(runtime_env):
     def final(_):
         return Response(content='事件发生于 2001-02-03 [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_query', {'query': 'fixture historical event date'}, 'query')]),
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'query': 'fixture historical event date'}, 'query')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         final,
     ), runtime)
     result = runner.start('这个历史事件是哪天发生的')
@@ -413,7 +404,6 @@ def test_non_product_research_uses_the_same_evidence_path(runtime_env):
 
 def test_multi_region_price_evidence_is_available_without_cross_combining(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/price-regions'
     runtime.research.register_user_urls(url)
     runtime.network.fetch = lambda value: {
@@ -425,7 +415,7 @@ def test_multi_region_price_evidence_is_available_without_cross_combining(runtim
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'中国大陆 128GB 起售价 CNY 4999；256GB 为 CNY 5999 [{ref}]')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         final,
     ), runtime)
     result = runner.start('https://example.com/price-regions 中国大陆起售价和 256GB 价格')
@@ -436,19 +426,17 @@ def test_multi_region_price_evidence_is_available_without_cross_combining(runtim
 
 def test_loaded_tools_persist_across_capability_followup(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_query', 'search_fetch'])
     runner = Runner(FakeModel(Response(content='可查询并读取公开网页。')), runtime)
     runner.start('你能做什么')
     runner.model = FakeModel(Response(content='可以继续使用已加载的网络工具。'))
     runner.start('刚才的网络工具还可用吗')
     offered = {item['function']['name'] for item in runner.model.tools[0]}
-    assert {'search_query', 'search_fetch'} <= offered
+    assert {'fetch_web_content'} <= offered
     assert store.data['run_runtime']['tool_activity'] == []
 
 
 def test_unsupported_price_is_discarded_before_recovery(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/price'
     runtime.research.register_user_urls(url)
     runtime.network.fetch = lambda value: {
@@ -458,7 +446,7 @@ def test_unsupported_price_is_discarded_before_recovery(runtime_env):
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'中国大陆起售价 CNY 9999 [{ref}]')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         unsupported,
         lambda _: Response(
             content='[[PARTIAL]] 正文仅列出另一个价格，所问价格尚未取得。 [' + store.data['run_runtime']['evidence_refs'][-1] + ']'
@@ -473,7 +461,6 @@ def test_unsupported_price_is_discarded_before_recovery(runtime_env):
 
 def test_supported_price_claim_passes_body_validation(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/price'
     runtime.research.register_user_urls(url)
     runtime.network.fetch = lambda value: {
@@ -483,7 +470,7 @@ def test_supported_price_claim_passes_body_validation(runtime_env):
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'中国大陆起售价 4999 元 [{ref}]')
     result = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]), final,
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), final,
     ), runtime).start(url + ' 这个产品起售价是多少')
     assert result['status'] == 'completed' and '4999' in result['answer'], (result, store.data['run_runtime'])
 
@@ -505,19 +492,18 @@ def test_explicit_web_intent_preloads_builtin_search_tools(runtime_env):
     runner.start('查询官网目前列出的产品')
     offered = {item['function']['name'] for item in runner.model.tools[0]}
     assert store.data['run_runtime']['profile'] == 'web_quick'
-    assert {'search_query', 'search_fetch'} <= offered
+    assert {'fetch_web_content'} <= offered
     assert store.data['run_runtime']['tool_activity'] == []
 
 
 def test_recall_reuses_validated_answer_without_model_or_tool_call(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/price'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Price', 'text': 'Price: EUR 29.3', 'truncated': False}
     def priced(_):
         return Response(content='价格为 EUR 29.3 [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]), priced,
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), priced,
     ), runtime)
     runner.start(url + ' 的价格是多少')
     runner.model = FakeModel(Response(content='不应调用'))
@@ -545,14 +531,13 @@ def test_recall_of_older_named_field_uses_one_tool_free_model_call(runtime_env):
 
 def test_invalid_source_answer_is_not_saved_and_recovery_gets_allowed_refs(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/facts'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Facts', 'text': 'Verified fixture fact.', 'truncated': False}
     def recovered(_):
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'已核实事实 [{ref}]')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         Response(content='错误引用 [src_0000000000000000]'),
         recovered,
     ), runtime)
@@ -564,11 +549,10 @@ def test_invalid_source_answer_is_not_saved_and_recovery_gets_allowed_refs(runti
 
 def test_repeated_invalid_sources_end_with_readable_evidence_fallback(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/facts'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Facts', 'text': 'Verified fixture fact.', 'truncated': False}
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         Response(content='错误引用 [src_0000000000000000]'),
         Response(content='仍然错误 [src_1111111111111111]'),
     ), runtime)
@@ -579,7 +563,7 @@ def test_repeated_invalid_sources_end_with_readable_evidence_fallback(runtime_en
 
 
 def test_structured_product_price_is_preserved_as_bounded_source_text():
-    from genesisai.capabilities.web.structured_data import extract_product_facts
+    from genesisai.core.extensions.tools.web.structured_data import extract_product_facts
     html = '''
     <meta property="product:price:amount" content="999.00">
     <meta property="product:price:currency" content="USD">
@@ -595,14 +579,13 @@ def test_structured_product_price_is_preserved_as_bounded_source_text():
 
 
 def test_structured_product_meta_price_is_used_only_as_fallback():
-    from genesisai.capabilities.web.structured_data import extract_product_facts
+    from genesisai.core.extensions.tools.web.structured_data import extract_product_facts
     html = '<meta property="og:title" content="Fixture"><meta property="product:price:amount" content="49.99"><meta property="product:price:currency" content="USD">'
     assert extract_product_facts(html).splitlines() == ['Product: Fixture', 'Price: USD 49.99']
 
 
 def test_verified_price_can_complete_after_exploration_reserve(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/price'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Price', 'text': 'Price: EUR 29.3', 'truncated': False}
     def final(_):
@@ -610,7 +593,7 @@ def test_verified_price_can_complete_after_exploration_reserve(runtime_env):
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'官方价格为 EUR 29.3 [{ref}]')
     result = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]), final,
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), final,
     ), runtime).start(url + ' 的价格是多少')
     assert result['status'] == 'completed'
     assert store.data['run_runtime']['stop_reason'] == 'model_answer'
@@ -618,7 +601,6 @@ def test_verified_price_can_complete_after_exploration_reserve(runtime_env):
 
 def test_same_number_in_wrong_currency_fails_price_validation(runtime_env):
     store, runtime = runtime_env
-    runtime.load_tools(['search_fetch'])
     url = 'https://example.com/regions'
     runtime.network.fetch = lambda value: {
         'url': value, 'title': 'Regional prices',
@@ -628,7 +610,7 @@ def test_same_number_in_wrong_currency_fails_price_validation(runtime_env):
         ref = store.data['run_runtime']['evidence_refs'][-1]
         return Response(content=f'中国大陆价格为 CNY 799 [{ref}]')
     runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('search_fetch', {'url': url}, 'fetch')]),
+        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
         wrong_currency,
         lambda _: Response(content='[[PARTIAL]] 无法从正文确认所问币种的金额。 [' + store.data['run_runtime']['evidence_refs'][-1] + ']'),
     ), runtime)

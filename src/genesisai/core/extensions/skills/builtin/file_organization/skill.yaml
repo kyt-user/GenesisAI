@@ -1,0 +1,4 @@
+name: file_organization
+description: 按明确规则整理、移动和核对工作区文件
+entry: SKILL.md
+tools: [list_files, search_codebase, editor]

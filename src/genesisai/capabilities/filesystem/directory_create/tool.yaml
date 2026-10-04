@@ -1,4 +1,0 @@
-name: directory_create
-enabled: true
-category: filesystem
-description: 在工作区内创建新目录，并拒绝覆盖现有路径

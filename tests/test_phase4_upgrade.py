@@ -3,7 +3,6 @@
 覆盖：
 - 流式输出 + reasoning 渲染
 - 自验证循环
-- 记忆分类检索与注入
 - creative profile 组装
 - profile-aware compact
 - code_index 工具
@@ -19,12 +18,11 @@ from rich.console import Console
 
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.app.terminal_view import CliView
-from genesisai.memory.manager import MemoryManager, CODING_TYPES, CREATIVE_TYPES
-from genesisai.prompt.context_budgeter import ContextBudgeter, select_initial_profile
-from genesisai.prompt.composer import PromptComposer
-from genesisai.state.store import Store
+from genesisai.core.prompt.context_budgeter import ContextBudgeter, select_initial_profile
+from genesisai.core.prompt.composer import PromptComposer
+from genesisai.core.state.store import Store
 from genesisai.shared.security import Access
-from genesisai.runtime.tool_runtime import ToolRuntime
+from genesisai.core.tools.tool_runtime import ToolRuntime
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +46,6 @@ def _store_and_runtime(tmp_path, *, active=()):
         confirm_search=False,
         confirm_shell=False,
     )
-    if active:
-        runtime.load_tools(list(active))
     return workspace, output, store, runtime
 
 
@@ -119,41 +115,6 @@ class TestStreamingRendering:
 
 
 # ---------------------------------------------------------------------------
-# 4.2 Memory category retrieval and injection
-# ---------------------------------------------------------------------------
-
-class TestMemoryCategories:
-    def test_by_category_returns_matching_types(self, tmp_path):
-        manager = MemoryManager(tmp_path)
-        manager.add(type="character", title="Alice", summary="主角", content="Alice 是故事主角")
-        manager.add(type="architecture", title="API", summary="REST API", content="REST API 设计")
-        manager.add(type="plot_thread", title="主线", summary="寻找宝藏", content="主线情节")
-
-        creative = manager.by_category(*CREATIVE_TYPES)
-        assert len(creative) == 2
-        types = {e["type"] for e in creative}
-        assert types == {"character", "plot_thread"}
-
-        coding = manager.by_category(*CODING_TYPES)
-        assert len(coding) == 1
-        assert coding[0]["type"] == "architecture"
-
-    def test_summaries_for_returns_compact_dicts(self, tmp_path):
-        manager = MemoryManager(tmp_path)
-        manager.add(type="gotcha", title="陷阱", summary="注意边界条件", content="详细解释")
-        manager.add(type="convention", title="命名", summary="使用驼峰", content="命名规范")
-
-        summaries = manager.summaries_for(CODING_TYPES)
-        assert len(summaries) == 2
-        for s in summaries:
-            assert "type" in s and "title" in s and "summary" in s
-
-    def test_summaries_for_empty_returns_empty(self, tmp_path):
-        manager = MemoryManager(tmp_path)
-        assert manager.summaries_for(CREATIVE_TYPES) == []
-
-
-# ---------------------------------------------------------------------------
 # 4.3 Creative profile selection and prompt assembly
 # ---------------------------------------------------------------------------
 
@@ -165,7 +126,7 @@ class TestCreativeProfile:
         assert select_initial_profile("创建一个世界观") == "creative"
 
     def test_creative_profile_has_high_budget(self):
-        from genesisai.prompt.context_budgeter import PROFILES
+        from genesisai.core.prompt.context_budgeter import PROFILES
         profile = PROFILES["creative"]
         assert profile.model_calls >= 25
         assert profile.token_budget >= 100000
@@ -177,31 +138,6 @@ class TestCreativeProfile:
 # ---------------------------------------------------------------------------
 
 class TestProfileAwareCompact:
-    def test_compact_includes_story_bible_for_creative(self, tmp_path):
-        workspace, output, store, runtime = _store_and_runtime(tmp_path)
-        store.data["workspace"] = str(workspace)
-        store.data["run_runtime"]["profile"] = "creative"
-        store.data["run_runtime"]["protocols"] = ["creative_writing"]
-        # Add some messages
-        store.data["messages"] = [
-            {"role": "user", "content": "写第一章"},
-            {"role": "assistant", "content": "好的，开始写"},
-            {"role": "user", "content": "继续"},
-            {"role": "assistant", "content": "第二章内容"},
-            {"role": "user", "content": "再写"},
-        ]
-        # Add creative memory
-        manager = MemoryManager(workspace)
-        manager.add(type="character", title="Bob", summary="反派", content="Bob 是反派角色")
-
-        composer = PromptComposer()
-        budgeter = ContextBudgeter(store, composer)
-        summary = budgeter.compact(force=True)
-
-        assert "story_bible" in summary
-        assert summary["story_bible"].get("characters")
-        assert any(c["title"] == "Bob" for c in summary["story_bible"]["characters"])
-
     def test_compact_includes_coding_context_for_local_files(self, tmp_path):
         workspace, output, store, runtime = _store_and_runtime(tmp_path)
         store.data["workspace"] = str(workspace)
@@ -236,7 +172,7 @@ class TestProfileAwareCompact:
 
 class TestCodeIndex:
     def test_code_index_extracts_python_signatures(self, tmp_path):
-        workspace, _, _, runtime = _store_and_runtime(tmp_path, active=("code_index",))
+        workspace, _, _, runtime = _store_and_runtime(tmp_path)
         target = workspace / "sample.py"
         target.write_text(
             "import os\n\n"
@@ -250,8 +186,8 @@ class TestCodeIndex:
         )
         call = {
             "id": "call_idx",
-            "name": "code_index",
-            "arguments": json.dumps({"path": "."}),
+            "name": "search_codebase",
+            "arguments": json.dumps({"path": ".", "mode": "index"}),
         }
         result = runtime.execute(call)
         assert result["ok"]
@@ -261,11 +197,11 @@ class TestCodeIndex:
         assert data["summary"]["total_functions"] >= 1
 
     def test_code_index_handles_empty_directory(self, tmp_path):
-        workspace, _, _, runtime = _store_and_runtime(tmp_path, active=("code_index",))
+        workspace, _, _, runtime = _store_and_runtime(tmp_path)
         call = {
             "id": "call_idx2",
-            "name": "code_index",
-            "arguments": json.dumps({"path": "."}),
+            "name": "search_codebase",
+            "arguments": json.dumps({"path": ".", "mode": "index"}),
         }
         result = runtime.execute(call)
         assert result["ok"]
@@ -312,23 +248,23 @@ class TestNovelTools:
 
 class TestProtocolsDetection:
     def test_debugging_protocol_detected(self):
-        from genesisai.agent.runner import Runner
-        protocols = Runner._protocols_for("这段代码为什么会报错？debug 一下")
+        from genesisai.core.prompt.task_protocols import TaskProtocolSelector
+        protocols = TaskProtocolSelector().protocols_for("这段代码为什么会报错？debug 一下")
         assert "debugging" in protocols
 
     def test_creative_writing_protocol_detected(self):
-        from genesisai.agent.runner import Runner
-        protocols = Runner._protocols_for("帮我写小说的第一章")
+        from genesisai.core.prompt.task_protocols import TaskProtocolSelector
+        protocols = TaskProtocolSelector().protocols_for("帮我写小说的第一章")
         assert "creative_writing" in protocols
 
     def test_revision_protocol_detected(self):
-        from genesisai.agent.runner import Runner
-        protocols = Runner._protocols_for("请润色这段文字")
+        from genesisai.core.prompt.task_protocols import TaskProtocolSelector
+        protocols = TaskProtocolSelector().protocols_for("请润色这段文字")
         assert "revision" in protocols
 
     def test_coding_protocol_detected(self):
-        from genesisai.agent.runner import Runner
-        protocols = Runner._protocols_for("帮我编写一个函数")
+        from genesisai.core.prompt.task_protocols import TaskProtocolSelector
+        protocols = TaskProtocolSelector().protocols_for("帮我编写一个函数")
         assert "coding" in protocols
 
 
@@ -406,16 +342,16 @@ class TestSelfVerification:
         runner = Runner(MinimalModel(), runtime, max_rounds=5, seconds=60)
 
         # local_files profile should auto-verify
-        assert runner._should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 0})
+        assert runner.development.should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 0})
         # coding protocol should auto-verify
-        assert runner._should_auto_verify({"profile": "direct_answer", "protocols": ["coding"], "verification_rounds": 0})
+        assert runner.development.should_auto_verify({"profile": "direct_answer", "protocols": ["coding"], "verification_rounds": 0})
         # direct_answer without coding should NOT auto-verify
-        assert not runner._should_auto_verify({"profile": "direct_answer", "protocols": [], "verification_rounds": 0})
+        assert not runner.development.should_auto_verify({"profile": "direct_answer", "protocols": [], "verification_rounds": 0})
         # Max rounds reached should NOT auto-verify
-        assert not runner._should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 3})
+        assert not runner.development.should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 3})
 
     def test_verification_rounds_tracked_in_state(self, tmp_path):
         """verification_rounds field is properly initialized and tracked."""
-        from genesisai.agent.research import ResearchController
+        from genesisai.core.research import ResearchController
         state = ResearchController.empty_state("local_files")
         assert state.get("verification_rounds") == 0

@@ -1,4 +1,0 @@
-name: repository_analysis
-description: 分析仓库入口、依赖、构建、测试、目录职责和风险
-entry: SKILL.md
-tools: [file_list, file_search, file_read, test_run, git_status, git_log]

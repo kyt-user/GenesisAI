@@ -1,4 +1,0 @@
-name: tool_load
-enabled: true
-category: core
-description: 将选定的内置业务工具加载到当前任务的 Active Tools

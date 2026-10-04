@@ -1,0 +1,4 @@
+name: read_files
+enabled: true
+category: kernel
+description: 读取一个或多个授权文件正文，支持行范围或偏移分页；可一次读取多文件

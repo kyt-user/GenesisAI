@@ -5,7 +5,7 @@ import json
 import pytest
 
 from genesisai.agent.runner import Runner
-from genesisai.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, atomic_json
+from genesisai.core.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, atomic_json
 
 
 def session_path(root, session_id):
@@ -48,7 +48,7 @@ def test_new_session_has_current_schema_version(tmp_path):
 
     assert store.data['schema_version'] == CURRENT_SESSION_SCHEMA_VERSION == 3
     assert saved['schema_version'] == 3
-    assert saved['tool_runtime'] == {'active_tools': [], 'active_skills': []}
+    assert saved['tool_runtime'] == {'active_skills': []}
 
 
 def test_unversioned_session_migrates_without_losing_content(tmp_path):
@@ -60,7 +60,7 @@ def test_unversioned_session_migrates_without_losing_content(tmp_path):
     saved = json.loads(path.read_text(encoding='utf-8'))
 
     assert loaded.data['schema_version'] == saved['schema_version'] == 3
-    assert loaded.data['tool_runtime'] == {'active_tools': [], 'active_skills': []}
+    assert loaded.data['tool_runtime'] == {'active_skills': []}
     for key, value in original.items():
         assert loaded.data[key] == value
         assert saved[key] == value
@@ -76,7 +76,7 @@ def test_v1_session_migrates_to_v2_without_losing_content(tmp_path):
     saved = json.loads(path.read_text(encoding='utf-8'))
 
     assert loaded.data['schema_version'] == saved['schema_version'] == 3
-    assert loaded.data['tool_runtime'] == saved['tool_runtime'] == {'active_tools': [], 'active_skills': []}
+    assert loaded.data['tool_runtime'] == saved['tool_runtime'] == {'active_skills': []}
     for key, value in original.items():
         if key != 'schema_version':
             assert loaded.data[key] == saved[key] == value
@@ -143,7 +143,10 @@ def test_migrated_unknown_call_remains_blocked_from_replay(tmp_path):
     write_session(root, data['id'], data)
 
     loaded = Store(root, data['id'])
-    executor = type('Executor', (), {'store': loaded})()
+    executor = type('Executor', (), {
+        'store': loaded, 'composer': None, 'context_budgeter': None,
+        'trace': None, 'docs': None,
+    })()
 
     assert loaded.data['schema_version'] == 3
     assert loaded.data['calls']['call_1']['state'] == 'unknown'
@@ -153,7 +156,7 @@ def test_migrated_unknown_call_remains_blocked_from_replay(tmp_path):
 def test_atomic_json_uses_replace_and_removes_temporary_file(tmp_path, monkeypatch):
     path = tmp_path / 'session.json'
     calls = []
-    import genesisai.state.store as storage
+    import genesisai.core.state.store as storage
 
     real_replace = storage.os.replace
 

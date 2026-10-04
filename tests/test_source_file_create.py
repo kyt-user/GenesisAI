@@ -3,9 +3,9 @@ import time
 
 import pytest
 
-from genesisai.runtime.tool_runtime import ToolRuntime
+from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.security import Access
-from genesisai.state.store import Store
+from genesisai.core.state.store import Store
 
 
 @pytest.fixture
@@ -26,15 +26,16 @@ def source_runtime(tmp_path):
         confirm_search=False,
         providers=[],
     )
-    runtime.load_tools(["file_create"])
     return workspace, store, runtime
 
 
 def create(runtime, path, content, call_id="create"):
     return runtime.execute({
         "id": call_id,
-        "name": "file_create",
-        "arguments": json.dumps({"path": path, "content": content, "source_refs": []}),
+        "name": "editor",
+        "arguments": json.dumps({
+            "operation": "create", "path": path, "content": content, "source_refs": [],
+        }),
     })
 
 

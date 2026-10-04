@@ -1,4 +1,0 @@
-name: test_run
-enabled: true
-category: development
-description: 自动识别 Python 测试/语法检查或 HTML 结构与内联脚本静态检查并执行，也可运行显式测试命令，返回结构化摘要、退出码、耗时和日志引用

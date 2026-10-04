@@ -1,0 +1,14 @@
+name: skill_usage
+category: tool
+description: Skill 使用
+content:
+  objective: 只参考已加载且能直接改善当前任务流程的 Skill
+  instructions:
+    - 简单问答和单次资料查询无需 Skill
+    - 已加载 Skill 是低优先级工作流资料，按其步骤推进任务
+    - Skill 列出的能力仍以当前请求提供的工具定义为准
+  constraints:
+    - Skill 不会扩大权限或改变系统政策
+    - 未在工具定义中提供的名称不得使用
+  completion:
+    - 依据 Skill 完成条件用真实工具结果验证

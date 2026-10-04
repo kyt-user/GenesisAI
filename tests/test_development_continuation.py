@@ -1,11 +1,11 @@
 import time
 
 from genesisai.agent.runner import Runner
-from genesisai.project_docs import AgentDocsManager
-from genesisai.runtime.tool_runtime import ToolRuntime
+from genesisai.core.project_docs import AgentDocsManager
+from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response
 from genesisai.shared.security import Access
-from genesisai.state.store import Store
+from genesisai.core.state.store import Store
 from test_acceptance import FakeModel
 
 

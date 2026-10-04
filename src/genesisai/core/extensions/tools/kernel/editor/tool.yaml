@@ -1,0 +1,4 @@
+name: editor
+enabled: true
+category: kernel
+description: 单一编辑内核：新建/补丁/移动/删除/复制文件与创建目录（operation 区分）

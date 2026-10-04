@@ -1,5 +1,3 @@
-"""四字段工具 YAML 和受信任 Registry。"""
-
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from genesisai.runtime.base import ToolSpec, object_schema
-from genesisai.runtime.registry import CORE_NAMES, TOOL_FIELDS, RegistryError, ToolRegistry
+from genesisai.core.tools.base import ToolSpec, object_schema
+from genesisai.core.tools.registry import TOOL_FIELDS, RegistryError, ToolRegistry
 
 
 def valid_spec(permission="read"):
@@ -29,15 +27,15 @@ def write_tool(root, category, directory, data):
 
 def registry_from(root, monkeypatch):
     monkeypatch.setattr(
-        "genesisai.runtime.registry.importlib.import_module",
+        "genesisai.core.tools.registry.importlib.import_module",
         lambda name: SimpleNamespace(
-            SPEC=valid_spec("core" if ".core." in name else "network" if ".web." in name else "read")
+            SPEC=valid_spec("network" if "fetch_web_content" in name else "read")
         ),
     )
     return ToolRegistry(root)
 
 
-def descriptor(name, category="filesystem", enabled=True):
+def descriptor(name, category="kernel", enabled=True):
     return {
         "name": name,
         "enabled": enabled,
@@ -54,8 +52,7 @@ def test_real_registry_has_exact_four_field_manifests():
         for manifest in root.glob("*/tool.yaml")
     )
 
-    assert len(registry) == len(manifests) >= 21
-    assert set(CORE_NAMES) == {item.name for item in registry.values() if item.category == "core"}
+    assert len(registry) == len(manifests) >= 15
     for manifest in manifests:
         data = yaml.safe_load(manifest.read_text(encoding="utf-8"))
         assert set(data) == TOOL_FIELDS
@@ -67,7 +64,7 @@ def test_real_registry_has_exact_four_field_manifests():
 @pytest.mark.parametrize(
     "data,match",
     [
-        ({"name": "demo", "enabled": True, "category": "filesystem"}, "字段"),
+        ({"name": "demo", "enabled": True, "category": "kernel"}, "字段"),
         ({**descriptor("demo"), "version": "1"}, "字段"),
         ([], "根节点"),
         ({**descriptor("demo"), "enabled": "true"}, "布尔"),
@@ -75,33 +72,26 @@ def test_real_registry_has_exact_four_field_manifests():
     ],
 )
 def test_invalid_manifest_shapes_are_rejected(tmp_path, monkeypatch, data, match):
-    write_tool(tmp_path, "filesystem", "demo", data)
+    write_tool(tmp_path, "kernel", "demo", data)
     with pytest.raises(RegistryError, match=match):
         registry_from(tmp_path, monkeypatch)
 
 
 def test_name_must_match_directory(tmp_path, monkeypatch):
-    write_tool(tmp_path, "filesystem", "folder_name", descriptor("other_name"))
+    write_tool(tmp_path, "kernel", "folder_name", descriptor("other_name"))
     with pytest.raises(RegistryError, match="目录不一致"):
         registry_from(tmp_path, monkeypatch)
 
 
 def test_duplicate_name_is_rejected_across_categories(tmp_path, monkeypatch):
-    write_tool(tmp_path, "filesystem", "duplicate", descriptor("duplicate"))
-    write_tool(tmp_path, "web", "duplicate", descriptor("duplicate", "web"))
+    write_tool(tmp_path, "kernel", "duplicate", descriptor("duplicate"))
+    write_tool(tmp_path, "office", "duplicate", descriptor("duplicate", "office"))
     with pytest.raises(RegistryError, match="重复"):
         registry_from(tmp_path, monkeypatch)
 
 
-def test_core_cannot_be_disabled(tmp_path, monkeypatch):
-    for name in CORE_NAMES:
-        write_tool(tmp_path, "core", name, descriptor(name, "core", enabled=name != "tool_load"))
-    with pytest.raises(RegistryError, match="Core"):
-        registry_from(tmp_path, monkeypatch)
-
-
 def test_yaml_python_constructor_is_not_executed(tmp_path, monkeypatch):
-    path = tmp_path / "filesystem" / "unsafe"
+    path = tmp_path / "kernel" / "unsafe"
     path.mkdir(parents=True)
     (path / "tool.yaml").write_text("!!python/object/apply:os.system ['echo unsafe']", encoding="utf-8")
     (path / "spec.py").write_text("SPEC = None\n", encoding="utf-8")
@@ -111,20 +101,20 @@ def test_yaml_python_constructor_is_not_executed(tmp_path, monkeypatch):
 
 
 def test_missing_spec_or_implementation_is_rejected(tmp_path, monkeypatch):
-    write_tool(tmp_path, "filesystem", "demo", descriptor("demo"))
-    (tmp_path / "filesystem" / "demo" / "implementation.py").unlink()
+    write_tool(tmp_path, "kernel", "demo", descriptor("demo"))
+    (tmp_path / "kernel" / "demo" / "implementation.py").unlink()
     with pytest.raises(RegistryError, match="缺少"):
         registry_from(tmp_path, monkeypatch)
 
 
 def test_invalid_spec_is_rejected_before_runtime(tmp_path, monkeypatch):
-    write_tool(tmp_path, "filesystem", "demo", descriptor("demo"))
+    write_tool(tmp_path, "kernel", "demo", descriptor("demo"))
     bad = ToolSpec(
         parameters={"type": "object", "properties": {}, "required": []},
         permission="read",
     )
     monkeypatch.setattr(
-        "genesisai.runtime.registry.importlib.import_module",
+        "genesisai.core.tools.registry.importlib.import_module",
         lambda name: SimpleNamespace(SPEC=bad),
     )
 
@@ -134,12 +124,18 @@ def test_invalid_spec_is_rejected_before_runtime(tmp_path, monkeypatch):
 
 def test_registry_does_not_import_business_implementations():
     modules = [
-        f"genesisai.capabilities.filesystem.{name}.implementation"
-        for name in ("file_list", "file_search", "file_read", "file_create", "file_copy")
-    ]
-    modules += [
-        f"genesisai.capabilities.web.{name}.implementation"
-        for name in ("search_query", "search_fetch")
+        f"genesisai.core.extensions.tools.kernel.{name}.implementation"
+        for name in (
+            "read_files",
+            "list_files",
+            "search_codebase",
+            "editor",
+            "run_commands",
+            "fetch_web_content",
+            "plan",
+            "attempt_completion",
+            "use_skill",
+        )
     ]
     for module in modules:
         sys.modules.pop(module, None)
@@ -152,24 +148,22 @@ def test_registry_does_not_import_business_implementations():
 def test_registry_root_is_inside_installed_genesisai_package():
     registry = ToolRegistry()
     package_root = Path(__file__).resolve().parents[1] / "src" / "genesisai"
+    tools = package_root / "core" / "extensions" / "tools"
     assert registry.root == package_root
-    assert registry.category_roots["core"] == package_root / "runtime" / "builtin_tools" / "core"
-    assert registry.category_roots["filesystem"] == package_root / "capabilities" / "filesystem"
-    assert registry.category_roots["development"] == package_root / "capabilities" / "shell"
+    assert registry.category_roots["kernel"] == tools / "kernel"
+    assert registry.category_roots["office"] == tools / "office"
+    assert registry.category_roots["novel"] == tools / "novel"
 
 
 def test_registry_refresh_applies_yaml_enabled_change(tmp_path, monkeypatch):
-    for name in CORE_NAMES:
-        write_tool(tmp_path, "core", name, descriptor(name, "core"))
-    write_tool(tmp_path, "filesystem", "file_read", descriptor("file_read"))
+    write_tool(tmp_path, "kernel", "read_files", descriptor("read_files"))
     registry = registry_from(tmp_path, monkeypatch)
-    manifest = tmp_path / "filesystem" / "file_read" / "tool.yaml"
+    manifest = tmp_path / "kernel" / "read_files" / "tool.yaml"
     manifest.write_text(
-        yaml.safe_dump(descriptor("file_read", enabled=False), allow_unicode=True),
+        yaml.safe_dump(descriptor("read_files", enabled=False), allow_unicode=True),
         encoding="utf-8",
     )
 
     registry.refresh()
 
-    assert registry.get("file_read").enabled is False
-
+    assert registry.get("read_files").enabled is False

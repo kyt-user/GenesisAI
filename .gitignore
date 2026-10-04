@@ -5,6 +5,8 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest_base/
+.import_linter_cache/
 *.egg-info/
 build/
 dist/
@@ -19,3 +21,5 @@ htmlcov/
 .genesis/command_logs/
 .genesis/backups/
 .genesis/.host.lock
+cline_sdk/
+apps/

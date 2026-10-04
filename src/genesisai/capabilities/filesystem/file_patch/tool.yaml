@@ -1,4 +1,0 @@
-name: file_patch
-enabled: true
-category: filesystem
-description: 在工作区内对现有文本文件应用 unified diff，并检查原文哈希和并发变化

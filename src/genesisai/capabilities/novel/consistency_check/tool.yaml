@@ -1,4 +1,0 @@
-name: consistency_check
-enabled: true
-category: novel
-description: 检查角色名一致性和情节线索矛盾（基于故事圣经）

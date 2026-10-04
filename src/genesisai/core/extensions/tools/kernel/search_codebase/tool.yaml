@@ -1,0 +1,4 @@
+name: search_codebase
+enabled: true
+category: kernel
+description: 在授权目录内按文件名或正文检索，或输出代码结构索引（类/函数/导入/TODO）

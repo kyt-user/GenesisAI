@@ -1,4 +1,0 @@
-name: git_log
-enabled: true
-category: git
-description: 读取有限数量的 Git 提交日志

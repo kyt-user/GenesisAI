@@ -1,4 +1,0 @@
-name: project_plan
-enabled: true
-category: memory
-description: 为 agent_docs 当前开发任务写入具体实施步骤、验收条件和非目标；修改产品代码前优先调用

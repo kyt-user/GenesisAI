@@ -1,4 +1,0 @@
-name: file_search
-enabled: true
-category: filesystem
-description: 按文件名或受支持文件的正文搜索授权目录

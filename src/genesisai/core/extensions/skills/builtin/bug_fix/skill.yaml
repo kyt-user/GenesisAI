@@ -1,0 +1,4 @@
+name: bug_fix
+description: 复现、定位、最小修复并验证代码缺陷
+entry: SKILL.md
+tools: [search_codebase, read_files, editor, run_commands]

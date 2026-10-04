@@ -1,4 +1,0 @@
-name: file_list
-enabled: true
-category: filesystem
-description: 分页列出授权目录中的文件路径和大小
