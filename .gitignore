@@ -21,5 +21,4 @@ htmlcov/
 .genesis/command_logs/
 .genesis/backups/
 .genesis/.host.lock
-cline_sdk/
-apps/
+temp/
