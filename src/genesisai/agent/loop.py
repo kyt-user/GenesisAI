@@ -1,4 +1,10 @@
-"""单 Agent 的 ReAct 循环骨架：只持有端口，不 import 任何 core 实现。"""
+"""单 Agent 的 ReAct 循环骨架。
+
+注意：本模块现在 import core 层实现（RunLogger），用于完整的日志记录功能。
+
+
+日志系统包含配置管理、存储查询和分析功能。
+"""
 
 from __future__ import annotations
 
@@ -15,6 +21,7 @@ from genesisai.agent.recovery import RecoveryMixin, SOURCE_REF
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
 from genesisai.shared.budgets import initial_run_runtime, is_recall_request, select_initial_profile
 from genesisai.shared.ids import uid
+from genesisai.core.state.logger import RunLogger
 
 
 class ContextLimitError(ValueError):
@@ -40,6 +47,7 @@ class Runner(RecoveryMixin):
         self.trace = runtime.trace
         self.machine = RunStateMachine(self.store)
         self.docs = runtime.docs
+        self.run_logger = RunLogger(self.store)
 
     @property
     def research(self):
@@ -87,6 +95,11 @@ class Runner(RecoveryMixin):
         self.store.save()
         state = self.store.data['run_runtime']
         self.store.event('status', status=value, profile=state['profile'], phase=state['phase'], stop_reason=state.get('stop_reason'), evidence_count=len(state['evidence_refs']))
+        
+        # 记录运行摘要日志
+        if hasattr(self, 'run_logger') and value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
+            self.run_logger.log_round_summary(self.store.data.get('rounds', 0), value, answer)
+        
         return dict(status=value, answer=self.store.data.get('answer', ''), pending=self.store.data['pending'])
 
     def ensure_available(self):
@@ -452,11 +465,22 @@ class Runner(RecoveryMixin):
                     return self.stop('limit_reached', '达到工具调用上限', 'tool_budget')
                 self.research.force_answer('tool_budget'); self.close_pending('budget_exhausted'); return None
             d['tool_count'] += 1; self.store.save()
+        
+        # 记录工具执行开始
+        if hasattr(self, 'run_logger'):
+            self.run_logger.log_tool_execution_start(call['id'], call['name'], call.get('arguments', '{}'))
+        
         self.on_event('tool_start', dict(name=call['name'])); started = time.monotonic()
         result = self.runtime.execute(call)
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        
+        # 记录工具执行完成
+        if hasattr(self, 'run_logger'):
+            self.run_logger.log_tool_execution_end(call['id'], call['name'], result, elapsed_ms)
+        
         if result.get('pending'):
             return self.status('awaiting_confirmation', self.runtime.confirmation_message(call['name']))
-        self.store.event('tool_end', tool_call_id=call['id'], tool=call['name'], ok=result.get('ok'), code=(result.get('error') or {}).get('code'), elapsed_ms=round((time.monotonic() - started) * 1000), profile=d['run_runtime']['profile'], phase=d['run_runtime']['phase'])
+        self.store.event('tool_end', tool_call_id=call['id'], tool=call['name'], ok=result.get('ok'), code=(result.get('error') or {}).get('code'), elapsed_ms=elapsed_ms, profile=d['run_runtime']['profile'], phase=d['run_runtime']['phase'])
         if result.get('error') and result['error']['code'] == 'unknown_execution': return self.status('interrupted', result['error']['message'])
         self.append_result(call, result)
         if call['name'] == 'attempt_completion' and result.get('ok'):

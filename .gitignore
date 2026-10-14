@@ -13,12 +13,5 @@ dist/
 workspace/
 .coverage
 htmlcov/
-.genesis/simulation*/
-.genesis/python-development*/
-.genesis/outputs/
-.genesis/sessions/
-.genesis/traces/
-.genesis/command_logs/
-.genesis/backups/
-.genesis/.host.lock
+.genesis
 temp/

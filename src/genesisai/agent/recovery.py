@@ -38,6 +38,11 @@ class RecoveryMixin:
         """调用模型并记录用量，支持可重试错误的自动重试。"""
         d = self.store.data; d['rounds'] += 1; self.store.save(); self.on_event('model', dict(round=d['rounds']))
         state = d['run_runtime']; call_id = self.trace.model_start(state); started = time.monotonic(); attempts = 0
+        
+        # 记录模型输入
+        if hasattr(self, 'run_logger'):
+            self.run_logger.log_model_input(d['rounds'], context, tools)
+        
         while True:
             try:
                 options = {}
@@ -86,7 +91,13 @@ class RecoveryMixin:
         for key in ('prompt_tokens', 'completion_tokens', 'total_tokens'):
             if isinstance(usage.get(key), int): d['usage'][key] = d['usage'].get(key, 0) + usage[key]
         self.research.note_model(usage.get('total_tokens', 0) if isinstance(usage.get('total_tokens'), int) else 0)
-        self.trace.model_end(call_id, elapsed_ms=round((time.monotonic() - started) * 1000), finish_reason=response.finish_reason, usage={k: usage[k] for k in ('prompt_tokens', 'completion_tokens', 'total_tokens') if isinstance(usage.get(k), int)}, state=state)
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        self.trace.model_end(call_id, elapsed_ms=elapsed_ms, finish_reason=response.finish_reason, usage={k: usage[k] for k in ('prompt_tokens', 'completion_tokens', 'total_tokens') if isinstance(usage.get(k), int)}, state=state)
+        
+        # 记录模型输出
+        if hasattr(self, 'run_logger'):
+            self.run_logger.log_model_output(d['rounds'], response, elapsed_ms)
+        
         if time.time() >= d['deadline'] and not state['evidence_refs']: return self.stop('limit_reached', '模型返回时已超过运行截止时间')
         return response
 
