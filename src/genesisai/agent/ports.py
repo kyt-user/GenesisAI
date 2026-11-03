@@ -65,6 +65,8 @@ class SessionPort(Protocol):
 
     def event(self, kind: str, **metadata) -> None: ...
 
+    def get_logger(self) -> Any: ...
+
 
 @runtime_checkable
 class DevelopmentPort(Protocol):

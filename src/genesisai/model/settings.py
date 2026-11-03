@@ -1,8 +1,8 @@
 """CLI 管理的用户级模型配置持久化。
 
 用户在终端完成「提供商 → 密钥 → 模型」选择后，配置写入用户配置目录下的
-``config.json``，使其不再依赖开发期的 ``.env``。进程环境变量仍作为回退，
-优先级：持久化配置 > 环境变量。
+``config.json``，作为未配置环境密钥时的回退。
+优先级：环境变量（含已加载的 .env）> 终端持久化配置。
 """
 
 from __future__ import annotations
@@ -41,6 +41,7 @@ class ProviderSettings:
     api_key: str = ""
     base_url: str = ""
     generation: dict = field(default_factory=dict)
+    context: dict = field(default_factory=dict)
 
     def masked_key(self) -> str:
         """返回可展示的掩码密钥。"""
@@ -71,6 +72,7 @@ def load_settings(directory=None) -> ProviderSettings | None:
         api_key=str(data.get("api_key") or "").strip(),
         base_url=str(data.get("base_url") or "").strip(),
         generation=dict(generation) if isinstance(generation, dict) else {},
+        context=data.get('context', {}),
     )
 
 
@@ -85,6 +87,7 @@ def save_settings(settings: ProviderSettings, directory=None) -> Path:
         "api_key": settings.api_key,
         "base_url": settings.base_url,
         "generation": dict(settings.generation),
+        "context": dict(settings.context),
     }
     temp = path.with_suffix(".tmp")
     with temp.open("w", encoding="utf-8") as stream:

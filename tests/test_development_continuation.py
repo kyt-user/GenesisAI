@@ -1,6 +1,6 @@
 import time
 
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.core.project_docs import AgentDocsManager
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response

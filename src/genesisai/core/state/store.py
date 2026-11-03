@@ -23,9 +23,14 @@ def atomic_json(path, value):
     os.replace(temp, path)
 
 
-def workspace_state_root(workspace):
-    """将所有项目运行状态保存在用户选择的工作区内。"""
-    return Path(workspace).resolve() / '.genesis'
+def default_workspace():
+    """与启动目录、应用安装位置无关的默认工作区。"""
+    return (Path.home() / 'GenesisAI' / 'workspace').resolve()
+
+
+def application_state_root():
+    """所有工作区的会话和运行历史统一保存在默认工作区。"""
+    return default_workspace() / '.genesis'
 
 
 def _new_session(session_id, workspace):
@@ -35,6 +40,8 @@ def _new_session(session_id, workspace):
         workspace=str(Path(workspace).resolve()),
         status='idle',
         messages=[],
+        context_checkpoint=None,
+        context_estimate_factor=1.0,
         calls={},
         sources={},
         artifacts={},
@@ -56,80 +63,13 @@ def _new_session(session_id, workspace):
     )
 
 
-def _migrate_session_v0_to_v1(data):
-    migrated = dict(data)
-    migrated['schema_version'] = 1
-    return migrated
-
-
-def _migrate_session_v1_to_v2(data):
-    migrated = dict(data)
-    migrated['tool_runtime'] = {'active_skills': []}
-    migrated['schema_version'] = 2
-    return migrated
-
-
-def _migrate_session_v2_to_v3(data):
-    migrated = dict(data)
-    migrated.setdefault('workspace', '')
-    migrated.setdefault('changes', [])
-    migrated.setdefault('permission_modes', {'network': 'ask', 'writes': 'ask', 'shell': 'ask'})
-    migrated['schema_version'] = 3
-    return migrated
-
-
-SESSION_MIGRATIONS = {
-    0: _migrate_session_v0_to_v1,
-    1: _migrate_session_v1_to_v2,
-    2: _migrate_session_v2_to_v3,
-}
-
-
-def migrate_session(data, workspace=None):
-    """将旧会话逐版本迁移到当前 Schema，不修改输入对象。"""
-    if not isinstance(data, dict):
-        raise ValueError('会话 JSON 根节点必须是对象')
-    version = data.get('schema_version', 0)
-    if isinstance(version, bool) or not isinstance(version, int) or version < 0:
-        raise ValueError('会话 schema_version 必须是非负整数')
-    if version > CURRENT_SESSION_SCHEMA_VERSION:
-        raise ValueError(
-            f'会话版本 {version} 高于当前支持版本 {CURRENT_SESSION_SCHEMA_VERSION}，请升级 GenesisAI'
-        )
-
-    migrated = dict(data)
-    while version < CURRENT_SESSION_SCHEMA_VERSION:
-        migration = SESSION_MIGRATIONS.get(version)
-        if migration is None:
-            raise ValueError(f'缺少会话版本 {version} 的迁移函数')
-        migrated = migration(migrated)
-        next_version = migrated.get('schema_version')
-        if next_version != version + 1:
-            raise ValueError(f'会话版本 {version} 迁移结果无效')
-        version = next_version
-    if version == 3 and not migrated.get('workspace') and workspace is not None:
-        migrated['workspace'] = str(Path(workspace).resolve())
-    if version == 3:
-        migrated.setdefault('changes', [])
-        migrated.setdefault('permission_modes', {'network': 'ask', 'writes': 'ask', 'shell': 'ask'})
-        if isinstance(migrated.get('tool_runtime'), dict):
-            migrated['tool_runtime'].pop('active_tools', None)
-            migrated['tool_runtime'].setdefault('active_skills', [])
-    if version == 3 and 'run_runtime' not in migrated:
-        phase = 'done' if migrated.get('status') == 'completed' else 'explore'
-        migrated['run_runtime'] = initial_run_runtime(phase=phase)
-    elif version == 3 and isinstance(migrated.get('run_runtime'), dict):
-        defaults = initial_run_runtime(
-            migrated['run_runtime'].get('profile', 'direct_answer'),
-            phase=migrated['run_runtime'].get('phase', 'explore'),
-        )
-        for key, value in defaults.items():
-            migrated['run_runtime'].setdefault(key, value)
-    return migrated
-
-
 def validate_session(data, expected_id=None):
     """验证会话持久化数据的最小稳定结构。"""
+    if not isinstance(data, dict):
+        raise ValueError('会话 JSON 根节点必须是对象')
+    version = data.get('schema_version')
+    if type(version) is not int or version != CURRENT_SESSION_SCHEMA_VERSION:
+        raise ValueError(f'会话 schema_version 必须为 {CURRENT_SESSION_SCHEMA_VERSION}；不支持历史格式，请新建会话')
     field_types = {
         'id': str,
         'workspace': str,
@@ -163,6 +103,17 @@ def validate_session(data, expected_id=None):
         raise ValueError('会话 ID 与文件名不一致')
     if not data['workspace']:
         raise ValueError('会话字段 workspace 无效')
+    checkpoint = data.get('context_checkpoint')
+    if checkpoint is not None:
+        if (not isinstance(checkpoint, dict)
+                or type(checkpoint.get('source_count')) is not int
+                or checkpoint['source_count'] < 0
+                or not isinstance(checkpoint.get('source_hash'), str)
+                or not isinstance(checkpoint.get('messages'), list)):
+            raise ValueError('会话 context_checkpoint 无效')
+    factor = data.get('context_estimate_factor', 1.0)
+    if type(factor) not in (int, float) or not 1 <= factor <= 4:
+        raise ValueError('会话 context_estimate_factor 无效')
     modes = data['permission_modes']
     if set(modes) != {'network', 'writes', 'shell'} or any(value not in {'ask', 'allow'} for value in modes.values()):
         raise ValueError('会话字段 permission_modes 无效')
@@ -175,8 +126,6 @@ def validate_session(data, expected_id=None):
     deadline = data['deadline']
     if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or deadline < 0:
         raise ValueError('会话字段 deadline 类型无效')
-    if data.get('schema_version') != CURRENT_SESSION_SCHEMA_VERSION:
-        raise ValueError('会话 Schema 未迁移到当前版本')
     tool_runtime = data['tool_runtime']
     if set(tool_runtime) != {'active_skills'} or not isinstance(tool_runtime['active_skills'], list):
         raise ValueError('会话字段 tool_runtime 无效')
@@ -268,8 +217,12 @@ class Store:
                 raw = json.loads(self.path.read_text(encoding='utf-8'))
             except json.JSONDecodeError as exc:
                 raise ValueError('会话 JSON 损坏，原文件未修改') from exc
-            self.data = migrate_session(raw, self.workspace)
+            self.data = raw
             validate_session(self.data, self.id)
+            saved_workspace = Path(self.data['workspace']).resolve()
+            if workspace is not None and self.workspace != saved_workspace:
+                raise ValueError('恢复会话的工作区与指定目录不一致，请使用原工作区或新建会话')
+            self.workspace = saved_workspace
             if self.data['status'] == 'running':
                 self.data['status'] = 'interrupted'
             for call in self.data['calls'].values():
@@ -282,6 +235,13 @@ class Store:
     def save(self):
         validate_session(self.data, self.id)
         atomic_json(self.path, self.data)
+
+    def get_logger(self):
+        """会话级日志端口，也供不组装完整 ToolRuntime 的恢复入口使用。"""
+        if not hasattr(self, '_io_logger'):
+            from genesisai.core.state.logger import RunLogger
+            self._io_logger = RunLogger(self)
+        return self._io_logger
 
     def event(self, kind, **metadata):
         allowed = {
@@ -315,21 +275,27 @@ class Store:
         self.save()
         return key
 
-    def verify_artifacts(self):
-        for data in self.data['artifacts'].values():
+    def verify_artifacts(self, *, current_run_only=False):
+        latest = {data['path']: data for data in self.data['artifacts'].values()}
+        changes = {item['path']: item for item in self.data['changes']}
+        for data in latest.values():
+            change = changes.get(data['path'])
+            last_run = change.get('run_id') if change else data.get('run_id')
+            if current_run_only and last_run != self.data['run_id']:
+                continue
             path = Path(data['path']).resolve()
-            if not path.is_relative_to(Path(self.data['output']).resolve()) or not path.is_file() or sha(path) != data['sha256']:
+            if not path.is_relative_to(Path(self.data['output']).resolve()):
+                raise ValueError('产物越界：' + path.name)
+            if change and change['operation'] in {'delete', 'move'}:
+                continue  # 已记录的合法删除/移动使原路径退出当前产物集合，历史仍保留。
+            expected = (change or {}).get('after_sha256') or data['sha256']
+            if not path.is_file() or sha(path) != expected:
                 raise ValueError('产物缺失、越界或已变更：' + path.name)
 
     def verify_sources(self):
+        self.refresh_local_files()
         for data in self.data['sources'].values():
-            if data['kind'] == 'file':
-                path = Path(data['path']).resolve()
-                if not any(path == Path(g) or path.is_relative_to(Path(g)) for g in self.data['grants']):
-                    raise ValueError('历史资料已不在授权范围')
-                if not path.is_file() or sha(path) != data['sha256']:
-                    raise ValueError('历史资料已变更，请新建会话重新读取')
-            elif data['kind'] == 'web':
+            if data['kind'] == 'web':
                 ref = next((key for key, value in self.data['sources'].items() if value is data), None)
                 path = self.root / 'sources' / f'{ref}.json'
                 if not path.is_file():
@@ -342,4 +308,28 @@ class Store:
                     raise ValueError('历史网络资料损坏，请重新执行检索') from exc
                 if text_digest != data.get('sha256'):
                     raise ValueError('历史网络资料已变更，请重新执行检索')
+
+    def refresh_local_files(self):
+        """标记已变化的本地快照；保留原始哈希和历史，不阻断继续读取。"""
+        changed = []
+        digests = {}
+        roots = [Path(p).resolve() for p in self.data['grants']]
+        if self.data['output']:
+            roots.append(Path(self.data['output']).resolve())
+        for collection in ('sources', 'artifacts'):
+            for ref, data in self.data[collection].items():
+                if collection == 'sources' and data['kind'] != 'file':
+                    continue
+                path = Path(data['path']).resolve()
+                if not any(path == root or path.is_relative_to(root) for root in roots):
+                    raise ValueError('历史文件已不在授权范围：' + path.name)
+                if path not in digests:
+                    digests[path] = sha(path) if path.is_file() else None
+                stale = digests[path] != data['sha256']
+                if stale != data.get('stale', False):
+                    data['stale'] = stale
+                    changed.append(dict(ref=ref, path=str(path), stale=stale))
+        if changed:
+            self.save()
+            self.get_logger().record('local_files_changed', files=changed)
 

@@ -44,6 +44,12 @@ def safe_environment():
 
 def run_process(context, command, cwd, timeout, *, kind):
     command = validate_command(command)
+    deadline = context.store.data.get('deadline', 0)
+    if context.store.data.get('status') == 'running' and deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
+        timeout = min(timeout, remaining)
     started = time.monotonic()
     try:
         completed = subprocess.run(
@@ -59,15 +65,21 @@ def run_process(context, command, cwd, timeout, *, kind):
             check=False,
         )
     except FileNotFoundError as exc:
+        context.runtime.logger.error('command_error', exc, command=command, cwd=str(cwd))
         raise ToolError('command_not_found', '命令不存在或不可执行') from exc
     except subprocess.TimeoutExpired as exc:
+        decode = lambda value: value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value
+        context.runtime.logger.error('command_error', exc, command=command, cwd=str(cwd),
+                                     stdout=decode(exc.stdout), stderr=decode(exc.stderr), timeout=timeout)
         raise ToolError('command_timeout', f'命令超过 {timeout} 秒上限', retryable=False) from exc
     stdout, stderr = completed.stdout or '', completed.stderr or ''
+    context.runtime.logger.record('command_output', command=command, cwd=str(cwd),
+                                  exit_code=completed.returncode, stdout=stdout, stderr=stderr)
     full = stdout + ('\n' if stdout and stderr else '') + stderr
     log_dir = context.store.root / 'command_logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{uid(kind)}.log"
-    log_path.write_text(full, encoding='utf-8')
+    log_path.write_text(context.runtime.logger.journal.clean(full), encoding='utf-8')
     limit = 12000
     result = {
         'command': command,

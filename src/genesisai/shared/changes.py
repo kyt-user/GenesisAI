@@ -1,4 +1,4 @@
-"""记录可审查、可撤销的工作区文件变化。"""
+"""记录工作区文件变化并保存写入前的备份。"""
 
 from __future__ import annotations
 
@@ -50,49 +50,3 @@ def atomic_write_bytes(path, payload):
 def current_sha(path):
     path = Path(path)
     return sha(path) if path.is_file() else None
-
-
-def pending_changes(store, run_id=None):
-    return [item for item in store.data.get('changes', []) if not item.get('undone') and (not run_id or item.get('run_id') == run_id)]
-
-
-def undo_changes(store, workspace, *, apply=False):
-    """预览或按逆序安全撤销当前 Run 的文件变化。"""
-    workspace = Path(workspace).resolve()
-    changes = pending_changes(store, store.data.get('run_id'))
-    preview = []
-    for item in reversed(changes):
-        path = Path(item['path']).resolve()
-        target = Path(item['destination']).resolve() if item.get('destination') else path
-        if not path.is_relative_to(workspace) or not target.is_relative_to(workspace):
-            raise ValueError('撤销目标超出工作区')
-        current = current_sha(target)
-        expected = item.get('after_sha256') or (item.get('before_sha256') if item['operation'] == 'move' else None)
-        conflict = expected is not None and current != expected
-        preview.append({'operation': item['operation'], 'path': str(target), 'conflict': conflict})
-        if apply and conflict:
-            raise ValueError('文件已被外部修改，拒绝撤销：' + target.name)
-    if not apply:
-        return preview
-    for item in reversed(changes):
-        path = Path(item['path']).resolve()
-        target = Path(item['destination']).resolve() if item.get('destination') else path
-        operation = item['operation']
-        if operation == 'create':
-            target.unlink()
-        elif operation in {'patch', 'delete'}:
-            backup = Path(item.get('backup') or '')
-            if not backup.is_file():
-                raise ValueError('撤销备份缺失：' + path.name)
-            atomic_write_bytes(path, backup.read_bytes())
-        elif operation == 'move':
-            path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(target), str(path))
-        elif operation == 'mkdir':
-            path.rmdir()
-        else:
-            raise ValueError('未知变更类型：' + str(operation))
-        item['undone'] = True
-    store.save()
-    return preview
-

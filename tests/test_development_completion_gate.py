@@ -1,6 +1,6 @@
 import json
 
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.messages import Response, ToolCall
 from test_acceptance import FakeModel
 from test_development_continuation import development_env

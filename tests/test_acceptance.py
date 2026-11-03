@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from genesisai.shared.messages import Response, ToolCall
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access, ToolError
 from genesisai.core.state.store import Store, HostLock, sha
 from genesisai.core.tools.tool_runtime import ToolRuntime
@@ -21,7 +21,7 @@ class FakeModel:
         self.contexts = []
         self.tool_definitions = []
 
-    def chat(self, messages, tools=None):
+    def chat(self, messages, tools=None, **kwargs):
         self.contexts.append(messages)
         self.tool_definitions.append(tools or [])
         response = next(self.responses)
@@ -29,7 +29,7 @@ class FakeModel:
             raise response
         return response(messages) if callable(response) else response
 
-    def stream_chat(self, messages, tools=None):
+    def stream_chat(self, messages, tools=None, **kwargs):
         self.contexts.append(messages)
         self.tool_definitions.append(tools or [])
         response = next(self.responses)
@@ -267,7 +267,9 @@ def test_A24_bounds_and_trace(env):
     trace=(store.root/'traces'/f'{store.id}.jsonl').read_text()
     assert 'PRIVATE_PROMPT' not in trace and 'SECRET_BODY' not in trace
     store.data['messages']=[dict(role='user',content='x'*81000)]
-    with pytest.raises(ValueError): runner.context()
+    runner.context_budgeter.configure({'max_input_tokens': 16000, 'strategy': 'basic'})
+    with pytest.raises(ValueError):
+        runner.context_budgeter.prepare(runner.context(), executor.definitions())
 
 
 def test_A15_fallback_and_E03_fusion(env):
@@ -317,7 +319,12 @@ def test_A08_deadline_and_persisted_limits(env):
     resumed=Runner(FakeModel(),executor,max_rounds=100)
     assert resumed.confirm(False)['status']=='limit_reached'
     assert store.data['limits']['rounds']==1
-    runner=Runner(FakeModel(Response(content='late')),executor,seconds=-1)
+    with pytest.raises(ValueError):
+        Runner(FakeModel(), executor, seconds=-1)
+    def expire(messages):
+        store.data['deadline'] = time.time() - 1
+        return Response(content='late')
+    runner=Runner(FakeModel(expire),executor,seconds=1)
     assert runner.start('timeout')['status']=='limit_reached'
 
 
@@ -362,7 +369,10 @@ def test_A20_changed_source_not_reused(env):
     runner=Runner(model_with_tools(response(call('read_files',dict(path='note.md'))),Response(content='read')),executor)
     assert runner.start('read')['status']=='completed'
     (root/'note.md').write_text('different')
-    with pytest.raises(ValueError,match='变更'): runner.start('summarize previous')
+    runner.model = FakeModel(Response(content='The previous file snapshot is stale.'))
+    assert runner.start('summarize previous')['status'] == 'completed'
+    assert any(item.get('stale') for item in store.data['sources'].values())
+    assert '历史文件快照已失效' in runner.model.contexts[0][0].content
 
 
 def test_A05_multi_call_confirmation_continues(env):

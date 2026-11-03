@@ -12,7 +12,7 @@ from genesisai.core.research import ResearchController
 
 from test_p11_agent_runtime import runtime_env, FakeModel, tool_call
 from genesisai.shared.messages import Response
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 
 
 def call(name, args, cid):
@@ -137,7 +137,7 @@ def test_session_grant_and_revocation_are_independent(runtime_env):
 
 
 def test_wait_does_not_consume_execution_time(runtime_env, monkeypatch):
-    import genesisai.agent.runner as runner_module
+    import genesisai.agent.loop as runner_module
     now = time.time()
     monkeypatch.setattr(runner_module.time, 'time', lambda: now)
     store, runtime = runtime_env
@@ -150,7 +150,7 @@ def test_wait_does_not_consume_execution_time(runtime_env, monkeypatch):
 
 
 def test_expired_approval_is_repreviewed_even_with_session_allow(runtime_env, monkeypatch):
-    import genesisai.agent.runner as runner_module
+    import genesisai.agent.loop as runner_module
     now = time.time()
     monkeypatch.setattr(runner_module.time, 'time', lambda: now)
     _, runtime = runtime_env
@@ -436,7 +436,7 @@ def test_cached_new_spans_count_as_progress_but_duplicates_do_not(runtime_env):
     assert store.data['run_runtime']['usage']['observations'] == before + 1
 
 
-def test_followup_context_keeps_answer_and_compacts_previous_pages(runtime_env):
+def test_followup_keeps_full_previous_pages_when_under_capacity(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='之前的答案')), runtime)
     runner.start('产品规格')
@@ -446,6 +446,6 @@ def test_followup_context_keeps_answer_and_compacts_previous_pages(runtime_env):
     runner.start('它的价格呢')
     context = runner.model.contexts[0]
     previous = next(json.loads(m.content) for m in context if m.tool_call_id == 'fixture')
-    assert len(previous['data']['text']) == 800
+    assert len(previous['data']['text']) == 4000
     assert any(m.content == '之前的答案' for m in context)
 

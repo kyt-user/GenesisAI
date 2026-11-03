@@ -7,7 +7,7 @@ from pathlib import Path
 from genesisai.app.cli import load_environment
 
 from genesisai.model.config import build_model
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.state.store import HostLock, Store, atomic_json
 from genesisai.core.tools.tool_runtime import ToolRuntime

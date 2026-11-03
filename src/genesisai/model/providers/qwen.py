@@ -1,6 +1,7 @@
 """阿里云通义千问（DashScope OpenAI 兼容）模型提供商实现。"""
 
 import os
+from genesisai.model.credentials import resolve_api_key
 
 from genesisai.model.openai_compatible import OpenAICompatibleClient
 
@@ -24,7 +25,7 @@ class QwenClient(OpenAICompatibleClient):
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 0,
     ):
-        resolved_key = (api_key or os.environ.get(self.API_KEY_ENV, "")).strip()
+        resolved_key = resolve_api_key(self.provider, api_key)
         if not resolved_key:
             raise RuntimeError(f"缺少环境变量 {self.API_KEY_ENV}")
         resolved_url = (

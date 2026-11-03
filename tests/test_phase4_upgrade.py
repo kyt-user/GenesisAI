@@ -18,7 +18,8 @@ from rich.console import Console
 
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.app.terminal_view import CliView
-from genesisai.core.prompt.context_budgeter import ContextBudgeter, select_initial_profile
+from genesisai.core.prompt.context_budgeter import ContextBudgeter
+from genesisai.shared.budgets import select_initial_profile
 from genesisai.core.prompt.composer import PromptComposer
 from genesisai.core.state.store import Store
 from genesisai.shared.security import Access
@@ -126,11 +127,11 @@ class TestCreativeProfile:
         assert select_initial_profile("创建一个世界观") == "creative"
 
     def test_creative_profile_has_high_budget(self):
-        from genesisai.core.prompt.context_budgeter import PROFILES
+        from genesisai.shared.budgets import PROFILES
         profile = PROFILES["creative"]
         assert profile.model_calls >= 25
-        assert profile.token_budget >= 100000
-        assert profile.seconds >= 600
+        assert "token_budget" not in profile.to_dict()
+        assert 'seconds' not in profile.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -160,10 +161,9 @@ class TestProfileAwareCompact:
         budgeter = ContextBudgeter(store, composer)
         summary = budgeter.compact(force=True)
 
-        assert "coding_context" in summary
-        coding = summary["coding_context"]
-        assert len(coding.get("file_changes", [])) >= 1
-        assert len(coding.get("test_results", [])) >= 1
+        assert summary["mode"] == "manual"
+        assert len(store.data["messages"]) == 9
+        assert summary["tokens_after"] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ class TestPromptTemplates:
 class TestSelfVerification:
     def test_verification_flag_set_after_file_modify(self, tmp_path):
         """After a file modification tool succeeds, _needs_verification is set."""
-        from genesisai.agent.runner import Runner
+        from genesisai.agent.loop import Runner
         from genesisai.shared.messages import Response
 
         workspace, output, store, runtime = _store_and_runtime(tmp_path, active=("file_read",))
@@ -315,7 +315,7 @@ class TestSelfVerification:
         class MinimalModel:
             def chat(self, messages, tools=None, **kwargs):
                 return Response(content="done")
-            def stream_chat(self, messages, tools=None):
+            def stream_chat(self, messages, tools=None, **kwargs):
                 yield "done"
                 yield Response(content="done")
 
@@ -327,7 +327,7 @@ class TestSelfVerification:
 
     def test_should_auto_verify_respects_profile(self, tmp_path):
         """_should_auto_verify returns True only for coding/local_files profiles."""
-        from genesisai.agent.runner import Runner
+        from genesisai.agent.loop import Runner
         from genesisai.shared.messages import Response
 
         workspace, output, store, runtime = _store_and_runtime(tmp_path)
@@ -335,7 +335,7 @@ class TestSelfVerification:
         class MinimalModel:
             def chat(self, messages, tools=None, **kwargs):
                 return Response(content="done")
-            def stream_chat(self, messages, tools=None):
+            def stream_chat(self, messages, tools=None, **kwargs):
                 yield "done"
                 yield Response(content="done")
 

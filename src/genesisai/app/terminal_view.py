@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import re
 import time
 
@@ -14,11 +14,13 @@ from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from genesisai.app.command_input import COMMANDS, TaskInput
+from genesisai.app.select import is_interactive, select
 
 
 @dataclass(frozen=True)
 class CliSnapshot:
-    """启动时可确定的界面状态；可选字段为后续模块预留。"""
+    """启动时可确定的会话和工作区状态。"""
 
     session_id: str
     model_name: str
@@ -32,6 +34,7 @@ class CliSnapshot:
     git_state: str | None = None
     context_percent: int | None = None
     agent_docs_status: str | None = None
+    history_root: str | None = None
 
 
 STATUS_STYLE = {
@@ -46,6 +49,13 @@ STATUS_STYLE = {
     "idle": ("○ 就绪", "cyan"),
 }
 
+TOOL_LABELS = {
+    'read_files': '读取文件', 'list_files': '查看目录', 'editor': '修改文件',
+    'run_commands': '执行命令', 'search_codebase': '搜索代码',
+    'plan': '记录任务计划', 'fetch_web_content': '查询网页',
+    'use_skill': '加载 Skill', 'attempt_completion': '提交结果',
+}
+
 
 class CliView:
     """只渲染界面，不参与模型决策、授权或工具执行。"""
@@ -55,76 +65,32 @@ class CliView:
         self._running_tools: list[str] = []
         self._streaming = False
         self._stream_chars = 0
+        self._streamed_text = ''
+        self._working_status = None
         self._reasoning_active = False
+        self.show_details = False
+        self._last_tool_result = None
 
     @staticmethod
-    def _value(value, pending="待接入") -> str:
+    def _value(value, pending="未启用") -> str:
         return str(value) if value not in {None, ""} else pending
 
-    @staticmethod
-    def _append_badge(line: Text, label: str, value: str, style: str) -> None:
-        if line:
-            line.append("   ")
-        line.append(f" {label} {value} ", style=f"bold {style} on #142235")
-
-    def render_startup(self, snapshot: CliSnapshot) -> None:
-        """显示紧凑的会话、能力和路径概览。"""
-        title = Text()
-        title.append("◆ ", style="bold bright_green")
-        title.append("GENESISAI", style="bold white")
-        title.append("\n  single-agent developer CLI", style="dim cyan")
-
-        badges = Text()
-        self._append_badge(badges, "MODEL", snapshot.model_name, "cyan")
-        self._append_badge(badges, "MODE", snapshot.permission_mode, "yellow")
-        self._append_badge(badges, "SESSION", snapshot.session_id[-8:], "green")
-
-        capabilities = Text()
-        capabilities.append("Skill: ", style="dim")
-        capabilities.append(self._value(snapshot.skill_name), style="cyan")
-        capabilities.append("   Git: ", style="dim")
-        capabilities.append(self._value(snapshot.git_state), style="cyan")
-        capabilities.append("   Tools: ", style="dim")
-        enabled = snapshot.enabled_tools if snapshot.enabled_tools is not None else snapshot.registered_tools
-        capabilities.append(f"{enabled}/{snapshot.registered_tools}", style="cyan")
-        capabilities.append("   Agent Docs: ", style="dim")
-        capabilities.append(self._value(snapshot.agent_docs_status, "未初始化"), style="cyan")
-        if snapshot.context_percent is not None:
-            capabilities.append(f"   Context: {snapshot.context_percent}%", style="dim cyan")
-
-        header = Table.grid(expand=True)
-        header.add_column(ratio=1)
-        header.add_column(justify="right")
-        header.add_row(title, badges)
-        header.add_row(Text(""), capabilities)
-
-        paths = Text()
-        paths.append("工作区  ", style="dim")
-        paths.append(snapshot.workspace, style="bright_black")
-        paths.append("\n输入    ", style="dim")
-        paths.append("、".join(snapshot.input_roots) if snapshot.input_roots else "未指定", style="bright_black")
-        paths.append("\n输出    ", style="dim")
-        paths.append(snapshot.output, style="bright_black")
-
-        self.console.print(
-            Panel(
-                Group(header, Text(""), paths),
-                border_style="bright_green",
-                box=box.ROUNDED,
-                padding=(1, 2),
-            )
-        )
+    def render_startup(self, snapshot: CliSnapshot, data=None) -> None:
+        self.snapshot = snapshot
+        self.console.print()
+        self.console.print(Text('GenesisAI', style='bold'))
+        mode = {'ASK': '操作需确认', 'ALLOW': '操作已授权', 'MIXED': '自定义权限'}.get(snapshot.permission_mode, snapshot.permission_mode)
+        self.console.print(Text(f'{snapshot.model_name}  |  {mode}'))
+        self.console.print(Text('工作区  ' + snapshot.workspace))
+        history = (data or {}).get('messages', [])
+        title = next((m.get('content', '') for m in reversed(history) if m.get('role') == 'user'), '')
+        if title:
+            self.console.print(Text('已恢复会话 · ' + ' '.join(title.split())[:80]))
+            label = STATUS_STYLE.get((data or {}).get('status'), ('已保存', ''))[0]
+            self.console.print(Text('上次状态 · ' + label))
+        else:
+            self.console.print('当前为新会话')
         self.render_command_hint()
-
-    def render_workspace_selection(self, current: str, suggested: str | None = None) -> None:
-        body = Text()
-        body.append("当前目录  ", style="dim")
-        body.append(current, style="white")
-        if suggested and suggested != current:
-            body.append("\nGit 根目录 ", style="dim")
-            body.append(suggested, style="cyan")
-        body.append("\n\n输入已有工作区路径；直接回车使用当前目录。", style="yellow")
-        self.console.print(Panel(body, title="指定工作区", title_align="left", border_style="cyan"))
 
     def render_agent_docs_consent(self, path: str) -> None:
         body = Text()
@@ -132,58 +98,53 @@ class CliView:
         body.append(path, style="cyan")
         body.append("\n\n内容包括项目概览、计划、进度、决策、已验证命令和验收记录。", style="dim")
         body.append("\n不会写入密钥、完整源码或原始命令日志。", style="dim")
-        body.append("\n\n输入 allow 初始化；其他输入将跳过，之后可用 /project init。", style="yellow")
+        if not is_interactive(self.console):
+            body.append("\n\n输入 allow 初始化，回车跳过。之后可用 /project init。", style="yellow")
         self.console.print(Panel(body, title="初始化 agent_docs", title_align="left", border_style="yellow"))
 
     def render_command_hint(self) -> None:
-        self.console.print(
-            "[dim]输入任务，或使用[/dim] [cyan]/status[/cyan] [cyan]/tools[/cyan] "
-            "[cyan]/new[/cyan] [cyan]/help[/cyan] [dim]查看当前能力。[/dim]"
-        )
+        self.console.print('直接描述你要完成的任务，输入 / 选择操作。')
 
     def render_help(self) -> None:
-        rows = [
-            ("/new", "保存当前会话并创建全新会话"),
-            ("/status", "查看会话、轮次、工具调用和 Token"),
-            ("/budget", "查看当前 Profile、预算、用量和停止原因"),
-            ("/trace", "查看脱敏执行链摘要"),
-            ("/compact", "按 cline 策略折叠早期对话，保留 typed 提示与结论性回答"),
-            ("/undo", "预览本任务撤销；/undo apply 安全执行"),
-            ("/doctor", "检查模型配置、目录、密钥状态和可选依赖"),
-            ("/clean", "预览旧日志清理；/clean run 执行"),
-            ("/history", "查看本地会话历史"),
-            ("/model", "查看模型；交互模式下可选择切换"),
-            ("/auth", "重新选择提供商、密钥与模型并写入用户配置"),
-            ("/permissions", "查看权限；可用 network|writes|shell ask|allow 切换"),
-            ("/tools", "查看启用与禁用的工具"),
-            ("/workflow", "列出或展开 .genesis/workflows 中的工作流"),
-            ("/resume", "恢复安全检查点"),
-            ("/approve", "允许一次；待确认时也可输入 approve、yes 或 y"),
-            ("/allow network", "批准当前网络调用并允许本会话后续公开网络请求"),
-            ("/allow network run", "批准当前网络调用并允许本轮后续请求；下一轮恢复确认"),
-            ("/allow writes", "批准当前写入并允许本会话后续工作区写入"),
-            ("/allow shell", "批准当前命令并允许本会话后续受控命令"),
-            ("/reject", "拒绝一次；待确认时也可输入 reject、no 或 n"),
-            ("/cancel", "取消当前运行"),
-            ("/exit", "保存状态并退出"),
-            ("/skills", "Skill 列表、检索、查看、加载与卸载"),
-            ("/project", "查看 agent_docs 活动任务；/project init 初始化"),
-            ("/diff", "查看本任务记录的文件变更"),
-        ]
-        table = Table.grid(padding=(0, 2))
-        table.add_column(style="bold cyan", no_wrap=True)
-        table.add_column(style="white")
-        for command, description in rows:
-            table.add_row(command, description)
-        footer = Text(
-            "\n普通输入继续当前会话；/new 创建全新会话。"
-            "写入和公开网络请求默认需要确认；/exit 会保留待确认状态。"
-            "恢复已有会话使用 --session ID。",
-            style="dim",
-        )
-        self.console.print(
-            Panel(Group(table, footer), title="命令", title_align="left", border_style="cyan", box=box.ROUNDED)
-        )
+        table = Table(box=box.SIMPLE, show_header=True)
+        table.add_column('分类')
+        table.add_column('命令', style='cyan')
+        table.add_column('操作')
+        for command, description, group in COMMANDS:
+            table.add_row(group, command, description)
+        self.console.print(table)
+
+    def toggle_details(self):
+        self.show_details = not self.show_details
+        self.console.print('工具详情已展开' if self.show_details else '工具详情已收起')
+        if self.show_details and self._last_tool_result is not None:
+            self.render_data('最近工具输出', self._last_tool_result)
+
+    def choose_command(self):
+        if is_interactive(self.console):
+            return self._get_input().read('选择操作 · 输入名称或中文说明搜索', default='/').strip()
+        picked = select(self.console, '选择操作', [(cmd, group + ' / ' + desc) for cmd, desc, group in COMMANDS], searchable=True)
+        return COMMANDS[picked][0] if picked is not None else None
+
+    def bind_session(self, snapshot, data):
+        if getattr(self, 'session_id', None) != snapshot.session_id:
+            self._input = None
+            self._confirmation_seen = None
+        self.session_id = snapshot.session_id
+        self.snapshot, self.session_data = snapshot, data
+
+    def _get_input(self):
+        if getattr(self, '_input', None) is None:
+            history = [m['content'] for m in getattr(self, 'session_data', {}).get('messages', [])
+                       if m.get('role') == 'user' and m.get('content')]
+            self._input = TaskInput(history)
+        return self._input
+
+    def request_consent(self, purpose, title):
+        if is_interactive(self.console):
+            index = select(self.console, title, [(purpose, ''), ('取消', '')], index=1)
+            return 'allow' if index == 0 else ''
+        return self.console.input('allow > ').strip()
 
     def render_model(self, snapshot: CliSnapshot) -> None:
         body = Text()
@@ -197,6 +158,7 @@ class CliView:
         """展示 CLI 当前生效的提供商、模型、密钥与写入位置。"""
         from genesisai.model.providers.catalog import get_provider
         from genesisai.model.settings import settings_path
+        from genesisai.model.credentials import environment_key, resolve_api_key
 
         provider = get_provider(settings.provider)
         label = provider.label if provider else settings.provider
@@ -208,7 +170,10 @@ class CliView:
         body.append("\n接口    ", style="dim")
         body.append(settings.base_url or "默认", style="white")
         body.append("\n密钥    ", style="dim")
-        body.append(settings.masked_key(), style="green")
+        effective = resolve_api_key(settings.provider, settings.api_key)
+        body.append(replace(settings, api_key=effective).masked_key(), style="green")
+        body.append("\n密钥来源 ", style="dim")
+        body.append("环境变量 / .env" if environment_key(settings.provider) else "终端配置", style="white")
         body.append("\n配置    ", style="dim")
         body.append(str(path or settings_path()), style="dim")
         self.console.print(Panel(body, title="模型配置", title_align="left", border_style="green"))
@@ -261,13 +226,6 @@ class CliView:
             table.add_row(str(item.get("operation")), str(target), f"{before} → {after}")
         self.console.print(Panel(table, title=f"Diff · {len(current)} 项", border_style="cyan"))
 
-    def render_pending_feature(self, command: str, description: str) -> None:
-        body = Text()
-        body.append(f"{command} ", style="bold cyan")
-        body.append("接口已预留，当前版本尚未接入。\n", style="yellow")
-        body.append(description, style="dim")
-        self.console.print(Panel(body, title="功能预留", title_align="left", border_style="bright_black"))
-
     def render_status(self, data: dict, snapshot: CliSnapshot) -> None:
         label, style = STATUS_STYLE.get(data.get("status"), (str(data.get("status", "unknown")), "white"))
         usage = data.get("usage") or {}
@@ -278,6 +236,10 @@ class CliView:
         table.add_row("会话", data.get("id") or snapshot.session_id)
         table.add_row("运行", data.get("run_id") or "—")
         table.add_row("模型", snapshot.model_name)
+        table.add_row('工作区', snapshot.workspace)
+        table.add_row('授权输入', '、'.join(snapshot.input_roots))
+        table.add_row('输出目录', snapshot.output)
+        table.add_row('历史目录', snapshot.history_root or '—')
         table.add_row("权限", snapshot.permission_mode)
         table.add_row("轮次", str(data.get("rounds", 0)))
         table.add_row("工具", str(data.get("tool_count", 0)))
@@ -290,6 +252,8 @@ class CliView:
         table.add_row('剩余执行时间', f"{max(0, data.get('deadline', 0) - now):.0f} 秒")
         table.add_row("Profile", str(runtime.get("profile", "—")))
         table.add_row("阶段", str(runtime.get("phase", "—")))
+        table.add_row('任务时限', f"{runtime.get('execution_seconds_limit', '—')} 秒")
+        table.add_row('单次请求超时', f"{runtime.get('request_timeout_seconds', '—')} 秒")
         table.add_row("停止原因", str(runtime.get("stop_reason") or "—"))
         table.add_row("Skill", self._value(snapshot.skill_name))
         table.add_row("Git", self._value(snapshot.git_state))
@@ -304,10 +268,13 @@ class CliView:
         table.add_column(style="white")
         table.add_row("Profile", str(runtime.get("profile", "—")))
         table.add_row("阶段", str(runtime.get("phase", "—")))
-        for key in ("model_calls", "search_queries", "search_fetches", "token_budget"):
-            label = {"model_calls": "模型调用", "search_queries": "网络检索", "search_fetches": "网页抓取", "token_budget": "Token"}[key]
-            used = usage.get(key if key != "token_budget" else "total_tokens", 0)
+        for key in ("model_calls", "search_queries", "search_fetches"):
+            label = {"model_calls": "模型调用", "search_queries": "网络检索", "search_fetches": "网页抓取"}[key]
+            used = usage.get(key, 0)
             table.add_row(label, f"{used} / {budget.get(key, '—')}（余 {max(0, budget.get(key, 0) - used) if isinstance(budget.get(key), int) else '—'}）")
+        table.add_row("累计 Token（用量）", str(usage.get('total_tokens', 0)))
+        context = runtime.get('context_report') or {}
+        table.add_row("当前请求（估算 Token）", f"{context.get('tokens_after', '—')} / {context.get('input_limit', '—')}")
         table.add_row("候选 / Evidence", f"{runtime.get('candidate_count', 0)} / {len(runtime.get('evidence_refs', []))}")
         table.add_row("停止原因", str(runtime.get("stop_reason") or "—"))
         self.console.print(Panel(table, title="预算", title_align="left", border_style="cyan", box=box.ROUNDED))
@@ -341,6 +308,11 @@ class CliView:
     def render_data(self, title: str, value) -> None:
         self.console.print(Panel(JSON.from_data(value, ensure_ascii=False, indent=2), title=title, title_align="left", border_style="cyan"))
 
+    def render_logs(self, path: str) -> None:
+        self.console.print(Text('完整输入输出日志（JSONL）', style='bold cyan'))
+        self.console.print(Text(path, overflow='fold'))
+        self.console.print(Text('每行一个事件；正文不截断，认证信息脱敏。', style='dim'))
+
     def render_progress(self, kind: str, value: dict) -> None:
         if kind == "reasoning_token":
             if not self._reasoning_active:
@@ -348,6 +320,10 @@ class CliView:
                 self.console.print(Text("💭 正在规划…", style="dim"))
             return
         if kind == "stream_token":
+            # Live 动画会清除当前行，必须先停止再输出未换行的正文片段。
+            if self._working_status is not None:
+                self._working_status.stop()
+                self._working_status = None
             # 如果需要，退出推理模式。
             if self._reasoning_active:
                 self._reasoning_active = False
@@ -356,12 +332,18 @@ class CliView:
             self._streaming = True
             text = value.get("text", "")
             self._stream_chars += len(text)
+            self._streamed_text += text
             self.console.print(Text(text), end="", highlight=False)
             return
         if kind == "model":
+            if self._streaming:
+                self.console.print()
+            self._streaming = False
+            self._streamed_text = ''
             # 重置新一轮的推理状态。
             self._reasoning_active = False
-            self.console.print(f"[cyan]◇[/cyan] [dim]模型推理 · 第 {value['round']} 轮[/dim]")
+            if self._working_status is not None:
+                self._working_status.update('正在分析任务 · Ctrl+C 停止')
             return
         if kind == "tool_start":
             # 如果正在流式输出，先干净地结束再显示工具。
@@ -370,18 +352,33 @@ class CliView:
                 self._streaming = False
             name = value["name"]
             self._running_tools.append(name)
-            self.console.print(f"[cyan]●[/cyan] {name} [dim]运行中[/dim]")
+            label = TOOL_LABELS.get(name, name)
+            if self._working_status is not None:
+                self._working_status.update(f'{label} · Ctrl+C 停止')
+            else:
+                self.console.print(Text('● ' + label + ' · 运行中'))
             return
         if kind == "tool_result":
+            self._last_tool_result = value
             name = self._running_tools.pop(0) if self._running_tools else "tool"
+            label = TOOL_LABELS.get(name, name)
+            data = value.get('data') or {}
+            target = data.get('path') or data.get('cwd') or ''
+            if not target and data.get('files'):
+                target = '、'.join(str(item.get('path', '')) for item in data['files'][:3])
             if value.get("ok"):
-                suffix = " · 输出已截断" if value.get("truncated") else ""
-                self.console.print(f"[green]✓[/green] {name} [dim]完成{suffix}[/dim]")
+                detail = f' · {target}' if target else ''
+                if name == 'run_commands' and 'exit_code' in data:
+                    detail += f" · 退出码 {data['exit_code']}"
+                self.console.print(Text.assemble(('✓ ', 'green'), (label + '完成' + detail, '')))
             else:
                 message = (value.get("error") or {}).get("message", "未知错误")
                 code = (value.get("error") or {}).get("code")
                 detail = f"[{code}] {message}" if code else message
-                self.console.print(Text.assemble(("× ", "red"), (name + " ", "white"), (detail, "dim red")))
+                self.console.print(Text.assemble(("× ", "red"), (label + '失败 ', ''), (detail, '')))
+                self.console.print('使用 /logs 查看完整输入输出。', style='dim')
+            if self.show_details:
+                self.render_data('工具输出', value)
             return
         if kind == "verification_start":
             self.console.print(f"[yellow]⟳[/yellow] [dim]自动验证 · 第 {value.get('round', 1)} 轮[/dim]")
@@ -389,10 +386,13 @@ class CliView:
 
     def render_result(self, result: dict, data: dict) -> None:
         # 如果流式传输已经显示了答案，就渲染一个紧凑的元数据栏。
+        streamed_same_answer = self._streaming and self._streamed_text == (result.get('answer') or '')
         if self._streaming:
             self._streaming = False
             self._stream_chars = 0
+            self._streamed_text = ''
             self.console.print()  # newline after streamed content
+        if streamed_same_answer:
             status = result.get("status", "failed")
             label, style = STATUS_STYLE.get(status, (status, "white"))
             footer = Text()
@@ -425,16 +425,9 @@ class CliView:
         total_tokens = (data.get("usage") or {}).get("total_tokens")
         if total_tokens is not None:
             footer.append(f"   Token {total_tokens}", style="dim")
-        self.console.print(
-            Panel(
-                Group(Markdown(str(answer)), Text(""), footer),
-                title=label,
-                title_align="left",
-                border_style=style,
-                box=box.ROUNDED,
-                padding=(0, 1),
-            )
-        )
+        self.console.print(Text(label, style=style))
+        self.console.print(Markdown(str(answer)))
+        self.console.print(footer)
 
     def render_confirmation(self, tool_name: str, preview: dict) -> None:
         body = Text()
@@ -448,26 +441,18 @@ class CliView:
             content = str(args.get("content", ""))
             body.append(f"\n内容    {len(content)} 字符", style="dim")
             if content:
-                body.append("\n\n")
-                body.append(content[:800], style="bright_black")
+                body.append('\n\n' + content[:800])
                 if len(content) > 800:
-                    body.append("\n…预览已截断", style="dim")
-        elif tool_name == "editor" and operation == "copy":
-            body.append("\n来源    ", style="dim")
-            body.append(str(args.get("source", "未知")), style="white")
-        body.append("\n\n")
-        body.append(" /approve ", style="bold white on #266a52")
-        body.append(" approve/yes/y ", style="dim")
-        body.append("  ")
-        body.append(" /reject ", style="bold white on #67333d")
-        body.append(" reject/no/n ", style="dim")
-        body.append("  ")
-        body.append(" /exit 暂缓 ", style="white on #26354a")
-        body.append("    仅本次 · 参数已冻结", style="dim")
-        body.append('\n中文：确认/同意；拒绝/不同意（完整匹配）', style='dim')
-        if tool_name == 'fetch_web_content':
-            body.append('\n/allow network run  允许本轮后续网络请求', style='cyan')
-            body.append('\n/allow network      允许本会话后续网络请求', style='cyan')
+                    body.append('\n…预览已截断', style='dim')
+        elif operation == 'patch':
+            body.append('\n\n' + str(args.get('patch', ''))[:1200])
+        elif args.get('source'):
+            body.append('\n来源  ' + str(args['source']))
+        if not is_interactive(self.console):
+            body.append("\n\n/approve  /reject  /cancel  /exit", style="cyan")
+        body.append("\n仅本次操作 · 参数已冻结", style="dim")
+        if preview.get('command'):
+            body.append('\n执行命令  ' + ' '.join(str(arg) for arg in preview['command']))
         self.console.print(
             Panel(body, title="◆ 操作确认", title_align="left", border_style="yellow", box=box.ROUNDED)
         )
@@ -491,25 +476,56 @@ class CliView:
                 index += 1
         return '\n'.join(output)
 
-    def render_remote_consent(self, input_roots: list[str]) -> None:
+    def render_remote_consent(self, input_roots: list[str], model_name=None) -> None:
         body = Text()
+        if model_name:
+            body.append(str(model_name) + '\n', style='bold')
         body.append("远程模型将接收当前会话内容。", style="white")
-        body.append("\n读取本地资料后，授权内容也可能发送给模型；搜索词可能包含会话或资料信息。", style="dim")
+        body.append("\n读取的授权资料和搜索词也可能发送给模型。")
         body.append("\n授权输入：", style="dim")
         body.append("、".join(input_roots) if input_roots else "未指定", style="white")
-        body.append("\n\n输入 allow 允许本次会话。", style="yellow")
+        if not is_interactive(self.console):
+            body.append("\n\n输入 allow 允许本次会话。", style="yellow")
         self.console.print(Panel(body, title="远程数据确认", title_align="left", border_style="yellow"))
 
     def render_error(self, message: str, *, title="错误") -> None:
-        self.console.print(Panel(Text(message), title=title, title_align="left", border_style="red"))
+        self.console.print(Text.assemble(('× ' + title + '\n', 'red bold'), (message, '')))
 
     def render_goodbye(self) -> None:
         self.console.print("\n[dim]会话状态已保存。[/dim] [bright_green]再见。[/bright_green]")
 
     def prompt(self) -> str:
-        return self.console.input("\n[bold bright_green]❯[/bold bright_green] ").strip()
+        data = getattr(self, 'session_data', {})
+        if is_interactive(self.console):
+            pending = data.get('pending') or []
+            if data.get('status') == 'awaiting_confirmation' and pending:
+                call_id = pending[0]['id']
+                if getattr(self, '_confirmation_seen', None) != call_id:
+                    self._confirmation_seen = call_id
+                    options = [('允许本次操作', ''), ('拒绝本次操作', ''), ('取消任务', ''), ('保存并退出', '')]
+                    picked = select(self.console, '选择如何处理', options, index=1)
+                    if picked is not None:
+                        self.last_input_raw = ['/approve', '/reject', '/cancel', '/exit'][picked]
+                        return self.last_input_raw
+            snapshot = getattr(self, 'snapshot', None)
+            status = snapshot.model_name if snapshot else 'GenesisAI'
+            context = (data.get('run_runtime') or {}).get('context_report') or {}
+            if context.get('input_limit'):
+                status += f" · 上下文约 {context.get('tokens_after', 0) / context['input_limit']:.0%}"
+            self.console.rule(style='dim')
+            self.last_input_raw = self._get_input().read(status)
+        else:
+            self.last_input_raw = self.console.input('\n> ')
+        return self.last_input_raw.strip()
 
     @contextmanager
     def working(self, message="GenesisAI 正在处理..."):
-        with self.console.status(f"[dim cyan]{message}[/dim cyan]", spinner="dots"):
+        status = self.console.status(Text(message + ' · Ctrl+C 停止'), spinner="dots")
+        self._working_status = status
+        status.start()
+        try:
             yield
+        finally:
+            if self._working_status is not None:
+                status.stop()
+            self._working_status = None

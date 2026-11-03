@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
+from genesisai.shared.ids import uid
 
 from genesisai.core.tools.base import ToolContext, Tool
 from genesisai.core.tools.catalog import ToolCatalog
@@ -40,9 +42,11 @@ class ToolRuntime:
         confirm_search: bool = True,
         confirm_shell: bool = True,
         registry: ToolRegistry | None = None,
+        logger=None,
     ):
         self.store = store
         self.access = access
+        self.logger = logger or store.get_logger()
         self._network = network or Network()
         self._providers = providers if providers is not None else [
             BraveSearchProvider(client=self._network),
@@ -139,6 +143,23 @@ class ToolRuntime:
         return self.catalog.definitions()
 
     def execute(self, call: dict, approved: str | None = None) -> dict:
+        invocation_id = uid('invocation')
+        info = call if isinstance(call, dict) else {}
+        prior = self.store.data['calls'].get(info.get('id', '')) if isinstance(info.get('id', ''), str) else None
+        details = {'invocation_id': invocation_id, 'approved': approved is not None,
+                   'prior_state': (prior or {}).get('state')}
+        self.logger.log_tool_execution_start(info.get('id'), info.get('name'), info.get('arguments'), **details)
+        started = time.monotonic()
+        try:
+            result = self._execute(call, approved)
+        except BaseException as exc:
+            self.logger.error('tool_exception', exc, call=call, **details)
+            raise
+        self.logger.log_tool_execution_end(info.get('id'), info.get('name'), result,
+                                          round((time.monotonic() - started) * 1000), **details)
+        return result
+
+    def _execute(self, call: dict, approved: str | None = None) -> dict:
         self.catalog.refresh()
         # 先校验调用资格，再查询研究缓存或权限。
         try:
@@ -177,7 +198,9 @@ class ToolRuntime:
         return error_result(call, "invalid_result", "工具返回了无效的结果结构")
 
     def reject(self, call: dict) -> dict:
-        return self.executor.reject(call)
+        result = self.executor.reject(call)
+        self.logger.record('tool_rejected', call=call, result=result)
+        return result
 
     @property
     def permission_mode(self) -> str:

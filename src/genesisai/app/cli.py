@@ -1,22 +1,26 @@
 import argparse
+import os
 import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from rich.console import Console
 
 from genesisai.app.terminal_view import CliSnapshot, CliView
-from genesisai.shared.changes import undo_changes
-from genesisai.app.maintenance import clean_runtime, doctor
-from genesisai.model.config import build_model
+from genesisai.model.config import build_model, load_model_config
 from genesisai.model.settings import load_settings
+from genesisai.model.providers.catalog import PROVIDERS
 from genesisai.app import onboarding
-from genesisai.agent.runner import Runner
+from genesisai.app.session_picker import choose_session
+from genesisai.app.select import select
+from genesisai.app.command_input import COMMANDS
+from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
-from genesisai.core.state.store import HostLock, Store, workspace_state_root
+from genesisai.core.state.store import HostLock, Store, application_state_root, default_workspace
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.core.project_docs import AgentDocsManager
 
@@ -36,33 +40,17 @@ class CliSession:
     snapshot: CliSnapshot
 
 
-def _git_workspace_suggestion(path: Path) -> Path | None:
-    current = path.resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / '.git').exists():
-            return candidate
-    return None
-
-
-def select_workspace(explicit: Path | None, *, console, view, interactive: bool) -> Path:
-    """解析显式工作区路径，或在远程数据确认前提示用户选择。"""
-    if explicit is not None:
-        workspace = explicit.resolve()
-        if workspace.exists() and not workspace.is_dir():
-            raise ValueError('工作区必须是目录')
-        # 保留 --workspace 的历史自动化行为，而交互式选择器
-        # 仍限制为只允许已存在的目录。
+def select_workspace(explicit: Path | None, *, create=True) -> Path:
+    """显式目录优先，否则使用固定默认工作区；首次使用自动创建。"""
+    workspace = Path(explicit).expanduser().resolve() if explicit is not None else default_workspace()
+    if workspace.exists() and not workspace.is_dir():
+        raise ValueError('工作区必须是目录')
+    if workspace.is_relative_to(application_state_root()):
+        raise ValueError('工作区不能位于应用历史目录内')
+    if create:
         workspace.mkdir(parents=True, exist_ok=True)
-        return workspace
-    current = Path.cwd().resolve()
-    if not interactive:
-        raise ValueError('非交互模式必须使用 --workspace 明确指定工作区')
-    suggestion = _git_workspace_suggestion(current)
-    view.render_workspace_selection(str(current), str(suggestion) if suggestion else None)
-    raw = console.input('[bold cyan]工作区 > [/bold cyan]').strip()
-    workspace = Path(raw).expanduser().resolve() if raw else current
-    if not workspace.is_dir():
-        raise ValueError('交互式工作区必须是已经存在的目录')
+    elif not workspace.is_dir():
+        raise ValueError('历史会话的工作区已不存在，请恢复原目录或新建会话')
     return workspace
 
 
@@ -80,6 +68,8 @@ def build_cli_session(
     on_event,
     workspace=None,
     confirm_shell=True,
+    logger=None,
+    request_timeout=DEFAULT_REQUEST_TIMEOUT,
 ):
     """将一个持久化 Session 绑定到访问边界、Runtime、Runner 和 UI 快照。"""
     store.data.update(grants=list(roots), output=str(output), remote_allowed=remote)
@@ -92,6 +82,7 @@ def build_cli_session(
         confirm_writes=confirm_writes,
         confirm_search=confirm_search,
         confirm_shell=confirm_shell,
+        logger=logger,
     )
     inventory = runtime.inventory()
     skills = SkillRegistry(actual_workspace, runtime.registry)
@@ -99,6 +90,7 @@ def build_cli_session(
         session_id=store.id,
         model_name=getattr(model, 'model', type(model).__name__),
         workspace=str(actual_workspace),
+        history_root=str(store.root),
         input_roots=list(roots),
         output=str(output),
         permission_mode=runtime.permission_mode,
@@ -109,7 +101,10 @@ def build_cli_session(
         agent_docs_status=(AgentDocsManager(actual_workspace).summary().get('active_status') or '就绪')
         if AgentDocsManager.exists(actual_workspace) else '未初始化',
     )
-    runner = Runner(model, runtime, max_rounds=max_rounds, seconds=seconds, on_event=on_event)
+    runner = Runner(model, runtime, max_rounds=max_rounds, seconds=seconds, request_timeout=request_timeout, on_event=on_event)
+    store.data['run_runtime']['execution_seconds_limit'] = seconds
+    store.data['run_runtime']['request_timeout_seconds'] = request_timeout
+    store.save()
     return CliSession(store=store, runtime=runtime, runner=runner, snapshot=snapshot)
 
 
@@ -126,17 +121,21 @@ def apply_permission_command(runtime, text):
 
 def load_environment(explicit=None, workspace=None):
     """先加载工作区 .env，再补充本项目 .env（不读取项目以外的上级目录）。"""
-    if explicit:
-        load_dotenv(Path(explicit), override=False)
-        return
     # 进程中已有的变量优先。工作区 .env 优先，GenesisAI/.env 只补充
     # 尚未设置的变量；不读取项目上级目录，避免历史遗留 .env 污染密钥。
-    candidates = []
-    if workspace:
-        candidates.append(Path(workspace).resolve() / '.env')
-    candidates.append(PROJECT_ROOT / '.env')
+    candidates = [Path(explicit)] if explicit else []
+    if not explicit:
+        if workspace:
+            candidates.append(Path(workspace).resolve() / '.env')
+        candidates.append(PROJECT_ROOT / '.env')
     for candidate in candidates:
         if candidate.is_file():
+            values = dotenv_values(candidate)
+            for provider in PROVIDERS:
+                name = provider.api_key_env
+                value = (values.get(name) or '').strip()
+                if not os.environ.get(name, '').strip() and value:
+                    os.environ[name] = value
             load_dotenv(candidate, override=False)
 
 
@@ -146,7 +145,7 @@ def main(argv=None):
     parser.add_argument('--config-dir', type=Path, help='用户配置目录，默认 ~/.genesisai')
     parser.add_argument('--auth', action='store_true', help='交互式选择模型提供商/模型并写入配置后退出')
     parser.add_argument('--env-file', type=Path, help='显式 .env 路径；默认读取工作区根目录及本项目 .env')
-    parser.add_argument('--workspace', type=Path, help='明确指定目标项目目录；非交互模式必须提供')
+    parser.add_argument('--workspace', type=Path, help='任务工作目录，默认 ~/GenesisAI/workspace；历史统一保存在默认工作区')
     parser.add_argument('--input', type=Path, action='append', default=[], help='授权读取目录/文件，可重复')
     parser.add_argument('--output', type=Path, help='新文件输出目录')
     parser.add_argument('--session', help='恢复会话 ID')
@@ -159,37 +158,55 @@ def main(argv=None):
     docs_group.add_argument('--no-agent-docs', action='store_true', help='本次启动不初始化 agent_docs')
     parser.add_argument('--prompt', help='执行单次输入后退出；需要确认时保留会话')
     parser.add_argument('--max-rounds', type=int, default=20)
-    parser.add_argument('--seconds', type=int, default=300)
+    parser.add_argument('--seconds', type=int, default=DEFAULT_TASK_SECONDS, help='一轮任务总执行时限，默认 300 秒')
+    parser.add_argument('--request-timeout', type=int, default=DEFAULT_REQUEST_TIMEOUT, help='单次模型请求超时，默认 60 秒')
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, 'reconfigure', None)
         if reconfigure:
             reconfigure(encoding='utf-8', errors='replace')
-    try:
-        console = Console(legacy_windows=False)
-    except TypeError:  # 测试和嵌入式宿主可能提供无参数 Console 工厂
-        console = Console()
+    console = Console(legacy_windows=False)
     view = CliView(console)
-    if args.max_rounds < 1 or args.seconds < 1:
+    if args.max_rounds < 1 or args.seconds < 1 or args.request_timeout < 1:
         parser.error('预算必须为正数')
     interactive = not args.prompt and bool(getattr(sys.stdin, 'isatty', lambda: False)())
     try:
-        actual_workspace = select_workspace(args.workspace, console=console, view=view, interactive=interactive)
-    except ValueError as exc:
+        actual_workspace = select_workspace(args.workspace, create=not args.session)
+    except (ValueError, OSError) as exc:
         view.render_error(str(exc), title='工作区错误')
         return 2
-    load_environment(args.env_file, actual_workspace)
     if args.auth:
+        load_environment(args.env_file, actual_workspace)
         configured = onboarding.run_onboarding(console, directory=args.config_dir)
         if configured is None:
             view.render_error('已取消模型配置。', title='模型配置')
             return 2
         view.render_model_settings(configured)
         return 0
-    state_root = workspace_state_root(actual_workspace)
+    state = None
+    session_logger = None
+    def record_console_output(logger=None):
+        target = logger or session_logger
+        if target is not None:
+            rendered = console.export_text(clear=True)
+            if rendered:
+                target.record('cli_output', text=rendered)
+
+    state_root = application_state_root()
+    initial_environment = dict(os.environ)
     try:
         with HostLock(state_root):
-            store = Store(state_root, args.session, workspace=actual_workspace)
+            store = Store(state_root, args.session,
+                          workspace=None if args.session and args.workspace is None else actual_workspace)
+            actual_workspace = store.workspace
+            if not actual_workspace.is_dir():
+                raise ValueError('历史会话的工作区已不存在，请恢复原目录或新建会话')
+            load_environment(args.env_file, actual_workspace)
+            environment_from_files = {key for key in os.environ if initial_environment.get(key) != os.environ[key]}
+            session_logger = store.get_logger()
+            console.record = True
+            session_logger.record('session_open', workspace=str(actual_workspace), resumed=bool(args.session),
+                                  log_path=str(session_logger.journal.path), options=vars(args))
             d = store.data
             roots = [str(p.resolve(strict=True)) for p in args.input] or d['grants'] or [str(actual_workspace)]
             if any(not Path(root).is_relative_to(actual_workspace) for root in roots):
@@ -197,13 +214,16 @@ def main(argv=None):
             output_path = (args.output or (Path(d['output']) if d['output'] else actual_workspace)).resolve()
             if not output_path.is_relative_to(actual_workspace):
                 raise ValueError('输出目录必须位于用户指定的工作区内')
-            if output_path == state_root or output_path.is_relative_to(state_root):
-                raise ValueError('输出目录不能位于工作区的 .genesis 运行状态目录内')
+            if any(output_path.is_relative_to(root) for root in (state_root, actual_workspace / '.genesis')):
+                raise ValueError('输出目录不能位于 .genesis 运行状态目录内')
             output = str(output_path)
             if args.session and (roots != d['grants'] or output != d['output']):
                 raise ValueError('恢复时不能更改授权根目录或输出目录，请创建新会话')
             current_settings = load_settings(args.config_dir)
             needs_config = current_settings is None or not onboarding.has_credentials(current_settings)
+            if current_settings is None and interactive and not args.prompt:
+                configured_model = load_model_config(args.config)
+                needs_config = not onboarding.env_key(configured_model.provider)
             if needs_config and interactive and not args.prompt:
                 current_settings = onboarding.run_onboarding(
                     console, directory=args.config_dir, initial=current_settings
@@ -220,14 +240,18 @@ def main(argv=None):
             if remote and not args.allow_remote_data:
                 if args.prompt:
                     raise ValueError('远程模型需 --allow-remote-data 明确允许会话、授权资料和搜索词发送')
-                view.render_remote_consent(roots)
-                if console.input('[bold yellow]确认 > [/bold yellow]').strip() != 'allow':
+                view.render_remote_consent(roots, getattr(model, 'model', None))
+                consent = view.request_consent('允许本次会话使用远程模型', '远程模型授权')
+                session_logger.record('startup_input', purpose='remote_data_consent', text=consent)
+                if consent != 'allow':
                     raise ValueError('未允许远程资料发送')
             if not AgentDocsManager.exists(actual_workspace) and not args.no_agent_docs:
                 initialize_docs = args.yes_agent_docs
                 if interactive and not initialize_docs:
                     view.render_agent_docs_consent(str(actual_workspace / 'agent_docs'))
-                    initialize_docs = console.input('[bold yellow]agent_docs > [/bold yellow]').strip().casefold() == 'allow'
+                    consent = view.request_consent('创建项目任务记录', '初始化项目记录')
+                    session_logger.record('startup_input', purpose='agent_docs_consent', text=consent)
+                    initialize_docs = consent.casefold() == 'allow'
                 if initialize_docs:
                     AgentDocsManager(actual_workspace, create=True)
             saved_modes = d.get('permission_modes', {'network': 'ask', 'writes': 'ask', 'shell': 'ask'})
@@ -255,11 +279,14 @@ def main(argv=None):
                 confirm_search=base_confirm_search,
                 max_rounds=args.max_rounds,
                 seconds=args.seconds,
+                request_timeout=args.request_timeout,
                 on_event=progress,
                 workspace=actual_workspace,
                 confirm_shell=base_confirm_shell,
+                logger=session_logger,
             )
-            view.render_startup(state.snapshot)
+            view.render_startup(state.snapshot, state.store.data)
+            record_console_output()
 
             def show(result):
                 d = state.store.data
@@ -270,16 +297,19 @@ def main(argv=None):
                     view.render_confirmation(call['name'], preview)
 
             def run_and_show(action, message='GenesisAI 正在处理...'):
-                with view.working(message):
-                    result = action()
-                show(result)
-                return result
+                try:
+                    with view.working(message):
+                        result = action()
+                    show(result)
+                    return result
+                finally:
+                    record_console_output()
 
             def apply_model_settings(new_settings):
                 nonlocal model, remote, current_settings
                 model, remote = build_model(args.config, settings=new_settings)
                 current_settings = new_settings
-                state.runner.model = model
+                state.runner.set_model(model)
                 state.snapshot = replace(state.snapshot, model_name=getattr(model, 'model', new_settings.model))
                 view.render_model_settings(new_settings)
 
@@ -288,8 +318,22 @@ def main(argv=None):
                 return 0 if state.store.data['status'] == 'completed' else 2
             while True:
                 try:
+                    view.bind_session(state.snapshot, state.store.data)
                     text = view.prompt()
+                    state.runtime.logger.record('cli_input', text=getattr(view, 'last_input_raw', text))
                     command = text.casefold()
+                    if command == '/' or (command == '/help' and interactive):
+                        if interactive:
+                            selected_command = view.choose_command()
+                        else:
+                            choices = [(cmd, desc) for cmd, desc, group in COMMANDS]
+                            picked = select(console, '选择操作', choices, searchable=True)
+                            selected_command = choices[picked][0] if picked is not None else None
+                        if not selected_command:
+                            continue
+                        text = selected_command
+                        command = text.casefold()
+                        state.runtime.logger.record('cli_menu_choice', command=command)
                     awaiting = state.store.data['status'] == 'awaiting_confirmation'
                     if command == '/exit':
                         view.render_goodbye()
@@ -327,16 +371,10 @@ def main(argv=None):
                     elif command == '/compact':
                         summary = state.runner.context_budgeter.compact(force=True)
                         view.render_data('Context Compact', {'summary': summary, 'report': state.store.data['run_runtime'].get('context_report', {})})
-                    elif command in {'/undo', '/undo apply'}:
-                        value = undo_changes(state.store, actual_workspace, apply=command.endswith(' apply'))
-                        view.render_data('Undo' + (' · 已执行' if command.endswith(' apply') else ' · 预览'), value)
-                    elif command == '/doctor':
-                        view.render_data('Doctor', doctor(actual_workspace, state.store.root, args.config))
-                    elif command in {'/clean', '/clean run'}:
-                        value = clean_runtime(state.store.root, state.store.id, execute=command.endswith(' run'))
-                        view.render_data('Clean' + (' · 已执行' if command.endswith(' run') else ' · 预览'), value)
                     elif command == '/trace':
                         view.render_trace(state.store)
+                    elif command == '/details':
+                        view.toggle_details()
                     elif command == '/history':
                         view.render_history(state.store.data['messages'])
                     elif command == '/model':
@@ -379,10 +417,75 @@ def main(argv=None):
                         manager = AgentDocsManager(actual_workspace, create=True)
                         state.snapshot = replace(state.snapshot, agent_docs_status=manager.summary().get('active_status') or '就绪')
                         view.render_data('Agent Docs · 已初始化', manager.summary())
+                    elif command == '/sessions':
+                        state.runner.ensure_available()
+                        selected_id = choose_session(console, state_root, state.store.id)
+                        if selected_id is None:
+                            continue
+                        restored = Store(state_root, selected_id)
+                        selected_workspace = select_workspace(restored.workspace, create=False)
+                        selected_roots = restored.data['grants'] or [str(selected_workspace)]
+                        selected_output = Path(restored.data['output'] or selected_workspace).resolve()
+                        if any(not Path(p).resolve().is_relative_to(selected_workspace) for p in selected_roots):
+                            raise ValueError('历史会话的授权目录已越出工作区')
+                        if (not selected_output.is_relative_to(selected_workspace)
+                                or selected_output.is_relative_to(state_root)
+                                or selected_output.is_relative_to(selected_workspace / '.genesis')):
+                            raise ValueError('历史会话的输出目录无效')
+                        previous_environment = dict(os.environ)
+                        selected_model = None
+                        try:
+                            for key in environment_from_files:
+                                if key in initial_environment:
+                                    os.environ[key] = initial_environment[key]
+                                else:
+                                    os.environ.pop(key, None)
+                            load_environment(args.env_file, selected_workspace)
+                            selected_model, selected_remote = (build_model(args.config, settings=current_settings)
+                                if current_settings is not None else build_model(args.config))
+                            if selected_remote and not (args.allow_remote_data or restored.data['remote_allowed']):
+                                view.render_remote_consent(selected_roots, getattr(selected_model, 'model', None))
+                                consent = view.request_consent('允许所选会话使用远程模型', '远程模型授权')
+                                state.runtime.logger.record('startup_input', purpose='restore_remote_consent', text=consent)
+                                if consent != 'allow':
+                                    raise ValueError('已取消恢复远程会话')
+                            modes = restored.data['permission_modes']
+                            selected_state = build_cli_session(
+                                restored, roots=selected_roots, output=str(selected_output), remote=selected_remote,
+                                model=selected_model, confirm_writes=modes['writes'] == 'ask',
+                                confirm_search=modes['network'] == 'ask', confirm_shell=modes['shell'] == 'ask',
+                                max_rounds=args.max_rounds, seconds=args.seconds, request_timeout=args.request_timeout,
+                                on_event=progress, workspace=selected_workspace)
+                        except Exception:
+                            selected_client = getattr(selected_model, 'client', None)
+                            if selected_client is not None:
+                                selected_client.close()
+                            for key in set(os.environ) | set(previous_environment):
+                                if key in previous_environment:
+                                    os.environ[key] = previous_environment[key]
+                                else:
+                                    os.environ.pop(key, None)
+                            raise
+                        environment_from_files = {key for key in os.environ if initial_environment.get(key) != os.environ[key]}
+                        old_logger = state.runtime.logger
+                        record_console_output(old_logger)
+                        old_logger.record('session_switch', next_session_id=selected_id)
+                        previous_client = getattr(model, 'client', None)
+                        if previous_client is not None and selected_model is not model:
+                            previous_client.close()
+                        state = selected_state
+                        actual_workspace, roots, output = selected_workspace, selected_roots, str(selected_output)
+                        model, remote = selected_model, selected_remote
+                        session_logger = state.runtime.logger
+                        session_logger.record('session_open', workspace=str(actual_workspace), resumed=True)
+                        view.render_startup(state.snapshot, state.store.data)
+                        view.render_status(state.store.data, state.snapshot)
                     elif command == '/new':
                         state.runner.ensure_available()
+                        old_logger = state.runtime.logger
+                        record_console_output(old_logger)
                         new_store = Store(state_root, workspace=actual_workspace)
-                        new_output = str((args.output or actual_workspace).resolve())
+                        new_output = output
                         state = build_cli_session(
                             new_store,
                             roots=roots,
@@ -393,11 +496,18 @@ def main(argv=None):
                             confirm_search=True,
                             max_rounds=args.max_rounds,
                             seconds=args.seconds,
+                            request_timeout=args.request_timeout,
                             on_event=progress,
                             workspace=actual_workspace,
                             confirm_shell=True,
                         )
-                        view.render_startup(state.snapshot)
+                        old_logger.record('session_switch', next_session_id=state.store.id)
+                        session_logger = state.runtime.logger
+                        state.runtime.logger.record('session_open', workspace=str(actual_workspace), resumed=False)
+                        view.render_startup(state.snapshot, state.store.data)
+                    elif command == '/logs':
+                        state.runtime.logger.record('log_location', path=str(state.runtime.logger.journal.path))
+                        view.render_logs(str(state.runtime.logger.journal.path))
                     elif command.startswith('/skills'):
                         registry = SkillRegistry(actual_workspace, state.runtime.registry)
                         parts = text.split(maxsplit=2)
@@ -451,14 +561,24 @@ def main(argv=None):
                     elif text:
                         run_and_show(lambda: state.runner.start(text))
                 except (EOFError, KeyboardInterrupt):
+                    state.runtime.logger.record('cli_closed', reason='eof_or_interrupt')
                     view.render_goodbye()
                     break
                 except (ValueError, SkillError, OSError) as exc:
+                    state.runtime.logger.error('cli_error', exc)
                     view.render_error(str(exc))
+                finally:
+                    record_console_output()
             return 0
     except (ValueError, RuntimeError, OSError) as exc:
+        if session_logger is not None:
+            session_logger.error('cli_error', exc)
         view.render_error(str(exc), title='启动失败')
         return 2
+    finally:
+        if session_logger is not None:
+            record_console_output()
+            session_logger.record('session_close', status=session_logger.store.data['status'])
 
 
 def entry():

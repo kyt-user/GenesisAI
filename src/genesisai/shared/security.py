@@ -34,6 +34,7 @@ class Access:
         self.state_root = Path(state_root).resolve()
         self._protected_state = self.state_root.name.casefold() == '.genesis'
         self.workspace = Path(workspace_root or (self.roots[0] if self.roots and self.roots[0].is_dir() else self.output)).resolve()
+        self._state_roots = (self.state_root, self.workspace / '.genesis') if self._protected_state else ()
         self.output.mkdir(parents=True, exist_ok=True)
         if self.output == self.state_root:
             raise ValueError('输出目录不能等于程序状态目录')
@@ -49,7 +50,7 @@ class Access:
                 candidates.append(self.output.joinpath(*raw.parts[1:]))
             raw = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
         path = raw.resolve(strict=True)
-        if self._protected_state and (path == self.state_root or path.is_relative_to(self.state_root)):
+        if any(path.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能读取程序状态文件')
         if path.name == '.env' or path.name.startswith('.env.'):
             raise ToolError('permission_denied', '不向工具开放密钥文件')
@@ -63,7 +64,7 @@ class Access:
         safe_name(target)
         if not target.is_relative_to(self.workspace) or (target == self.workspace and not allow_directory):
             raise ToolError('permission_denied', '路径超出工作区')
-        if self._protected_state and (target == self.state_root or target.is_relative_to(self.state_root)):
+        if any(target.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能操作程序状态文件')
         if target.name == '.env' or target.name.startswith('.env.'):
             raise ToolError('permission_denied', '不能操作密钥文件')
@@ -79,7 +80,7 @@ class Access:
         target = (self.output / relative).resolve()
         if target == self.output or not target.is_relative_to(self.output):
             raise ToolError('permission_denied', '输出路径越界')
-        if self._protected_state and (target == self.state_root or target.is_relative_to(self.state_root)):
+        if any(target.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能操作程序状态文件')
         if target.name == '.env' or target.name.startswith('.env.'):
             raise ToolError('permission_denied', '不能操作密钥文件')

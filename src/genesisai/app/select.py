@@ -108,13 +108,19 @@ def _menu_panel(title, rows, selected, footer, query=None) -> Panel:
         body.append("搜索  ", style="dim")
         body.append(query, style="cyan")
         body.append("\n")
-    for position, (label, detail, _origin) in enumerate(rows):
+    start = max(0, min(selected - 3, len(rows) - 7))
+    visible_rows = rows[start:start + 7]
+    for position, (label, detail, _origin) in enumerate(visible_rows, start):
         active = position == selected
         body.append("❯ " if active else "  ", style="bold cyan" if active else "grey35")
         body.append(label, style="bold cyan" if active else "white")
         if detail:
             body.append("  " + detail, style="dim")
         body.append("\n")
+    if len(rows) > 7:
+        body.append(f'第 {start + 1}–{start + len(visible_rows)} 项，共 {len(rows)} 项 · ↑↓ 滚动\n', style='dim')
+    if not rows:
+        body.append('没有匹配的操作，请修改搜索内容。\n')
     if footer:
         body.append(footer, style="dim")
     return Panel(body, title=title, title_align="left", border_style="cyan", box=box.ROUNDED)

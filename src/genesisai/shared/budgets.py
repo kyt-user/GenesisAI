@@ -14,20 +14,18 @@ class TaskProfile:
     search_queries: int
     search_fetches: int
     retries_per_candidate: int
-    token_budget: int
-    seconds: int
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 PROFILES = {
-    "direct_answer": TaskProfile("direct_answer", 3, 0, 0, 0, 12000, 60),
-    "web_quick": TaskProfile("web_quick", 8, 2, 4, 1, 30000, 120),
-    "web_normal": TaskProfile("web_normal", 12, 4, 8, 1, 50000, 300),
-    "web_deep": TaskProfile("web_deep", 20, 8, 12, 1, 100000, 600),
-    "local_files": TaskProfile("local_files", 20, 0, 0, 1, 160000, 600),
-    "creative": TaskProfile("creative", 25, 0, 0, 1, 120000, 600),
+    "direct_answer": TaskProfile("direct_answer", 3, 0, 0, 0),
+    "web_quick": TaskProfile("web_quick", 8, 2, 4, 1),
+    "web_normal": TaskProfile("web_normal", 12, 4, 8, 1),
+    "web_deep": TaskProfile("web_deep", 20, 8, 12, 1),
+    "local_files": TaskProfile("local_files", 20, 0, 0, 1),
+    "creative": TaskProfile("creative", 25, 0, 0, 1),
 }
 
 

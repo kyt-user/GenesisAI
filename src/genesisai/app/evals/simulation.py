@@ -18,7 +18,7 @@ from pathlib import Path
 import yaml
 
 from genesisai.model.config import build_model
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills.registry import SkillRegistry
 from genesisai.core.state.store import Store, atomic_json

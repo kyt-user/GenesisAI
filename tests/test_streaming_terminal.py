@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from rich.console import Console
 
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.app.terminal_view import CliView
 from genesisai.model.providers.deepseek import DeepSeekClient
 from genesisai.core.tools.tool_runtime import ToolRuntime
@@ -83,7 +83,7 @@ def test_runner_passes_final_stream_token_limit(tmp_path):
     model = StreamingModel()
     runner = Runner(model, runtime)
 
-    response = runner._call_model([], [])
+    response = runner._call_model(runner.context(), [])
 
     assert response.content == "done"
     assert model.options["max_tokens"] == 600

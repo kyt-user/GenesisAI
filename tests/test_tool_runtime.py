@@ -6,7 +6,7 @@ import json
 import pytest
 
 from genesisai.shared.messages import Response
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.state.store import Store
 from genesisai.core.tools.tool_runtime import ToolRuntime
@@ -167,7 +167,7 @@ def test_three_followups_keep_session_context_and_reset_run_budget(tmp_path):
     assert len(store.data["history"]) == 3
 
 
-def test_followup_fails_clearly_when_previous_turn_cannot_fit_context(tmp_path):
+def test_followup_compacts_long_previous_turn_and_continues(tmp_path):
     _, _, store, runtime = make_runtime(tmp_path)
     store.data["messages"] = [
         {"role": "user", "content": "旧问题"},
@@ -176,9 +176,12 @@ def test_followup_fails_clearly_when_previous_turn_cannot_fit_context(tmp_path):
     store.data["status"] = "completed"
     store.save()
 
-    result = Runner(FakeModel(), runtime).start("基于上一轮继续")
-    assert result["status"] == "failed"
-    assert "无法同时保留当前追问和上一轮内容" in result["answer"]
+    model = FakeModel(Response(content='继续完成'))
+    model.context_config = {'max_input_tokens': 20000, 'strategy': 'basic'}
+    result = Runner(model, runtime).start("基于上一轮继续")
+    assert result['status'] == 'completed'
+    assert store.data['context_checkpoint']
+    assert len(store.data['messages'][1]['content']) == 81000
 
 
 def test_network_confirmation_uses_network_message(tmp_path):

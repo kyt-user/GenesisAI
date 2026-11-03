@@ -6,8 +6,7 @@
 
 from __future__ import annotations
 
-import os
-
+from genesisai.model.credentials import environment_key, resolve_api_key
 from genesisai.app import select
 from genesisai.model.providers.catalog import PROVIDERS, get_provider
 from genesisai.model.settings import ProviderSettings, load_settings, save_settings
@@ -29,26 +28,19 @@ def provider_choices() -> list[tuple[str, str]]:
 
 def env_key(provider_id: str, environ=None) -> str:
     """从环境变量读取指定提供商的密钥。"""
-    provider = get_provider(provider_id)
-    if provider is None:
-        return ""
-    return (environ or os.environ).get(provider.api_key_env, "").strip()
+    return environment_key(provider_id, environ)
 
 
 def has_credentials(settings: ProviderSettings | None, environ=None) -> bool:
     """判断当前是否已有可用密钥（持久化或环境变量）。"""
-    if settings is None:
-        return False
-    if settings.api_key:
-        return True
-    return bool(env_key(settings.provider, environ))
+    return bool(effective_key(settings, environ))
 
 
 def effective_key(settings: ProviderSettings | None, environ=None) -> str:
-    """返回生效密钥：优先持久化，其次环境变量。"""
+    """返回生效密钥：优先环境变量，其次终端持久化配置。"""
     if settings is None:
         return ""
-    return settings.api_key or env_key(settings.provider, environ)
+    return resolve_api_key(settings.provider, settings.api_key, environ=environ)
 
 
 def run_onboarding(console, *, directory=None, initial: ProviderSettings | None = None):
@@ -61,24 +53,30 @@ def run_onboarding(console, *, directory=None, initial: ProviderSettings | None 
             if provider.id == initial.provider:
                 default_provider = position
                 break
-    console.print("[dim]配置将写入用户目录，之后无需再设置开发用 .env。[/dim]")
+    console.print("[dim]环境中的 API Key 优先；终端保存的密钥仅在环境未配置时使用。[/dim]")
     chosen = select.select(console, "选择模型提供商", provider_choices(), index=default_provider)
     if chosen is None:
         return None
     provider = PROVIDERS[chosen]
 
     existing = initial.api_key if (initial and initial.provider == provider.id) else ""
-    existing = existing or env_key(provider.id)
-    if existing:
-        console.print(f"[dim]已检测到 {provider.label} 密钥：{mask(existing)}，直接回车沿用。[/dim]")
-    hint = f"获取密钥：{provider.docs_url}" if provider.docs_url else ""
-    key = select.prompt_secret(console, f"{provider.label} API Key", hint=hint, required=not existing)
-    if key is None:
-        return None
-    key = key or existing
-    if not key:
-        console.print("[red]未提供密钥，已取消。[/red]")
-        return None
+    existing = existing.strip()
+    environment = env_key(provider.id)
+    if environment:
+        console.print(f"[dim]使用环境中的 {provider.api_key_env}：{mask(environment)}，无需输入密钥。[/dim]")
+        # 不把环境密钥复制到用户配置，保留原有终端密钥作为回退。
+        key = existing
+    else:
+        if existing:
+            console.print(f"[dim]已检测到终端保存的 {provider.label} 密钥：{mask(existing)}，直接回车沿用。[/dim]")
+        hint = f"获取密钥：{provider.docs_url}" if provider.docs_url else ""
+        key = select.prompt_secret(console, f"{provider.label} API Key", hint=hint, required=not existing)
+        if key is None:
+            return None
+        key = key or existing
+        if not key:
+            console.print("[red]未提供密钥，已取消。[/red]")
+            return None
 
     model_options = [(model.label, f"{model.id} · {model.description}") for model in provider.models]
     model_options.append(("自定义模型 ID…", "手动输入不在列表中的模型"))
@@ -106,6 +104,7 @@ def run_onboarding(console, *, directory=None, initial: ProviderSettings | None 
         api_key=key,
         base_url=provider.base_url,
         generation=generation,
+        context=dict(initial.context) if initial and initial.provider == provider.id and initial.model == model else {},
     )
     path = save_settings(settings, directory)
     console.print(f"[green]✓ 已保存[/green] [dim]{path}[/dim]")
@@ -139,6 +138,7 @@ def select_model_only(console, settings: ProviderSettings, *, directory=None):
         api_key=settings.api_key,
         base_url=settings.base_url,
         generation=dict(settings.generation),
+        context=dict(settings.context) if settings.model == model else {},
     )
     save_settings(updated, directory)
     return updated

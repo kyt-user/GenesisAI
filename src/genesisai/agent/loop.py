@@ -1,9 +1,6 @@
 """单 Agent 的 ReAct 循环骨架。
 
-注意：本模块现在 import core 层实现（RunLogger），用于完整的日志记录功能。
-
-
-日志系统包含配置管理、存储查询和分析功能。
+日志记录器通过 runtime 注入。
 """
 
 from __future__ import annotations
@@ -21,7 +18,7 @@ from genesisai.agent.recovery import RecoveryMixin, SOURCE_REF
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
 from genesisai.shared.budgets import initial_run_runtime, is_recall_request, select_initial_profile
 from genesisai.shared.ids import uid
-from genesisai.core.state.logger import RunLogger
+from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
 
 
 class ContextLimitError(ValueError):
@@ -35,9 +32,12 @@ class Runner(RecoveryMixin):
     工具调用通过 ToolRuntime 执行，结果写回会话存储。
     """
 
-    def __init__(self, model, runtime, *, max_rounds=20, max_tools=40, max_failures=3, seconds=300, on_event=None):
+    def __init__(self, model, runtime, *, max_rounds=20, max_tools=40, max_failures=3, seconds=DEFAULT_TASK_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT, on_event=None):
         self.model, self.runtime, self.store = model, runtime, runtime.store
         self.max_rounds, self.max_tools, self.max_failures, self.seconds = max_rounds, max_tools, max_failures, seconds
+        if seconds <= 0 or request_timeout <= 0:
+            raise ValueError('任务时限和请求超时必须为正数')
+        self.request_timeout = request_timeout
         self.on_event = on_event or (lambda *args: None)
         self.cancel_requested = False
         self._needs_verification = False
@@ -47,7 +47,18 @@ class Runner(RecoveryMixin):
         self.trace = runtime.trace
         self.machine = RunStateMachine(self.store)
         self.docs = runtime.docs
-        self.run_logger = RunLogger(self.store)
+        self.run_logger = runtime.logger
+        self.set_model(model)
+
+    def set_model(self, model):
+        self.model = model
+        if self.context_budgeter is not None:
+            self.context_budgeter.configure(
+                getattr(model, 'context_config', None),
+                output_tokens=getattr(model, 'generation', {}).get('max_tokens'),
+                summarize=self._summarize_context, tools=self.runtime.definitions,
+                estimation_key=f'{type(model).__name__}:{getattr(model, "model", "")}',
+            )
 
     @property
     def research(self):
@@ -94,10 +105,11 @@ class Runner(RecoveryMixin):
                 self.store.data['run_runtime']['confirmation_paused_at'] = time.time()
         self.store.save()
         state = self.store.data['run_runtime']
+        self.run_logger.record('run_status', status=value, answer=answer, pending=self.store.data['pending'])
         self.store.event('status', status=value, profile=state['profile'], phase=state['phase'], stop_reason=state.get('stop_reason'), evidence_count=len(state['evidence_refs']))
         
         # 记录运行摘要日志
-        if hasattr(self, 'run_logger') and value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
+        if value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
             self.run_logger.log_round_summary(self.store.data.get('rounds', 0), value, answer)
         
         return dict(status=value, answer=self.store.data.get('answer', ''), pending=self.store.data['pending'])
@@ -113,11 +125,11 @@ class Runner(RecoveryMixin):
     def start(self, text):
         """根据用户输入初始化并启动一轮新运行。"""
         d = self.store.data
+        input_id = self.run_logger.record('user_input', text=text, previous_run_id=d.get('run_id'))
         self.ensure_available()
         if not text.strip() or len(text) > 16000:
             raise ValueError('输入不能为空或超过16000字符')
         self.store.verify_sources()
-        self.store.verify_artifacts()
         previous_runtime = d.get('run_runtime') or {}
         previous_answer = d.get('answer', '')
         previous_status = d.get('status')
@@ -172,6 +184,7 @@ class Runner(RecoveryMixin):
             d['run_runtime']['reuse_evidence'] = True
         self.runtime.policy.clear_run_grant()
         d['run_runtime']['execution_seconds_limit'] = self.seconds
+        d['run_runtime']['request_timeout_seconds'] = self.request_timeout
         d['run_runtime']['objective'] = active_task['title'] if continuation else text
         d['run_runtime']['execution_requested'] = continuation or self.prompt.requests_development_execution(text, protocols)
         d['run_runtime']['project_changed'] = False
@@ -179,7 +192,7 @@ class Runner(RecoveryMixin):
         if is_recall_request(text):
             d['run_runtime']['phase'] = 'answer'
         d.update(run_id=uid('run'), status='running', rounds=0, tool_count=0, failures=0,
-                 deadline=time.time() + min(self.seconds, d['run_runtime']['budget']['seconds']), pending=[], answer='', usage={},
+                 deadline=time.time() + self.seconds, pending=[], answer='', usage={},
                  limits=dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
         if 'coding' in d['run_runtime']['protocols'] and project_manager is not None:
             try:
@@ -195,6 +208,7 @@ class Runner(RecoveryMixin):
         self.research.register_user_urls(text)
         self.store.save()
         self.store.event('run_start', profile=profile, phase='explore')
+        self.run_logger.record('run_start', input_event_id=input_id, text=text)
         if is_recall_request(text) and previous_answer and self._can_reuse_answer(text, previous_answer):
             # 纯文本追问不应让随机模型修改已通过来源和价格校验的事实。
             d['messages'].append(dict(role='assistant', content=previous_answer, tool_calls=None))
@@ -217,6 +231,7 @@ class Runner(RecoveryMixin):
     def append_result(self, call, result):
         """记录工具执行结果到会话消息和工具活动日志。"""
         d = self.store.data
+        self.run_logger.record('tool_result_delivery', call=call, result=result)
         d['run_runtime'].setdefault('tool_activity', []).append({
             'call_id': call['id'], 'tool': call['name'], 'ok': result.get('ok'),
             'code': (result.get('error') or {}).get('code'),
@@ -236,6 +251,7 @@ class Runner(RecoveryMixin):
                     d['run_runtime']['project_task_status'] = task['status']
             except Exception as exc:
                 d['run_runtime']['agent_docs_error'] = f'{type(exc).__name__}: {exc}'
+        self._update_development_state(call, result)
         self.store.save()
         self.on_event('tool_result', result)
 
@@ -254,6 +270,7 @@ class Runner(RecoveryMixin):
 
     def fail(self, exc, *, reason='runtime_error'):
         """记录异常诊断并终止运行。"""
+        self.run_logger.error('run_error', exc, reason=reason)
         diagnostic = {
             'id': uid('diagnostic'), 'type': type(exc).__name__,
             # 不持久化异常参数、局部变量、源码文本或 HTTP 响应体。
@@ -270,6 +287,7 @@ class Runner(RecoveryMixin):
 
     def cancel(self):
         """标记取消请求并终止运行。"""
+        self.run_logger.record('run_cancel')
         self.cancel_requested = True
         for call in self.store.data['calls'].values():
             if call.get('state') in {'started', 'unknown'}:
@@ -279,11 +297,12 @@ class Runner(RecoveryMixin):
     def resume(self):
         """从中断或确认等待状态恢复运行。"""
         d = self.store.data
+        self.run_logger.record('run_resume', previous_status=d['status'])
         if any(c['state'] in {'started', 'unknown'} and not c.get('acknowledged') for c in d['calls'].values()):
             return self.status('interrupted', '存在不确定调用。请检查输出并 /cancel；不会自动重放。')
         if d['status'] not in {'interrupted', 'awaiting_confirmation'}:
             raise ValueError('没有可恢复的运行')
-        self.store.verify_sources(); self.store.verify_artifacts()
+        self.store.verify_sources()
         if d['status'] == 'awaiting_confirmation':
             return self.status('awaiting_confirmation')
         self.machine.transition('execute', 'resume')
@@ -292,6 +311,7 @@ class Runner(RecoveryMixin):
     def confirm(self, approve):
         """处理用户对待确认调用的批准或拒绝。"""
         d = self.store.data
+        self.run_logger.record('confirmation_decision', approved=approve, pending=d['pending'])
         if d['status'] != 'awaiting_confirmation' or not d['pending']:
             raise ValueError('没有待确认调用')
         try:
@@ -358,8 +378,7 @@ class Runner(RecoveryMixin):
                 state = d['run_runtime']
                 limits = d.get('limits', dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
                 if time.time() >= d['deadline']:
-                    if state['evidence_refs']: self.research.force_answer('deadline')
-                    else: return self.stop('limit_reached', '达到运行时间上限，且没有取得可用证据', 'deadline')
+                    return self.finish_timeout(task_expired=True)
                 if d['failures'] >= limits['failures']:
                     if state['evidence_refs']: self.research.force_answer('failure_limit')
                     else: return self.stop('limit_reached', '达到连续失败上限，且没有取得可用证据', 'failure_limit')
@@ -435,7 +454,7 @@ class Runner(RecoveryMixin):
                     outcome = self._recover_unsupported_prices(unsupported_prices)
                     if outcome is not None: return outcome
                     continue
-                self.store.verify_artifacts(); EvidenceBundle(self.store).verify()
+                self.store.verify_artifacts(current_run_only=True); EvidenceBundle(self.store).verify()
                 d['messages'].append(dict(role='assistant', content=response.content, tool_calls=None))
                 self.store.save()
                 partial = response.content.lstrip().startswith('[[PARTIAL]]')
@@ -466,17 +485,9 @@ class Runner(RecoveryMixin):
                 self.research.force_answer('tool_budget'); self.close_pending('budget_exhausted'); return None
             d['tool_count'] += 1; self.store.save()
         
-        # 记录工具执行开始
-        if hasattr(self, 'run_logger'):
-            self.run_logger.log_tool_execution_start(call['id'], call['name'], call.get('arguments', '{}'))
-        
         self.on_event('tool_start', dict(name=call['name'])); started = time.monotonic()
         result = self.runtime.execute(call)
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        
-        # 记录工具执行完成
-        if hasattr(self, 'run_logger'):
-            self.run_logger.log_tool_execution_end(call['id'], call['name'], result, elapsed_ms)
         
         if result.get('pending'):
             return self.status('awaiting_confirmation', self.runtime.confirmation_message(call['name']))
@@ -487,6 +498,12 @@ class Runner(RecoveryMixin):
             answer = (result.get('data') or {}).get('result')
             if answer:
                 return self.stop('completed', answer, 'attempt_completion')
+        if self.research.should_force_answer(): self.close_pending('research_complete')
+        return None
+
+    def _update_development_state(self, call, result):
+        """统一记录直接执行与批准后执行的开发结果，由 append_result 一并落盘。"""
+        d = self.store.data
         if call['name'] in self.development.FILE_MODIFY_TOOLS and result.get('ok'):
             d['run_runtime']['project_changed'] = True
             validation = ((result.get('data') or {}).get('validation') or {})
@@ -497,12 +514,9 @@ class Runner(RecoveryMixin):
             if self.development.requires_change_verification(call['name'], result, run_state=d['run_runtime']):
                 self._needs_verification = True
                 d['run_runtime']['verification_required'] = True
-            self.store.save()
-        elif call['name'] == 'run_commands' and result.get('ok') and isinstance((result.get('data') or {}).get('summary'), dict):
-            passed = bool((result.get('data') or {}).get('passed'))
+                d['run_runtime']['verification_succeeded'] = False
+        elif call['name'] == 'run_commands' and isinstance((result.get('data') or {}).get('summary'), dict):
+            passed = bool(result.get('ok') and (result.get('data') or {}).get('passed'))
             self._needs_verification = not passed
             d['run_runtime']['verification_required'] = not passed
             d['run_runtime']['verification_succeeded'] = passed
-            self.store.save()
-        if self.research.should_force_answer(): self.close_pending('research_complete')
-        return None

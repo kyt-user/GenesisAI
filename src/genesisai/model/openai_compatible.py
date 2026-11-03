@@ -29,6 +29,28 @@ class OpenAICompatibleClient(ModelClient):
         )
         self.model = model
         self.generation = dict(generation or {})
+        self.io_logger = None
+        self.io_context = {}
+
+    def bind_logging(self, logger, **context):
+        self.io_logger = logger
+        self.io_context = context
+        logger.add_secret(getattr(self.client, 'api_key', None))
+
+    def _record_io(self, event, **payload):
+        if getattr(self, 'io_logger', None) is not None:
+            self.io_logger.record(event, **self.io_context, **payload)
+
+    def _logged_stream(self, stream):
+        try:
+            for chunk in stream:
+                if getattr(self, 'io_logger', None) is not None:
+                    self._record_io('provider_stream_chunk', response=chunk.model_dump())
+                yield chunk
+        finally:
+            close = getattr(stream, 'close', None)
+            if close:
+                close()
 
     def chat(
         self,
@@ -40,12 +62,13 @@ class OpenAICompatibleClient(ModelClient):
         if tools == []:
             options['tool_choice'] = 'none'
             options.update(self._no_tool_options())
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[self._to_openai_message(message) for message in messages],
-            tools=tools,
-            **options,
-        )
+        payload = dict(model=self.model,
+                       messages=[self._to_openai_message(message) for message in messages],
+                       tools=tools, **options)
+        self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
+        response = self.client.chat.completions.create(**payload)
+        if getattr(self, 'io_logger', None) is not None:
+            self._record_io('provider_response', response=response.model_dump())
         message = response.choices[0].message
         tool_calls = [
             ToolCall(
@@ -74,7 +97,7 @@ class OpenAICompatibleClient(ModelClient):
             options['tool_choice'] = 'none'
             options.update(self._no_tool_options())
         options.setdefault("stream_options", {"include_usage": True})
-        stream = self.client.chat.completions.create(
+        payload = dict(
             model=self.model,
             messages=[
                 message if isinstance(message, dict) else self._to_openai_message(message)
@@ -84,12 +107,14 @@ class OpenAICompatibleClient(ModelClient):
             stream=True,
             **options,
         )
+        self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
+        stream = self.client.chat.completions.create(**payload)
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_call_parts: dict[int, dict[str, str]] = {}
         usage = None
         finish_reason = None
-        for chunk in stream:
+        for chunk in self._logged_stream(stream):
             if getattr(chunk, "usage", None):
                 usage = chunk.usage.model_dump()
             if not chunk.choices:

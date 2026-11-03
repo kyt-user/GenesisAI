@@ -6,7 +6,7 @@ import pytest
 from test_p11_agent_runtime import runtime_env, FakeModel, tool_call
 from test_p12_runtime import call, query_provider
 from genesisai.shared.messages import Response
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import ToolError
 from genesisai.core.extensions.tools.web.contracts import SearchError, SearchQuery
 from genesisai.core.extensions.tools.web.providers.bing import BingSearchProvider
@@ -278,41 +278,6 @@ def test_no_tools_request_explicitly_disables_model_tool_choice():
     assert calls[0]['extra_body'] == {'thinking': {'type': 'disabled'}}
     assert 'tool_choice' not in calls[1]
     assert calls[1]['extra_body'] == {'thinking': {'type': 'enabled'}}
-
-
-def test_old_link_lists_are_compacted_without_mutating_stored_result(runtime_env):
-    from genesisai.core.prompt.context_budgeter import ContextBudgeter
-    from genesisai.core.prompt.composer import PromptComposer
-    store, _ = runtime_env
-    payload = {'data': {'links': [{'url': f'https://example.com/{i}', 'title': str(i)} for i in range(30)]}}
-    item = {'role': 'tool', 'content': json.dumps(payload)}
-    compacted = ContextBudgeter(store, PromptComposer())._compact_message(item, compact_links=True)
-    assert len(json.loads(compacted['content'])['data']['links']) == 5
-    assert len(json.loads(item['content'])['data']['links']) == 30
-
-
-def test_current_context_compacts_older_observations_and_reports_cost(runtime_env):
-    from genesisai.core.prompt.context_budgeter import ContextBudgeter
-    from genesisai.core.prompt.composer import PromptComposer
-    store, _ = runtime_env
-    def observation(character):
-        return json.dumps({'ok': True, 'data': {'text': character * 5000, 'links': [], 'hits': []}}, ensure_ascii=False)
-    store.data['messages'] = [
-        {'role': 'user', 'content': '价格是多少'},
-        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'one', 'name': 'fetch_web_content', 'arguments': '{}'}]},
-        {'role': 'tool', 'content': observation('A'), 'tool_call_id': 'one'},
-        {'role': 'assistant', 'content': None, 'tool_calls': [{'id': 'two', 'name': 'fetch_web_content', 'arguments': '{}'}]},
-        {'role': 'tool', 'content': observation('B'), 'tool_call_id': 'two'},
-    ]
-    messages = ContextBudgeter(store, PromptComposer()).build('web_quick')
-    tool_payloads = [json.loads(item.content) for item in messages if item.role == 'tool']
-    report = store.data['run_runtime']['context_report']
-    assert len(tool_payloads[0]['data']['text']) == 1200
-    assert len(tool_payloads[1]['data']['text']) == 4000
-    assert report['system_chars'] == sum(report['system_sections'].values())
-    assert report['message_chars'] == sum(report['message_role_chars'].values())
-    assert report['total_chars'] == report['system_chars'] + report['message_chars']
-    assert sum(report['selected_group_chars']) == report['message_chars']
 
 
 def test_model_trace_contains_only_context_size_report(runtime_env):

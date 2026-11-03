@@ -1,3 +1,4 @@
+from genesisai.core.state.store import application_state_root
 import hashlib
 import json
 import os
@@ -24,7 +25,7 @@ def test_A19_cli_commands_and_multi_turn(tmp_path, monkeypatch):
     commands=iter(['/help','hello','/status','/history','again','/exit'])
     monkeypatch.setattr('rich.console.Console.input',lambda *a,**k:next(commands))
     assert main(['--workspace',str(tmp_path/'work')])==0
-    state=json.loads(next((tmp_path/'work/.genesis/sessions').glob('*.json')).read_text(encoding='utf-8'))
+    state=json.loads(next((application_state_root()/'sessions').glob('*.json')).read_text(encoding='utf-8'))
     assert state['answer']=='Second' and len(model.contexts)==2
     assert any(m.content=='First' for m in model.contexts[1])
 
@@ -172,7 +173,7 @@ generation:
 
 
 def test_model_error_is_actionable():
-    from genesisai.agent.runner import Runner
+    from genesisai.agent.loop import Runner
     assert '模型服务内部错误' in Runner.model_error(type('InternalServerError',(Exception,),{})())
     assert '无法连接模型服务' in Runner.model_error(type('APIConnectionError',(Exception,),{})())
 

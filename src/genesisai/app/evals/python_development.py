@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.core.project_docs import AgentDocsManager
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response, ToolCall
@@ -66,7 +66,7 @@ class ScriptedModel:
             raise AssertionError("仿真模型响应已耗尽")
         return self.responses.pop(0)
 
-    def stream_chat(self, messages, tools=None):
+    def stream_chat(self, messages, tools=None, **kwargs):
         yield self.chat(messages, tools)
 
 

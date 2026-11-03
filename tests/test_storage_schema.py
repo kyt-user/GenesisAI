@@ -1,10 +1,10 @@
-"""会话 JSON Schema 版本、迁移和损坏保护。"""
+"""只接受当前会话格式，拒绝旧版和损坏数据且不改写原文件。"""
 
 import json
 
 import pytest
 
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.core.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, atomic_json
 
 
@@ -19,26 +19,8 @@ def write_session(root, session_id, data):
     return path
 
 
-def legacy_session(session_id='session_legacy'):
-    return dict(
-        id=session_id,
-        status='idle',
-        messages=[{'role': 'user', 'content': '保留原文'}],
-        calls={'call_1': {'call': {'id': 'call_1'}, 'state': 'succeeded'}},
-        sources={'src_1': {'kind': 'web', 'title': '来源'}},
-        artifacts={'artifact_1': {'path': 'result.md', 'sha256': 'abc', 'run_id': 'run_1'}},
-        pending=[{'id': 'call_pending'}],
-        grants=['D:/materials'],
-        output='D:/output',
-        remote_allowed=True,
-        run_id='run_1',
-        rounds=2,
-        tool_count=3,
-        failures=0,
-        deadline=123.5,
-        usage={'total_tokens': 42},
-        history=[{'run_id': 'run_0', 'status': 'completed'}],
-    )
+def current_session(root):
+    return Store(root).data
 
 
 def test_new_session_has_current_schema_version(tmp_path):
@@ -49,37 +31,6 @@ def test_new_session_has_current_schema_version(tmp_path):
     assert store.data['schema_version'] == CURRENT_SESSION_SCHEMA_VERSION == 3
     assert saved['schema_version'] == 3
     assert saved['tool_runtime'] == {'active_skills': []}
-
-
-def test_unversioned_session_migrates_without_losing_content(tmp_path):
-    root = tmp_path / 'work'
-    original = legacy_session()
-    path = write_session(root, original['id'], original)
-
-    loaded = Store(root, original['id'])
-    saved = json.loads(path.read_text(encoding='utf-8'))
-
-    assert loaded.data['schema_version'] == saved['schema_version'] == 3
-    assert loaded.data['tool_runtime'] == {'active_skills': []}
-    for key, value in original.items():
-        assert loaded.data[key] == value
-        assert saved[key] == value
-
-
-def test_v1_session_migrates_to_v2_without_losing_content(tmp_path):
-    root = tmp_path / 'work'
-    original = legacy_session()
-    original['schema_version'] = 1
-    path = write_session(root, original['id'], original)
-
-    loaded = Store(root, original['id'])
-    saved = json.loads(path.read_text(encoding='utf-8'))
-
-    assert loaded.data['schema_version'] == saved['schema_version'] == 3
-    assert loaded.data['tool_runtime'] == saved['tool_runtime'] == {'active_skills': []}
-    for key, value in original.items():
-        if key != 'schema_version':
-            assert loaded.data[key] == saved[key] == value
 
 
 def test_current_session_load_is_idempotent(tmp_path):
@@ -94,28 +45,18 @@ def test_current_session_load_is_idempotent(tmp_path):
     assert second.data['messages'] == [{'role': 'user', 'content': 'keep'}]
 
 
-@pytest.mark.parametrize('version', [True, '1', -1, 1.5])
+@pytest.mark.parametrize('version', [None, 0, 1, 2, 4, True, '3', -1, 1.5, 3.0])
 def test_invalid_schema_version_is_rejected_without_rewrite(tmp_path, version):
     root = tmp_path / 'work'
-    data = legacy_session()
-    data['schema_version'] = version
+    data = current_session(root)
+    if version is None:
+        del data['schema_version']
+    else:
+        data['schema_version'] = version
     path = write_session(root, data['id'], data)
     before = path.read_bytes()
 
     with pytest.raises(ValueError, match='schema_version'):
-        Store(root, data['id'])
-
-    assert path.read_bytes() == before
-
-
-def test_future_schema_version_is_rejected_without_rewrite(tmp_path):
-    root = tmp_path / 'work'
-    data = legacy_session()
-    data['schema_version'] = CURRENT_SESSION_SCHEMA_VERSION + 1
-    path = write_session(root, data['id'], data)
-    before = path.read_bytes()
-
-    with pytest.raises(ValueError, match='高于当前支持版本'):
         Store(root, data['id'])
 
     assert path.read_bytes() == before
@@ -135,9 +76,21 @@ def test_broken_or_non_object_json_is_not_overwritten(tmp_path, payload):
     assert path.read_bytes() == before
 
 
-def test_migrated_unknown_call_remains_blocked_from_replay(tmp_path):
+@pytest.mark.parametrize('field', ['workspace', 'changes', 'permission_modes', 'run_runtime'])
+def test_missing_current_fields_are_rejected_without_automatic_repair(tmp_path, field):
     root = tmp_path / 'work'
-    data = legacy_session()
+    data = current_session(root)
+    del data[field]
+    path = write_session(root, data['id'], data)
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match=field):
+        Store(root, data['id'])
+    assert path.read_bytes() == before
+
+
+def test_unknown_call_remains_blocked_from_replay(tmp_path):
+    root = tmp_path / 'work'
+    data = current_session(root)
     data['status'] = 'interrupted'
     data['calls'] = {'call_1': {'call': {'id': 'call_1'}, 'state': 'unknown'}}
     write_session(root, data['id'], data)
@@ -145,7 +98,7 @@ def test_migrated_unknown_call_remains_blocked_from_replay(tmp_path):
     loaded = Store(root, data['id'])
     executor = type('Executor', (), {
         'store': loaded, 'composer': None, 'context_budgeter': None,
-        'trace': None, 'docs': None,
+        'trace': None, 'docs': None, 'logger': loaded.get_logger(),
     })()
 
     assert loaded.data['schema_version'] == 3

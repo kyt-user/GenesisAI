@@ -1,7 +1,6 @@
 """DeepSeek 模型提供商实现。"""
 
-import os
-
+from genesisai.model.credentials import resolve_api_key
 from genesisai.model.openai_compatible import OpenAICompatibleClient
 
 
@@ -25,7 +24,7 @@ class DeepSeekClient(OpenAICompatibleClient):
         reasoning_enabled: bool = True,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
-        resolved_key = (api_key or os.environ.get(self.API_KEY_ENV, "")).strip()
+        resolved_key = resolve_api_key(self.provider, api_key)
         if not resolved_key:
             raise RuntimeError(f"缺少环境变量 {self.API_KEY_ENV}")
         super().__init__(

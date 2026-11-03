@@ -7,10 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from genesisai.shared.changes import undo_changes
 from genesisai.core.prompt.context_budgeter import ContextBudgeter
 from genesisai.shared.filetypes import detect_file_type
-from genesisai.app.maintenance import clean_runtime, doctor
 from genesisai.core.prompt.composer import PromptComposer, PromptFormatError
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills import SkillError, SkillRegistry
@@ -116,18 +114,12 @@ def test_p5_docx_xlsx_pdf_and_optional_pptx(tmp_path):
     assert all(item.get("verified") for item in store.data["artifacts"].values())
 
 
-def test_p6_compact_undo_doctor_clean(tmp_path):
+def test_manual_compact_preserves_file_creation(tmp_path):
     workspace, output, store, runtime = runtime_for(tmp_path)
     for i in range(4):
         store.data["messages"].extend([{"role": "user", "content": f"goal {i}"}, {"role": "assistant", "content": f"answer {i}"}])
     store.save()
-    summary = ContextBudgeter(store, PromptComposer(), max_chars=2000).compact(force=True)
-    assert summary["source_hash"] and summary["user_goals"]
+    summary = ContextBudgeter(store, PromptComposer()).compact(force=True)
+    assert summary["mode"] == "manual" and summary["tokens_after"] > 0
     created = execute(runtime, "editor", {"operation": "create", "path": "new.txt", "content": "hello", "source_refs": [], "scope": "workspace"})
     assert created["ok"] and (workspace / "new.txt").is_file()
-    preview = undo_changes(store, workspace); assert preview and not preview[0]["conflict"]
-    undo_changes(store, workspace, apply=True); assert not (workspace / "new.txt").exists()
-    report = doctor(workspace, store.root); assert any(item["name"] == "workspace" and item["ok"] for item in report["checks"])
-    old = store.root / "command_logs" / "old.log"; old.parent.mkdir(); old.write_text("x"); old.touch()
-    cleaned = clean_runtime(store.root, store.id, execute=False, days=1); assert "files" in cleaned
-

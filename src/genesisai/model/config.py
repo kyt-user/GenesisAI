@@ -11,7 +11,7 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 PROVIDERS = frozenset({"deepseek", "qwen"})
-TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation"})
+TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation", "context"})
 GENERATION_KEYS = frozenset({"max_tokens", "temperature", "top_p"})
 
 
@@ -20,6 +20,7 @@ class ModelConfig:
     provider: str
     model: str
     generation: dict = field(default_factory=dict)
+    context: dict = field(default_factory=dict)
 
 
 def load_model_config(path=None) -> ModelConfig:
@@ -53,14 +54,17 @@ def load_model_config(path=None) -> ModelConfig:
     for key in ("temperature", "top_p"):
         if key in generation and not 0 <= generation[key] <= 2:
             raise ValueError(f"generation.{key} 超出范围")
-    return ModelConfig(provider=provider, model=model.strip(), generation=dict(generation))
+    from genesisai.shared.context_config import ContextConfig
+    context = data.get('context', {})
+    ContextConfig.parse(context)
+    return ModelConfig(provider=provider, model=model.strip(), generation=dict(generation), context=context)
 
 
 def build_model(path=None, settings=None):
     """构建模型客户端。
 
-    传入 ``settings``（CLI 持久化配置）时优先采用其 provider/model/api_key；
-    否则回退到 YAML 配置，密钥由各提供商从环境变量解析。
+    传入 ``settings`` 时采用其 provider/model；密钥始终优先环境变量，
+    settings.api_key 仅作回退。无 settings 时从 YAML 获取模型配置。
     """
     if settings is not None:
         return _build_from_settings(settings)
@@ -70,13 +74,14 @@ def build_model(path=None, settings=None):
 
     classes = dict(deepseek=DeepSeekClient, qwen=QwenClient)
     client = classes[config.provider](model=config.model, generation=config.generation)
+    client.context_config = config.context
     host = urlsplit(str(client.client.base_url)).hostname
     remote = host not in {"localhost", "127.0.0.1", "::1"}
     return client, remote
 
 
 def _build_from_settings(settings):
-    """按 CLI 持久化配置构建客户端；空密钥回退到环境变量。"""
+    """按 CLI 持久化配置选择模型；提供商统一按环境优先解析密钥。"""
     from genesisai.model.providers.deepseek import DeepSeekClient
     from genesisai.model.providers.qwen import QwenClient
 
@@ -94,6 +99,9 @@ def _build_from_settings(settings):
     if settings.base_url:
         kwargs["base_url"] = settings.base_url
     client = classes[provider](**kwargs)
+    from genesisai.shared.context_config import ContextConfig
+    ContextConfig.parse(settings.context)
+    client.context_config = dict(settings.context)
     host = urlsplit(str(client.client.base_url)).hostname
     remote = host not in {"localhost", "127.0.0.1", "::1"}
     return client, remote

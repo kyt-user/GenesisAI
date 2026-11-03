@@ -6,7 +6,6 @@ import ipaddress
 import hashlib
 import json
 import re
-import time
 from urllib.parse import urlsplit
 
 from genesisai.shared.budgets import PROFILES, initial_run_runtime
@@ -56,9 +55,6 @@ class ResearchController:
             return
         self.state["profile"] = profile
         self.state["budget"] = PROFILES[profile].to_dict()
-        if 'execution_seconds_limit' in self.state:
-            self.store.data['deadline'] = self.state['started_at'] + self.state.get('paused_seconds', 0) + min(
-                self.state['execution_seconds_limit'], self.state['budget']['seconds'])
         self.store.save()
 
     def register_user_urls(self, text: str) -> None:
@@ -158,7 +154,7 @@ class ResearchController:
         budget, usage = self.state["budget"], self.state["usage"]
         return {
             key: max(0, budget[key] - usage.get(key, 0))
-            for key in ("model_calls", "search_queries", "search_fetches", "token_budget")
+            for key in ("model_calls", "search_queries", "search_fetches")
         }
 
     def _check_fetch(self, call: dict, raw_url: str) -> dict | None:
@@ -377,7 +373,3 @@ class ResearchController:
             if usage[key] >= budget[key] and budget[key] > 0:
                 self.force_answer(reason)
                 return
-        if usage["total_tokens"] >= int(budget["token_budget"] * 0.75) and self.state["phase"] == "explore":
-            self.force_answer("exploration_token_reserve")
-        if time.time() - self.state["started_at"] - self.state.get("paused_seconds", 0) >= budget["seconds"]:
-            self.force_answer("profile_deadline")

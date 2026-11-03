@@ -10,17 +10,10 @@ def no_network(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _local_state_root(monkeypatch):
-    """Force session state into workspace/.genesis for test isolation."""
+def _isolated_home(tmp_path, monkeypatch):
+    """Exercise real path resolution without touching the user's history."""
     from pathlib import Path as _Path
-    from genesisai.core.state import store as _store_mod
-
-    def _local_root(workspace):
-        return _Path(workspace).resolve() / '.genesis'
-
-    monkeypatch.setattr(_store_mod, 'workspace_state_root', _local_root)
-    from genesisai.app import cli as _cli_mod
-    monkeypatch.setattr(_cli_mod, 'workspace_state_root', _local_root)
+    monkeypatch.setattr(_Path, 'home', classmethod(lambda cls: tmp_path / 'home'))
 
 
 @pytest.fixture(autouse=True)

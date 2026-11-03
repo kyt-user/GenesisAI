@@ -26,6 +26,9 @@ class ToolExecutor:
         descriptor = None
         execution_started = False
         try:
+            state = self.context.store.data
+            if state.get('status') == 'running' and state.get('deadline') and time.time() >= state['deadline']:
+                raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
             self._validate_call(call)
             prior = self.ledger.prior(call)
             if prior and prior["state"] in {"succeeded", "failed"}:
@@ -76,6 +79,7 @@ class ToolExecutor:
                 "truncated": bool(payload.get("truncated", False)),
             }
         except Exception as exc:
+            self.context.runtime.logger.error('tool_error', exc, call=call)
             call_id = call.get("id", "") if isinstance(call, dict) else ""
             current = self.ledger.store.data["calls"].get(call_id, {})
             target = preview.get("target") if isinstance(preview, dict) else None

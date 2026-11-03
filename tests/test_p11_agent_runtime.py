@@ -4,14 +4,15 @@ import time
 import pytest
 
 from genesisai.agent.completion import CompletionValidator
-from genesisai.core.prompt.context_budgeter import ContextBudgeter, PROFILES, select_initial_profile
+from genesisai.core.prompt.context_budgeter import ContextBudgeter
+from genesisai.shared.budgets import PROFILES, select_initial_profile
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.core.prompt.composer import PromptComposer
 from genesisai.core.research import ResearchController
-from genesisai.agent.runner import Runner
+from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
-from genesisai.core.state.store import CURRENT_SESSION_SCHEMA_VERSION, Store, migrate_session
+from genesisai.core.state.store import Store
 from genesisai.core.tools.tool_runtime import ToolRuntime
 
 
@@ -27,7 +28,7 @@ class FakeModel:
         value = next(self.responses)
         return value(messages) if callable(value) else value
 
-    def stream_chat(self, messages, tools=None):
+    def stream_chat(self, messages, tools=None, **kwargs):
         self.contexts.append(messages)
         self.tools.append(tools or [])
         value = next(self.responses)
@@ -64,7 +65,7 @@ def test_p11_profiles_are_fixed_and_conservative():
     assert PROFILES["direct_answer"].model_calls == 3
     assert PROFILES["web_quick"].search_queries == 2
     assert PROFILES["web_quick"].search_fetches == 4
-    assert PROFILES["web_quick"].token_budget == 30000
+    assert "token_budget" not in PROFILES["web_quick"].to_dict()
     assert select_initial_profile("请深度、全面调研这个主题") == "web_deep"
     assert select_initial_profile("比较并整理一份专题报告") == "web_normal"
     assert select_initial_profile("你好") == "direct_answer"
@@ -80,25 +81,6 @@ def test_p11_prompt_composer_is_modular_and_hashed():
     assert "web_research.md" not in composed.names
     assert composed.hashes and all(len(value) == 64 for value in composed.hashes.values())
     assert "当前日期" in composed.text and "时区" in composed.text
-
-
-def test_p11_v2_migrates_losslessly_to_v3(tmp_path):
-    old = {
-        "schema_version": 2,
-        "id": "session_legacy",
-        "status": "completed",
-        "messages": [{"role": "user", "content": "keep"}],
-        "calls": {}, "sources": {}, "artifacts": {}, "pending": [],
-        "grants": [], "output": str(tmp_path), "remote_allowed": False,
-        "run_id": "run_old", "rounds": 1, "tool_count": 0, "failures": 0,
-        "deadline": 1, "usage": {"total_tokens": 7}, "history": [],
-        "tool_runtime": {"active_tools": ["search_query"]},
-    }
-    migrated = migrate_session(old)
-    assert CURRENT_SESSION_SCHEMA_VERSION == 3
-    assert migrated["messages"] == old["messages"]
-    assert migrated["tool_runtime"] == {"active_skills": []}
-    assert migrated["run_runtime"]["phase"] == "done"
 
 
 def test_p11_unregistered_and_search_pages_are_rejected(runtime_env):
@@ -183,7 +165,8 @@ def test_p11_context_compacts_old_tool_bodies_and_keeps_previous_answer(runtime_
         {"role": "assistant", "content": "上一轮最终答案"},
         {"role": "user", "content": "它的优势是什么"},
     ]
-    messages = ContextBudgeter(store, PromptComposer()).build("direct_answer")
+    budgeter = ContextBudgeter(store, PromptComposer(), config={"max_input_tokens": 9000, "strategy": "basic"})
+    messages = budgeter.prepare(budgeter.build("direct_answer"), [])
     joined = "".join(message.content or "" for message in messages)
     assert "上一轮最终答案" in joined
     assert len(joined) < 20000

@@ -2,52 +2,56 @@
 
 from __future__ import annotations
 
-import hashlib
+import copy
 import json
-import re
+from dataclasses import asdict, replace
 from pathlib import Path
 
-from genesisai.core.prompt.compaction import (
-    DEFAULT_MAX_INPUT_TOKENS,
-    DEFAULT_PRESERVE_RECENT_TOKENS,
-    fold_messages,
-    resolve_strategy,
-    total_tokens,
-    trigger_and_target_tokens,
-)
-from genesisai.shared.budgets import PROFILES, TaskProfile, is_recall_request, select_initial_profile
+from genesisai.core.prompt.compaction import estimate_tokens, fingerprint, message_units, project
+from genesisai.shared.context_config import ContextConfig
 from genesisai.shared.messages import Message, ToolCall
 
 
 class ContextBudgeter:
-    """按 cline 压缩模型组装有界上下文：折叠早期轮次、逐字保留 typed 提示与近端窗口。"""
+    """Persist a working-context projection separately from the full transcript."""
 
-    def __init__(
-        self,
-        store,
-        composer,
-        *,
-        max_chars: int = 60000,
-        observation_chars: int = 4000,
-        strategy: str | None = None,
-        recent_turns: int = 2,
-        max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS,
-        preserve_recent_tokens: int = DEFAULT_PRESERVE_RECENT_TOKENS,
-    ):
-        self.store = store
-        self.composer = composer
-        self.max_chars = max_chars
-        self.observation_chars = observation_chars
-        # 上下文压缩策略：basic（默认，确定性折叠）/ agentic（缺摘要器回退 basic）/ off。
-        self.strategy = resolve_strategy(strategy)
-        self.recent_turns = max(1, int(recent_turns))
-        self.max_input_tokens = max_input_tokens
-        self.preserve_recent_tokens = preserve_recent_tokens
+    def __init__(self, store, composer, *, config=None):
+        self.store, self.composer = store, composer
+        self.config = ContextConfig.parse(config)
+        self.summarize = None
+        self.tools = lambda: []
+        self._last_estimate = None
+
+    def configure(self, config=None, *, output_tokens=None, summarize=None, tools=None, estimation_key=None):
+        self.config = ContextConfig.parse(config)
+        if output_tokens is not None:
+            self.config = replace(self.config, output_reserve_tokens=max(self.config.output_reserve_tokens, int(output_tokens)))
+        if self.config.input_limit <= 0:
+            raise ValueError('No input budget remains after reserving output tokens')
+        self.summarize = summarize
+        if tools is not None:
+            self.tools = tools
+        if estimation_key is not None and self.store.data.get('context_model') != estimation_key:
+            self.store.data['context_model'] = estimation_key
+            self.store.data['context_estimate_factor'] = 1.0
+            self._last_estimate = None
+            self.store.save()
+
+    def working_messages(self):
+        raw = self.store.data['messages']
+        checkpoint = self.store.data.get('context_checkpoint')
+        if checkpoint:
+            count = checkpoint['source_count']
+            if count <= len(raw) and fingerprint(raw[:count]) == checkpoint['source_hash']:
+                return copy.deepcopy(checkpoint['messages'] + raw[count:])
+            self.store.get_logger().record('context_checkpoint_invalidated', source_count=count)
+            self.store.data['context_checkpoint'] = None
+            self.store.save()
+        return copy.deepcopy(raw)
 
     def build(self, profile: str, *, recovery: bool = False, final: bool = False) -> list[Message]:
         """构建当前轮次的完整模型上下文消息列表。"""
         state = self.store.data.get("run_runtime") or {}
-        context_mode = self._context_mode_for(profile, state.get("protocols", []))
         composed = self.composer.compose(profile, state, recovery=recovery, final=final)
         state["prompt_names"] = composed.names
         state["prompt_hashes"] = composed.hashes
@@ -71,6 +75,18 @@ class ContextBudgeter:
         )
         system_text += addition
         system_sections["workspace"] = len(addition)
+        self.store.refresh_local_files()
+        stale = {ref: item['path'] for collection in ('sources', 'artifacts')
+                 for ref, item in self.store.data[collection].items() if item.get('stale')}
+        if stale:
+            addition = (
+                '\n\n历史文件快照已失效（文件可能被本次编辑、应用自身或用户更新，也可能已删除）。'
+                '历史消息中的这些内容不能当作当前文件事实，旧来源引用不可用于证明当前内容。'
+                '需要当前内容时重新使用 read_files 读取；只询问历史执行结果时可依据已记录的工具结果回答。\n'
+                + json.dumps(stale, ensure_ascii=False)
+            )
+            system_text += addition
+            system_sections['file_freshness'] = len(addition)
         outcome = self.store.data.get('last_run_outcome')
         if outcome:
             addition = '\n\n上一轮可信执行结果：仅 tool_activity 列出的动作属于这个 run_id；更早历史中的错误不能说成上一轮发生。解释时依据该记录，不猜测预算或配置。对用户用自然语言概括，不复制状态字段：\n' + json.dumps(outcome, ensure_ascii=False)
@@ -113,253 +129,94 @@ class ContextBudgeter:
                     system_sections["agent_docs"] = len(addition)
             except Exception as exc:
                 state["agent_docs_error"] = f"{type(exc).__name__}: {exc}"
-        messages = [Message(role="system", content=system_text)]
-        groups = self._select_groups(context_mode)
-        selected: list[list[dict]] = []
-        size = len(system_text)
-        for index, group in enumerate(reversed(groups)):
-            length = len(json.dumps(group, ensure_ascii=False))
-            if size + length > self.max_chars:
-                if not selected:
-                    group = self._minimal_current(group)
-                    length = len(json.dumps(group, ensure_ascii=False))
-                    if size + length > self.max_chars:
-                        raise ValueError("当前问题超过上下文安全上限，请缩短输入或使用 /new")
-                    selected.insert(0, group)
-                elif index == 1:
-                    raise ValueError("无法同时保留当前追问和上一轮内容；请使用 /new 开始新会话")
-                break
-            selected.insert(0, group)
-            size += length
-        for group in selected:
-            for item in group:
-                calls = [ToolCall(**call) for call in item.get("tool_calls") or []] or None
-                messages.append(Message(
-                    role=item["role"],
-                    content=item.get("content"),
-                    tool_calls=calls,
-                    tool_call_id=item.get("tool_call_id"),
-                    metadata=item.get("metadata"),
-                ))
-        role_chars = {"user": 0, "assistant": 0, "tool": 0, "other": 0}
-        group_chars = []
-        for group in selected:
-            group_size = 0
-            for item in group:
-                length = len(str(item.get("content") or ""))
-                role = item.get("role") if item.get("role") in role_chars else "other"
-                role_chars[role] += length
-                group_size += length
-            group_chars.append(group_size)
-        message_chars = sum(role_chars.values())
-        state["context_report"] = {
-            "system_chars": len(system_text),
-            "system_sections": system_sections,
-            "selected_groups": len(selected),
-            "selected_group_chars": group_chars,
-            "message_chars": message_chars,
-            "message_role_chars": role_chars,
-            "total_chars": len(system_text) + message_chars,
-            "max_chars": self.max_chars,
-            "answer_reserve_chars": max(4000, self.max_chars // 5),
-        }
-        self.store.save()
-        if recovery and state.get("partial_response"):
-            messages.append(Message(
-                role="user",
-                content="请基于已有证据完成回答。此前被截断的内容如下：\n" + state["partial_response"][-8000:],
-            ))
+        messages = [Message(role="system", content=system_text), *self._messages(self.working_messages())]
+        if recovery and state.get('partial_response'):
+            messages.append(Message(role='user', content='Continue the interrupted answer using recorded evidence:\n' + state['partial_response'][-8000:]))
+        state['context_report'] = {'system_sections': system_sections}
         return messages
 
-    def compact(self, *, force: bool = False, mode: str = "auto"):
-        """按 cline 策略折叠早期会话消息，返回压缩报告。
-
-        ``basic``/``agentic`` 走确定性折叠，``off`` 关闭压缩；未达触发线且非强制时
-        返回上一次报告。报告字段对齐 cline：策略、模式、触发/目标 token 与 dropped-work。
-        """
-        state = self.store.data.get("run_runtime") or {}
-        messages = self.store.data["messages"]
-        tokens_before = total_tokens(messages)
-        trigger_tokens, target_tokens = trigger_and_target_tokens(self.max_input_tokens)
-        effective_mode = "manual" if force else mode
-        if self.strategy == "off":
-            return {
-                "strategy": "off",
-                "mode": effective_mode,
-                "folded": False,
-                "tokens_before": tokens_before,
-                "tokens_after": tokens_before,
-                "trigger_tokens": trigger_tokens,
-                "target_tokens": target_tokens,
-                "messages_before": len(messages),
-                "messages_after": len(messages),
-                "messages_removed": 0,
-                "dropped_work": {"read_files": [], "edited_files": [], "commands": []},
-                "dropped_work_notice": None,
-            }
-        if not force and tokens_before < trigger_tokens:
-            return state.get("context_summary")
-        folded, fold_report = fold_messages(messages, recent_turns=self.recent_turns)
-        profile = state.get("profile", "")
-        protocols = state.get("protocols", [])
-        payload = json.dumps(folded, ensure_ascii=False, sort_keys=True)
-        report = {
-            "strategy": self.strategy,
-            "mode": effective_mode,
-            "folded": fold_report["folded"],
-            "tokens_before": tokens_before,
-            "tokens_after": total_tokens(folded),
-            "trigger_tokens": trigger_tokens,
-            "target_tokens": target_tokens,
-            "preserve_recent_tokens": self.preserve_recent_tokens,
-            "messages_before": fold_report["messages_before"],
-            "messages_after": fold_report["messages_after"],
-            "messages_removed": fold_report["messages_removed"],
-            "dropped_work": fold_report["dropped_work"],
-            "dropped_work_notice": fold_report["dropped_work_notice"],
-            "source_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
-            "user_goals": [str(item.get("content") or "")[:1000] for item in folded if item.get("role") == "user"][-8:],
-        }
-        # 按任务档位保留领域特定上下文。
-        if profile == "local_files" or "coding" in protocols or "testing" in protocols:
-            report["coding_context"] = self._collect_coding_context(messages)
-        state["context_summary"] = report
-        self.store.save()
-        return report
+    @staticmethod
+    def _messages(values):
+        return [Message(role=m['role'], content=m.get('content'),
+                        tool_calls=[ToolCall(**call) for call in m.get('tool_calls') or []] or None,
+                        tool_call_id=m.get('tool_call_id'), metadata=m.get('metadata')) for m in values]
 
     @staticmethod
-    def _collect_coding_context(messages: list[dict]) -> dict:
-        """从消息中提取文件变更和测试结果用于紧凑保存。"""
-        file_changes = []
-        test_results = []
-        for item in messages:
-            if item.get("role") != "tool":
-                continue
-            content = item.get("content", "")
+    def request_tokens(messages, tools):
+        # Count the serialized payload including tool arguments, schemas and system text.
+        payload = [{k: v for k, v in asdict(m).items() if v is not None and k not in {'metadata', 'reasoning'}}
+                   for m in messages]
+        return estimate_tokens({'messages': payload, 'tools': tools})
+
+    def note_usage(self, actual_input):
+        if type(actual_input) is int and actual_input > 0 and self._last_estimate:
+            factor = min(4.0, max(1.0, actual_input / self._last_estimate))
+            self.store.data['context_estimate_factor'] = max(factor, self.store.data.get('context_estimate_factor', 1.0))
+            self.store.save()
+
+    def prepare(self, messages, tools, *, mode='auto'):
+        config = self.config
+        factor = self.store.data.get('context_estimate_factor', 1.0)
+        limit = int(config.input_limit / factor)
+        trigger = int(limit * 0.90)
+        before = self.request_tokens(messages, tools)
+        report = {'mode': mode, 'folded': False, 'tokens_before': before,
+                  'input_limit': limit, 'trigger_tokens': trigger, 'estimate_factor': factor}
+        raw = self.store.data['messages']
+        working = self.working_messages()
+        # Build() adds system text and possibly one recovery reminder outside the transcript.
+        suffix = messages[1 + len(working):]
+        overhead = self.request_tokens([messages[0], *suffix], tools)
+        if before >= trigger or mode != 'auto':
+            target = int(trigger * 0.70) if mode == 'auto' else min(int(trigger * 0.70), overhead + max(1, estimate_tokens(working) // 2))
+            if mode == 'overflow_recovery':
+                target = min(target, int(before * 0.5))
+            available = target - overhead
+            if available <= 0:
+                raise ValueError('System prompt, tools and recovery input exceed the context budget')
+            callback = self.summarize if config.strategy == 'agentic' and mode != 'overflow_recovery' else None
             try:
-                data = json.loads(content)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            tool_name = ""
-            if isinstance(data, dict):
-                tool_name = data.get("tool", "")
-                if not tool_name and "data" in data:
-                    inner = data["data"]
-                    if isinstance(inner, dict):
-                        tool_name = inner.get("tool", "")
-            # 检测文件修改结果。
-            if any(key in content for key in ("requires_verification", "change_id", "written", "created")):
-                file_changes.append(content[:500])
-            # 检测测试结果。
-            if any(key in content for key in ("summary", "exit_code", "pytest", "passed", "failed", "FAILED")):
-                test_results.append(content[:500])
-        return {
-            "file_changes": file_changes[-10:],
-            "test_results": test_results[-5:],
+                projected, details = project(working, available, config.preserve_recent_tokens, callback)
+            except ValueError:
+                if mode != 'manual' or before >= trigger:
+                    raise
+                projected, details = working, {'folded': False, 'reason': 'necessary_context_already_small'}
+            candidate = [messages[0], *self._messages(projected), *suffix]
+            after = self.request_tokens(candidate, tools)
+            if after >= trigger or after > limit or (mode == 'overflow_recovery' and after >= before):
+                raise ValueError('Context remains too large after compaction; no safe retry is possible')
+            report.update({k: v for k, v in details.items() if k != 'facts'}, target_tokens=target, tokens_after=after)
+            if details['folded']:
+                checkpoint = {'source_count': len(raw), 'source_hash': fingerprint(raw), 'messages': projected}
+                self.store.data['context_checkpoint'] = checkpoint
+                report.update(source_hash=checkpoint['source_hash'])
+                self.store.data['run_runtime']['context_summary'] = report
+                self.store.get_logger().record('context_compaction', **report)
+            messages = candidate
+        after = self.request_tokens(messages, tools)
+        if after > limit:
+            raise ValueError('Request exceeds the configured context input limit')
+        message_units([asdict(m) for m in messages[1:]])
+        report['tokens_after'] = after
+        self._last_estimate = after
+        roles = {role: 0 for role in ('user', 'assistant', 'tool', 'other')}
+        for message in messages[1:]:
+            roles[message.role if message.role in roles else 'other'] += len(message.content or '')
+        prior = self.store.data['run_runtime'].get('context_report', {})
+        self.store.data['run_runtime']['context_report'] = {
+            **report, 'system_sections': prior.get('system_sections', {}),
+            'system_chars': len(messages[0].content or ''), 'message_role_chars': roles,
+            'message_chars': sum(roles.values()),
+            'total_chars': len(messages[0].content or '') + sum(roles.values()),
+            'tool_definition_tokens': estimate_tokens(tools),
         }
+        self.store.save()
+        return messages
 
-    def _select_groups(self, context_mode: str) -> list[list[dict]]:
-        """按 cline 折叠选择消息并按轮次分组，对较旧的观察做递进式截断。
-
-        最近轮次逐字保留（旧观察按 800/1200/默认递进截断），更早轮次仅保留其
-        typed user 提示、结论性回答与 dropped-work 提示块（由 ``fold_messages`` 生成）。
-        """
-        messages = self.store.data["messages"]
-        if self.strategy == "off":
-            flat = [dict(message) for message in messages]
-        else:
-            flat = fold_messages(messages, recent_turns=self.recent_turns)[0]
-        selected: list[list[dict]] = []
-        for index, group in enumerate(reversed(self._group_flat(flat))):
-            last_tool = max((i for i, item in enumerate(group) if item.get("role") == "tool"), default=-1)
-            selected.append([self._compact_message(
-                item,
-                observation_chars=800 if index else (1200 if item.get("role") == "tool" and i < last_tool else None),
-                compact_links=bool(index) or i < last_tool,
-                context_mode=context_mode,
-            ) for i, item in enumerate(group)])
-        selected.reverse()
-        return selected
-
-    @staticmethod
-    def _group_flat(messages: list[dict]) -> list[list[dict]]:
-        groups: list[list[dict]] = []
-        for message in messages:
-            if message.get("role") == "user":
-                groups.append([])
-            if groups:
-                groups[-1].append(message)
-        return groups
-
-    def _compact_message(self, item: dict, *, observation_chars=None, compact_links=False, context_mode="general") -> dict:
-        limit = self.observation_chars if observation_chars is None else observation_chars
-        value = {key: data for key, data in item.items() if key != "reasoning"}
-        if value.get("role") != "tool" or not isinstance(value.get("content"), str):
-            return value
-        try:
-            payload = json.loads(value["content"])
-        except (TypeError, json.JSONDecodeError):
-            value["content"] = value["content"][:limit]
-            return value
-        if not isinstance(payload, dict):
-            value['content'] = str(value['content'])[:limit]
-            return value
-        data = payload.get("data")
-        if compact_links and isinstance(data, dict) and isinstance(data.get('links'), list) and len(data['links']) > 5:
-            data['links'] = data['links'][:5]
-            data['links_note'] = '早先页面链接在上下文中仅保留前五项；完整链接保存在来源缓存，可再次读取同一 URL 取得。'
-        if compact_links and isinstance(data, dict) and isinstance(data.get('hits'), list) and len(data['hits']) > 3:
-            data['hits'] = data['hits'][:3]
-            data['hits_note'] = '早先搜索候选在上下文中仅保留前三项；完整候选已登记在运行状态中。'
-        if isinstance(data, dict) and isinstance(data.get("text"), str):
-            original = data["text"]
-            if len(original) > limit:
-                # 构建首尾截断，精确适配 limit 字符数。
-                def _marker(n):
-                    return "\n\n[\u2026\u7701\u7565" + str(n) + "\u5b57\u7b26\u2026]\n\n"
-                # 首次估算分割点。
-                head_size = max(limit * 2 // 3, 200)
-                tail_size = limit - head_size - len(_marker(len(original) - head_size - max(limit - head_size, 100)))
-                tail_size = max(tail_size, 50)
-                head_size = limit - tail_size - len(_marker(len(original) - head_size - tail_size))
-                head_size = max(head_size, 100)
-                # 用最终尺寸重新计算标记。
-                omitted = len(original) - head_size - tail_size
-                marker = _marker(omitted)
-                # 微调以精确命中 limit。
-                total = head_size + len(marker) + tail_size
-                if total > limit:
-                    head_size -= (total - limit)
-                    head_size = max(head_size, 100)
-                    omitted = len(original) - head_size - tail_size
-                    marker = _marker(omitted)
-                    total = head_size + len(marker) + tail_size
-                if total < limit:
-                    head_size += (limit - total)
-                    omitted = len(original) - head_size - tail_size
-                    marker = _marker(omitted)
-                    total = head_size + len(marker) + tail_size
-                data["text"] = original[:head_size] + marker + original[-tail_size:]
-                payload["truncated"] = True
-                data["observation_note"] = "正文已保存到 Source Store；上下文保留首尾片段。可用 fetch_web_content 的 offset 从缓存读取完整内容，保持 URL 不变。"
-            else:
-                data["text"] = original
-        value["content"] = json.dumps(payload, ensure_ascii=False)
-        return value
-
-    @staticmethod
-    def _context_mode_for(profile: str, protocols: list[str]) -> str:
-        """确定上下文压缩模式：'coding'、'writing' 或 'general'。"""
-        if profile == "creative" or "creative_writing" in protocols or "revision" in protocols:
-            return "writing"
-        if profile == "local_files" or "coding" in protocols or "testing" in protocols or "debugging" in protocols:
-            return "coding"
-        return "general"
-
-    @staticmethod
-    def _minimal_current(group: list[dict]) -> list[dict]:
-        users = [item for item in group if item.get("role") == "user"]
-        return users[-1:] if users else []
-
-
-
+    def compact(self, *, force=False, mode='auto'):
+        if self.store.data.get('pending'):
+            raise ValueError('Resolve pending tool approvals before compacting context')
+        state = self.store.data['run_runtime']
+        messages = self.build(state['profile'])
+        self.prepare(messages, self.tools(), mode='manual' if force else mode)
+        return state['context_report']

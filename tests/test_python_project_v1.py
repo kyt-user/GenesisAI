@@ -8,7 +8,7 @@ from genesisai.app.cli import select_workspace
 from genesisai.core.extensions.tools.shell.python_support import automatic_test_command, inspect_python_project
 from genesisai.app.evals.python_development import load_dataset, run_all
 from genesisai.core.project_docs import AgentDocsError, AgentDocsManager
-from genesisai.core.state.store import workspace_state_root
+from genesisai.core.state.store import application_state_root, default_workspace
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -16,60 +16,40 @@ FIXTURE = PROJECT / "agent_tests_workspace"
 DATASET = Path(__file__).parent / "python_development_dataset" / "manifest.yaml"
 
 
-class _Console:
-    def __init__(self, answer):
-        self.answer = answer
-
-    def input(self, *_args, **_kwargs):
-        return self.answer
+def test_default_workspace_is_independent_of_launch_directory(tmp_path):
+    assert default_workspace() == tmp_path / "home" / "GenesisAI" / "workspace"
+    assert select_workspace(None) == default_workspace()
+    assert default_workspace().is_dir()
 
 
-class _View:
-    def __init__(self):
-        self.values = None
-
-    def render_workspace_selection(self, current, suggested):
-        self.values = (current, suggested)
-
-
-def test_interactive_workspace_is_selected_before_session(tmp_path, monkeypatch):
-    workspace = tmp_path / "agent_tests_workspace"
-    workspace.mkdir()
+def test_explicit_workspace_is_created_and_overrides_default(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    view = _View()
-
-    selected = select_workspace(None, console=_Console(str(workspace)), view=view, interactive=True)
-
-    assert selected == workspace.resolve()
-    assert view.values[0] == str(tmp_path.resolve())
+    selected = select_workspace(Path("custom project"))
+    assert selected == tmp_path / "custom project"
+    assert selected.is_dir()
+    assert not default_workspace().exists()
 
 
-def test_interactive_workspace_must_already_exist(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    with pytest.raises(ValueError, match="已经存在"):
-        select_workspace(None, console=_Console("missing"), view=_View(), interactive=True)
+def test_workspace_cannot_be_a_file(tmp_path):
+    target = tmp_path / "file"
+    target.write_text("x")
+    with pytest.raises(ValueError, match="目录"):
+        select_workspace(target)
 
 
-def test_interactive_enter_explicitly_selects_current_directory(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    selected = select_workspace(None, console=_Console(""), view=_View(), interactive=True)
-
-    assert selected == tmp_path.resolve()
-
-
-def test_noninteractive_start_requires_explicit_workspace(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    with pytest.raises(ValueError, match="--workspace"):
-        select_workspace(None, console=_Console(""), view=_View(), interactive=False)
+def test_current_directory_does_not_change_default(tmp_path, monkeypatch):
+    first = select_workspace(None)
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    assert select_workspace(None) == first
+    assert not (other / ".genesis").exists()
 
 
-def test_runtime_state_is_contained_by_selected_workspace(tmp_path):
-    workspace = tmp_path / "work"
-    workspace.mkdir()
-
-    assert workspace_state_root(workspace) == workspace / ".genesis"
+def test_runtime_history_is_contained_by_default_workspace():
+    assert application_state_root() == default_workspace() / ".genesis"
+    with pytest.raises(ValueError, match="历史目录"):
+        select_workspace(application_state_root() / "nested")
 
 
 def test_cli_rejects_input_and_output_outside_selected_workspace(tmp_path):
