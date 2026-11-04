@@ -19,9 +19,7 @@ def test_local_file_source_reference_is_valid_without_web_evidence(tmp_path):
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
         providers=[],
     )
     ref = store.source(kind="file", path=str(note), sha256=sha(note), title=note.name)

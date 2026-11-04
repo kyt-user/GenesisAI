@@ -10,7 +10,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-PROVIDERS = frozenset({"deepseek", "qwen"})
+PROVIDERS = frozenset({"deepseek", "qwen", "qwen_token_plan"})
 TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation", "context"})
 GENERATION_KEYS = frozenset({"max_tokens", "temperature", "top_p"})
 
@@ -71,8 +71,9 @@ def build_model(path=None, settings=None):
     config = load_model_config(path)
     from genesisai.model.providers.deepseek import DeepSeekClient
     from genesisai.model.providers.qwen import QwenClient
+    from genesisai.model.providers.qwen_token_plan import QwenTokenPlanClient
 
-    classes = dict(deepseek=DeepSeekClient, qwen=QwenClient)
+    classes = dict(deepseek=DeepSeekClient, qwen=QwenClient, qwen_token_plan=QwenTokenPlanClient)
     client = classes[config.provider](model=config.model, generation=config.generation)
     client.context_config = config.context
     host = urlsplit(str(client.client.base_url)).hostname
@@ -84,8 +85,9 @@ def _build_from_settings(settings):
     """按 CLI 持久化配置选择模型；提供商统一按环境优先解析密钥。"""
     from genesisai.model.providers.deepseek import DeepSeekClient
     from genesisai.model.providers.qwen import QwenClient
+    from genesisai.model.providers.qwen_token_plan import QwenTokenPlanClient
 
-    classes = dict(deepseek=DeepSeekClient, qwen=QwenClient)
+    classes = dict(deepseek=DeepSeekClient, qwen=QwenClient, qwen_token_plan=QwenTokenPlanClient)
     provider = (settings.provider or "").strip()
     if provider not in classes:
         raise ValueError(f"不支持的 Provider：{provider}")

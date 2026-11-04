@@ -58,8 +58,12 @@ class Implementation:
         )
         chapters = []
         for f in files:
+            try:
+                f = context.access.workspace_path(f, must_exist=True)
+            except (ToolError, OSError):
+                continue
             info = _extract_chapter_info(f)
-            info["path"] = str(f.relative_to(context.access.workspace))
+            info["path"] = context.access.display_path(f)
             chapters.append(info)
         numbered = [c for c in chapters if c["number"] is not None]
         unnumbered = [c for c in chapters if c["number"] is None]

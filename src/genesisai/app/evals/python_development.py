@@ -87,7 +87,7 @@ def _runtime(workspace: Path, case_root: Path) -> tuple[Store, ToolRuntime]:
     runtime = ToolRuntime(
         store,
         Access([workspace], output, state, workspace_root=workspace),
-        providers=[], confirm_writes=False, confirm_search=False, confirm_shell=False,
+        providers=[], permission_mode="auto",
     )
     return store, runtime
 

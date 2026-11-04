@@ -27,23 +27,34 @@ def snapshot():
         workspace="D:/project/workspace",
         input_roots=[],
         output="D:/project/output",
-        permission_mode="ASK",
+        permission_mode="user",
         registered_tools=10,
         enabled_tools=3,
     )
 
 
-def test_cli_header_focuses_on_model_workspace_and_task_entry():
+def test_cli_home_shows_workspace_and_task_entry():
     view, stream = recording_view()
 
-    view.render_startup(snapshot())
+    view.render_home(snapshot().workspace, [])
 
     output = stream.getvalue()
     assert "GenesisAI" in output
-    assert "test-model" in output
     assert 'D:/project/workspace' in output
-    assert '输入 / 选择操作' in output
+    assert '输入 / 查看操作' in output
+    assert '/auth 切换模型提供商' in output
     assert 'Tools:' not in output and 'Skill:' not in output
+
+
+def test_command_control_sequences_are_inert_in_live_output_and_details():
+    view, stream = recording_view()
+    unsafe = '中文\tA\x1b[2J\x1b[3D\x1b]0;title\x07\x9b2J\x9dtitle\x9c\n'
+    view.render_progress('command_output', {'text': unsafe})
+    view.show_details = True
+    view.render_progress('tool_result', {'ok': True, 'data': {'stdout': unsafe, 'cwd': unsafe}})
+    shown = stream.getvalue()
+    assert '中文' in shown and 'title' in shown
+    assert not any(ch in shown for ch in '\x1b\x07\x9b\x9c\x9d')
 
 
 def test_confirmation_card_keeps_target_and_actions_visible():
@@ -133,7 +144,7 @@ def test_new_command_creates_fresh_session_and_preserves_old_one(tmp_path, monke
     assert restored.data["id"] == old["id"]
 
 
-def test_permissions_command_switches_network_and_writes_for_session(tmp_path, monkeypatch):
+def test_permissions_command_switches_session_mode(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
 
     view, stream = recording_view()
@@ -141,11 +152,10 @@ def test_permissions_command_switches_network_and_writes_for_session(tmp_path, m
     monkeypatch.setattr(cli, "Console", lambda **kwargs: view.console)
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
     commands = iter([
-        "/permissions network allow",
+        "/permissions auto",
         "/status",
-        "/permissions writes allow",
         "/permissions",
-        "/permissions network ask",
+        "/permissions user",
         "/permissions",
         "/exit",
     ])
@@ -155,9 +165,9 @@ def test_permissions_command_switches_network_and_writes_for_session(tmp_path, m
 
     output = stream.getvalue()
     assert "公开网络" in output
-    assert "本次会话已允许" in output
+    assert "自动执行" in output
     assert "逐次确认" in output
-    assert "MIXED" in output
+    assert "工作区外" in output
     assert model.contexts == []
 
 
@@ -224,7 +234,7 @@ def test_new_session_keeps_grants_resets_runtime_permission_and_refreshes_ui(tmp
     model = FakeModel(Response(content="old"))
     monkeypatch.setattr(cli, "Console", lambda **kwargs: view.console)
     monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
-    commands = iter(["old", "/permissions network allow", "/new", "/permissions", "/exit"])
+    commands = iter(["old", "/permissions auto", "/new", "/permissions", "/exit"])
     monkeypatch.setattr("rich.console.Console.input", lambda *args, **kwargs: next(commands))
     work = tmp_path / "work"
     inputs = work / "inputs"
@@ -233,7 +243,7 @@ def test_new_session_keeps_grants_resets_runtime_permission_and_refreshes_ui(tmp
     assert main(["--workspace", str(work), "--input", str(inputs)]) == 0
 
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in (application_state_root() / "sessions").glob("*.json")]
-    assert len(payloads) == 2
+    assert len(payloads) == 1
     assert all(item["grants"] == [str(inputs.resolve())] for item in payloads)
     assert stream.getvalue().splitlines().count("GenesisAI") == 2
     assert "逐次确认" in stream.getvalue()
@@ -281,7 +291,7 @@ def test_other_plain_text_cannot_approve_pending_call(tmp_path, monkeypatch):
     assert "处理确认" in stream.getvalue()
 
 
-def test_yes_writes_preauthorizes_only_output_creation(tmp_path, monkeypatch):
+def test_auto_mode_allows_output_creation(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
 
     model = FakeModel(
@@ -293,14 +303,14 @@ def test_yes_writes_preauthorizes_only_output_creation(tmp_path, monkeypatch):
     monkeypatch.setattr("rich.console.Console.input", lambda *args, **kwargs: next(commands))
     work = tmp_path / "work"
 
-    assert main(["--workspace", str(work), "--yes-writes"]) == 0
+    assert main(["--workspace", str(work), "--permissions", "auto"]) == 0
 
     assert (work / "allowed.md").read_text(encoding="utf-8") == "ok"
     session = json.loads(next((application_state_root() / "sessions").glob("*.json")).read_text(encoding="utf-8"))
     assert session["status"] == "completed"
 
 
-def test_yes_search_preauthorizes_public_search(tmp_path, monkeypatch):
+def test_auto_mode_allows_public_search(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
     from genesisai.core.tools.tool_runtime import ToolRuntime as RealToolRuntime
 
@@ -323,7 +333,7 @@ def test_yes_search_preauthorizes_public_search(tmp_path, monkeypatch):
     monkeypatch.setattr("rich.console.Console.input", lambda *args, **kwargs: next(commands))
     work = tmp_path / "work"
 
-    assert main(["--workspace", str(work), "--yes-search"]) == 0
+    assert main(["--workspace", str(work), "--permissions", "auto"]) == 0
 
     session = json.loads(next((application_state_root() / "sessions").glob("*.json")).read_text(encoding="utf-8"))
     assert session["status"] == "completed"
@@ -343,13 +353,6 @@ def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monke
     def runtime_factory(store, access, **kwargs):
         return RealToolRuntime(store, access, providers=[Provider()], **kwargs)
 
-    denied_model = FakeModel()
-    monkeypatch.setattr(cli, "build_model", lambda path: (denied_model, True))
-    assert main([
-        "--workspace", str(tmp_path / "denied"), "--yes-search", "--prompt", "private"
-    ]) == 2
-    assert denied_model.contexts == []
-
     pending_model = FakeModel(
         response(call("fetch_web_content", {"query": "public"}, "remote_search")),
     )
@@ -357,7 +360,7 @@ def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monke
     monkeypatch.setattr(cli, "build_model", lambda path: (pending_model, True))
     work = tmp_path / "allowed"
     assert main([
-        "--workspace", str(work), "--allow-remote-data", "--prompt", "research"
+        "--workspace", str(work), "--prompt", "research"
     ]) == 2
     sessions = [json.loads(path.read_text(encoding="utf-8"))
                 for path in (application_state_root() / "sessions").glob("*.json")]

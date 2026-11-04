@@ -22,8 +22,7 @@ def source_runtime(tmp_path):
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        confirm_writes=False,
-        confirm_search=False,
+        permission_mode="auto",
         providers=[],
     )
     return workspace, store, runtime
@@ -77,6 +76,7 @@ def test_binary_and_unknown_extensions_are_rejected(source_runtime, path):
 def test_source_create_respects_workspace_and_secret_boundaries(source_runtime, path):
     workspace, _, runtime = source_runtime
 
+    runtime.set_permission("user")
     result = create(runtime, path, "secret")
 
     assert result["error"]["code"] == "permission_denied"

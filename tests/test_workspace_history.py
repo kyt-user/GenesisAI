@@ -22,7 +22,7 @@ def test_default_cli_creates_files_and_full_history_in_default_workspace(monkeyp
         'operation': 'create', 'path': 'result.txt', 'content': 'hello', 'source_refs': [],
     })), Response(content='done'))
     monkeypatch.setattr(cli, 'build_model', lambda _: (model, False))
-    assert cli.main(['--no-agent-docs', '--yes-writes', '--prompt', 'create file']) == 0
+    assert cli.main(['--no-agent-docs', '--permissions', 'auto', '--prompt', 'create file']) == 0
     assert (default_workspace() / 'result.txt').read_text() == 'hello'
     saved, = sessions()
     assert Path(saved['workspace']) == default_workspace()

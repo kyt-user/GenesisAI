@@ -39,7 +39,7 @@ class Implementation:
         char_names = _extract_names(text)
 
         return {
-            "path": str(target.relative_to(context.access.workspace)),
+            "path": context.access.display_path(target),
             "headings": headings[:20],
             "paragraph_summaries": paragraphs[:10],
             "word_count": word_count,

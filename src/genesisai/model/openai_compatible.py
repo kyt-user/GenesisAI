@@ -1,10 +1,13 @@
 """OpenAI 兼容的对话补全公共实现。"""
 
+import asyncio
 from collections.abc import Iterator
+from contextlib import contextmanager
 
-from openai import OpenAI
+from openai import AsyncOpenAI, OpenAI
 
 from genesisai.model.base import ModelClient
+from genesisai.shared.run_control import current_run
 from genesisai.shared.messages import Message, Response, ToolCall
 
 
@@ -42,15 +45,57 @@ class OpenAICompatibleClient(ModelClient):
             self.io_logger.record(event, **self.io_context, **payload)
 
     def _logged_stream(self, stream):
-        try:
-            for chunk in stream:
-                if getattr(self, 'io_logger', None) is not None:
-                    self._record_io('provider_stream_chunk', response=chunk.model_dump())
-                yield chunk
-        finally:
-            close = getattr(stream, 'close', None)
-            if close:
-                close()
+        for chunk in stream:
+            if getattr(self, 'io_logger', None) is not None:
+                self._record_io('provider_stream_chunk', response=chunk.model_dump())
+            yield chunk
+
+    @contextmanager
+    def _request(self, payload):
+        control = current_run.get()
+        if control is None:
+            response = self.client.chat.completions.create(**payload)
+            try:
+                yield response
+            finally:
+                if payload.get('stream') and hasattr(response, 'close'):
+                    response.close()
+            return
+
+        # Drive the async socket on the run worker. Cancel wakes a blocked read,
+        # including the wait for HTTP headers before a stream object exists.
+        with asyncio.Runner() as runner:
+            client = AsyncOpenAI(api_key=self.client.api_key, base_url=self.client.base_url,
+                                 timeout=self.client.timeout, max_retries=self.client.max_retries)
+            loop = runner.get_loop()
+
+            def wait(awaitable):
+                task = asyncio.ensure_future(awaitable, loop=loop)
+                with control.interruptible(lambda: loop.call_soon_threadsafe(task.cancel)):
+                    try:
+                        return loop.run_until_complete(task)
+                    except asyncio.CancelledError as exc:
+                        raise KeyboardInterrupt from exc
+
+            try:
+                response = wait(client.chat.completions.create(**payload))
+                if not payload.get('stream'):
+                    yield response
+                    return
+                iterator = response.__aiter__()
+
+                def chunks():
+                    while True:
+                        try:
+                            yield wait(anext(iterator))
+                        except StopAsyncIteration:
+                            return
+                try:
+                    yield chunks()
+                finally:
+                    loop.run_until_complete(response.close())
+            finally:
+                loop.run_until_complete(client.close())
 
     def chat(
         self,
@@ -66,7 +111,10 @@ class OpenAICompatibleClient(ModelClient):
                        messages=[self._to_openai_message(message) for message in messages],
                        tools=tools, **options)
         self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
-        response = self.client.chat.completions.create(**payload)
+        with self._request(payload) as response:
+            return self._parse_response(response)
+
+    def _parse_response(self, response):
         if getattr(self, 'io_logger', None) is not None:
             self._record_io('provider_response', response=response.model_dump())
         message = response.choices[0].message
@@ -91,7 +139,7 @@ class OpenAICompatibleClient(ModelClient):
         messages: list[Message] | list[dict],
         tools: list[dict] | None = None,
         **kwargs,
-    ) -> Iterator[str | Response]:
+    ) -> Iterator[str | tuple[str, str] | Response]:
         options = self._request_options(kwargs)
         if tools == []:
             options['tool_choice'] = 'none'
@@ -108,7 +156,10 @@ class OpenAICompatibleClient(ModelClient):
             **options,
         )
         self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
-        stream = self.client.chat.completions.create(**payload)
+        with self._request(payload) as stream:
+            yield from self._parse_stream(stream)
+
+    def _parse_stream(self, stream):
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
         tool_call_parts: dict[int, dict[str, str]] = {}
@@ -126,7 +177,6 @@ class OpenAICompatibleClient(ModelClient):
             if reasoning_delta:
                 reasoning_parts.append(reasoning_delta)
                 yield ("reasoning", reasoning_delta)
-                continue
             if delta.content:
                 content_parts.append(delta.content)
                 yield delta.content
@@ -139,6 +189,8 @@ class OpenAICompatibleClient(ModelClient):
                 if call.function:
                     current["name"] += call.function.name or ""
                     current["arguments"] += call.function.arguments or ""
+        if finish_reason is None:
+            raise ValueError('模型流提前结束，未收到结束原因')
         tool_calls = [
             ToolCall(
                 id=tool_call_parts[index]["id"],

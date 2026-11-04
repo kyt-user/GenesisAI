@@ -56,7 +56,7 @@ def main():
                 with HostLock(work):
                     store=Store(work); output=work/'outputs'
                     store.data.update(grants=[str(inputs)],output=str(output));store.save()
-                    runtime=ToolRuntime(store,Access([inputs],output,work),confirm_writes=False,confirm_search=False)
+                    runtime=ToolRuntime(store,Access([inputs],output,work),permission_mode="auto")
                     outcome=Runner(model,runtime,seconds=600,max_rounds=20).start(prompt)
                     status=outcome['status']
                     checks={}

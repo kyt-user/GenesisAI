@@ -243,7 +243,7 @@ def test_discovered_links_have_provenance_and_still_require_approval(runtime_env
     assert candidate['source_type'] == 'page_link'
     assert candidate['parent_source_ref'] == page['source_refs'][0]
     assert 'https://evil.example/' not in store.data['run_runtime']['candidates']
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     purchase = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/buy'}, 'buy'))
     assert purchase['pending'] is True
 

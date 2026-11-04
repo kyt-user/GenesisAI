@@ -37,7 +37,7 @@ def deepseek_settings(**overrides):
 
 
 def test_catalog_exposes_known_providers():
-    assert catalog.provider_ids() == ["deepseek", "qwen"]
+    assert catalog.provider_ids() == ["deepseek", "qwen", "qwen_token_plan"]
     deepseek = catalog.get_provider("deepseek")
     assert deepseek is not None
     assert deepseek.api_key_env == "DEEPSEEK_API_KEY"
@@ -184,5 +184,5 @@ def test_cli_missing_key_fails_fast_without_tty(tmp_path, monkeypatch):
     save_settings(deepseek_settings(api_key=""), directory)
     work = tmp_path / "work"
 
-    assert cli.main(["--config-dir", str(directory), "--workspace", str(work)]) == 2
+    assert cli.main(["--config-dir", str(directory), "--workspace", str(work), "--prompt", "hello"]) == 2
     assert "API Key" in stream.getvalue()

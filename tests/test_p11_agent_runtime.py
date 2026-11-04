@@ -54,8 +54,7 @@ def runtime_env(tmp_path):
     runtime = ToolRuntime(
         store,
         Access([], output, workspace),
-        confirm_search=False,
-        confirm_writes=False,
+        permission_mode="auto",
         providers=[],
     )
     return store, runtime

@@ -17,9 +17,10 @@ from test_acceptance import FakeModel
 def isolate_credentials(monkeypatch):
     monkeypatch.delenv('DEEPSEEK_API_KEY', raising=False)
     monkeypatch.delenv('DASHSCOPE_API_KEY', raising=False)
+    monkeypatch.delenv('QWEN_TOKEN_PLAN', raising=False)
 
 
-@pytest.mark.parametrize('provider,variable', [('deepseek','DEEPSEEK_API_KEY'), ('qwen','DASHSCOPE_API_KEY')])
+@pytest.mark.parametrize('provider,variable', [('deepseek','DEEPSEEK_API_KEY'), ('qwen','DASHSCOPE_API_KEY'), ('qwen_token_plan','QWEN_TOKEN_PLAN')])
 @pytest.mark.parametrize('environment,expected', [(' env-key ', 'env-key'), ('', 'terminal-key'), ('   ', 'terminal-key'), (None, 'terminal-key')])
 def test_actual_client_environment_first_then_terminal(monkeypatch, provider, variable, environment, expected):
     if environment is not None:
@@ -41,6 +42,7 @@ def test_empty_injected_environment_does_not_use_process(monkeypatch):
     assert onboarding.effective_key(settings, {}) == 'terminal-key'
 
 
+@pytest.mark.parametrize('provider,variable', [('deepseek', 'DEEPSEEK_API_KEY'), ('qwen_token_plan', 'QWEN_TOKEN_PLAN')])
 @pytest.mark.parametrize('process,workspace,project,expected', [
     ('process-key', 'workspace-key', 'project-key', 'process-key'),
     (None, 'workspace-key', 'project-key', 'workspace-key'),
@@ -48,18 +50,18 @@ def test_empty_injected_environment_does_not_use_process(monkeypatch):
     ('   ', 'workspace-key', 'project-key', 'workspace-key'),
     (None, '   ', '', 'terminal-key'),
 ])
-def test_dotenv_chain_reaches_actual_client(tmp_path, monkeypatch, process, workspace, project, expected):
+def test_dotenv_chain_reaches_actual_client(tmp_path, monkeypatch, provider, variable, process, workspace, project, expected):
     root = tmp_path/'repo'
     work = tmp_path/'work'
     root.mkdir()
     work.mkdir()
     monkeypatch.setattr(cli, 'PROJECT_ROOT', root)
     if process is not None:
-        monkeypatch.setenv('DEEPSEEK_API_KEY', process)
-    (work/'.env').write_text(f'DEEPSEEK_API_KEY="{workspace}"\n', encoding='utf-8')
-    (root/'.env').write_text(f'DEEPSEEK_API_KEY="{project}"\n', encoding='utf-8')
+        monkeypatch.setenv(variable, process)
+    (work/'.env').write_text(f'{variable}="{workspace}"\n', encoding='utf-8')
+    (root/'.env').write_text(f'{variable}="{project}"\n', encoding='utf-8')
     cli.load_environment(workspace=work)
-    model, _ = build_model(settings=ProviderSettings(provider='deepseek', model='fixture', api_key='terminal-key'))
+    model, _ = build_model(settings=ProviderSettings(provider=provider, model='fixture', api_key='terminal-key'))
     try:
         assert model.client.api_key == expected
     finally:
@@ -118,7 +120,8 @@ def test_interactive_start_does_not_prompt_when_env_exists(tmp_path, monkeypatch
         save_settings(ProviderSettings(provider='deepseek', model='fixture', api_key='terminal-key'), directory)
     monkeypatch.setattr(cli.sys, 'stdin', type('TTY', (), {'isatty':lambda self: True})())
     monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=StringIO(), force_terminal=False))
-    monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: '/exit')
+    inputs = iter(['hello', '/exit'])
+    monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: next(inputs))
     def unexpected(*args, **kwargs):
         raise AssertionError('unexpected onboarding')
     monkeypatch.setattr(onboarding, 'run_onboarding', unexpected)

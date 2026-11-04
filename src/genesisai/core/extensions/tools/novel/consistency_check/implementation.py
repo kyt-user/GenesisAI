@@ -36,7 +36,7 @@ class Implementation:
                 })
 
         return {
-            "path": str(target.relative_to(context.access.workspace)),
+            "path": context.access.display_path(target),
             "names_checked": len(mentioned),
             "warnings": warnings[:20],
             "consistent": len(warnings) == 0,

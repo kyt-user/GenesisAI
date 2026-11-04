@@ -74,10 +74,10 @@ def main():
     report['checks']['baseline_fails'] = report['baseline']['exit_code'] != 0
     AgentDocsManager(workspace, create=True)
     store = Store(root / '.genesis', workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace), remote_allowed=True,
+    store.data.update(grants=[str(workspace)], output=str(workspace),
                       deadline=time.time() + 600)
     runtime = ToolRuntime(store, Access([workspace], workspace, store.root, workspace_root=workspace),
-                          confirm_writes=False, confirm_search=False, confirm_shell=False, providers=[])
+                          permission_mode="auto", providers=[])
     # Actual read-only tool executions produce the seeded transcript; no fabricated success results.
     store.data['messages'].append({'role': 'user', 'content':
         'This is generated historical context for a compaction test. Read the fixture repeatedly. '
@@ -130,7 +130,7 @@ def main():
         if outcome['status'] in {'completed', 'partial', 'failed', 'limit_reached'}:
             restored = Store(root / '.genesis', store.id, workspace=workspace)
             restored_runtime = ToolRuntime(restored, Access([workspace], workspace, restored.root, workspace_root=workspace),
-                                           confirm_writes=False, confirm_search=False, confirm_shell=False, providers=[])
+                                           permission_mode="auto", providers=[])
             report['followup'] = Runner(model, restored_runtime, max_rounds=4, seconds=120, on_event=progress).start(
                 '请概括上一轮实际修改了什么、测试是否通过。不要修改文件，不需要重新运行命令。')
             report['checks']['restored_followup_completed'] = report['followup']['status'] == 'completed'

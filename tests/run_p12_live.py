@@ -34,7 +34,7 @@ def run_record(data):
 
 def main():
     parser = argparse.ArgumentParser(description='真实模型 CLI 验收：仅在允许向模型和公开网络发送测试查询后运行')
-    parser.add_argument('--scope', choices=['session', 'run'], default='session')
+    parser.add_argument('--scope', choices=['user', 'auto'], default='user')
     parser.add_argument('--scenario', choices=['apple', 'arduino', 'raspberry', 'nonproduct'], default='apple')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -77,8 +77,8 @@ def main():
 
     def prompt(_view):
         nonlocal question_index
-        if state.store.data['status'] == 'awaiting_confirmation':
-            command = '/allow network run' if args.scope == 'run' else '/allow network'
+        if state and state.store.data['status'] == 'awaiting_confirmation':
+            command = '/approve'
             pending = state.store.data['pending'][0]
             if state.runtime.registry.get(pending['name']).spec.permission != 'network':
                 command = '/reject'
@@ -98,7 +98,7 @@ def main():
         cli.build_cli_session = capture
         cli.CliView.prompt = prompt
         code = cli.main(['--workspace', str(output / 'workspace'), '--env-file', str(root.parents[1] / '.env'),
-                         '--allow-remote-data', '--seconds', '180'])
+                         '--seconds', '180', '--permissions', args.scope])
     report = {'time_utc': stamp, 'exit_code': code, 'actions': actions, 'mode': 'real model and network', 'scope': args.scope,
               'scenario': args.scenario}
     if state:

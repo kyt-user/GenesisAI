@@ -80,7 +80,7 @@ class Implementation:
         scope = args.get("scope", "output")
         if scope == "output":
             path = context.access.create(args["path"], payload)
-            if path.is_relative_to(context.access.workspace):
+            if context.access.host_access or path.is_relative_to(context.access.workspace):
                 record_change(context.store, operation="create", path=path, after_sha=hashlib.sha256(payload).hexdigest())
             artifact_refs = [context.store.artifact(path)]
         else:

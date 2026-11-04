@@ -19,9 +19,20 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -e .
 ```
 
+### Windows 桌宠
+
+在仓库根目录安装桌宠依赖并启动 Genesis。
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[pet]"
+.venv\Scripts\genesis.exe
+```
+
+在 Genesis 输入 `/pet` 唤出桌宠。左键拖动角色，右键关闭窗口，再次输入 `/pet` 即可重新打开。角色会随任务执行、等待确认和完成切换动作。批准或拒绝操作仍在终端输入。退出 CLI 时桌宠自动关闭。
+
 ## 模型配置
 
-网络确认时，输入 `/approve` 或“确认”只批准当前请求；`/allow network run` 允许本轮后续网络请求，`/allow network` 允许本会话后续请求。使用 `/permissions network ask` 撤销预授权；`/new` 恢复逐次确认。等待确认不消耗执行时间，但过期的确认需要重新预览。自然追问缺少资料时会补查，无须另说“执行搜索”。
+等待审批时，输入 /approve 或“确认”只批准当前调用。等待时间不计入执行预算，过期后重新展示操作。自然追问缺少资料时会补查，无须另说“执行搜索”。
 
 内部异常会显示诊断编号，可用 `/trace` 查看脱敏堆栈位置。部分结果显示“部分完成”，不会因已取得官网页面而自动标记完成。
 
@@ -43,9 +54,11 @@ DEEPSEEK_API_KEY=replace_me
 
 程序不会显示密钥，也不会读取 xiaoerAI 的环境文件。
 
-模型 API Key 的优先级为：**进程环境变量 > 工作区 `.env` > GenesisAI 根目录 `.env` > 终端保存的 Key**（空值和纯空格视为未配置）。`--env-file` 指定文件时替代两个自动查找的 `.env`。按当前选定的提供商读取 `DEEPSEEK_API_KEY` 或 `DASHSCOPE_API_KEY`。
+模型 API Key 的优先级为 **进程环境变量 > 工作区 `.env` > GenesisAI 根目录 `.env` > 终端保存的 Key**（空值和纯空格视为未配置）。`--env-file` 指定文件时替代两个自动查找的 `.env`。按当前选定的提供商读取 `DEEPSEEK_API_KEY`、`DASHSCOPE_API_KEY` 或 `QWEN_TOKEN_PLAN`。
 
-环境和终端配置都没有可用 Key 时，交互式启动才提示输入；有环境 Key 时首次启动也不要求终端配置。`--auth` 或 `/auth` 仍可选择提供商和模型，但有对应环境 Key 时跳过密钥输入，且不将环境 Key 复制到 `~/.genesisai/config.json`。原有终端 Key 保留作回退。修改 `.env` 后重启程序生效；配置界面会显示实际使用的密钥来源。
+阿里云 Token Plan 用户在 `.env` 中填写 `QWEN_TOKEN_PLAN=套餐专属密钥`，然后运行 `genesis --auth` 或在会话中输入 `/auth`，选择「阿里云 Token Plan」及模型。默认模型为 `qwen3.8-flash`，支持自定义模型 ID。套餐使用 `https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1` 和 `sk-sp-` 开头的专属密钥。模型 YAML 对应 `provider: qwen_token_plan`。套餐接入与可用模型以[官方文档](https://platform.qianwenai.com/docs/token-plan/personal/token-plan-personal-quickstart)为准。
+
+环境和终端配置都没有可用 Key 时，交互模式首次提交任务时才提示输入；有环境 Key 时首次启动也不要求终端配置。`--auth` 或 `/auth` 仍可选择提供商和模型，但有对应环境 Key 时跳过密钥输入，且不将环境 Key 复制到 `~/.genesisai/config.json`。原有终端 Key 保留作回退。修改 `.env` 后重启程序生效；配置界面会显示实际使用的密钥来源。
 
 ## 启动
 
@@ -57,27 +70,29 @@ python -m genesisai
 genesis
 ```
 
-默认工作区是 `~/GenesisAI/workspace`（Windows 为 `%USERPROFILE%\GenesisAI\workspace`），首次启动自动创建，不随应用安装目录或启动位置变化。交互式和 `--prompt` 模式都可直接使用默认值；使用 `--workspace "E:\my-project"` 指定其他任务目录，不存在时自动创建。工作区确定后才进行远程数据外发确认，并可初始化 `agent_docs/` 项目工作记忆；非交互模式使用 `--yes-agent-docs` 初始化或 `--no-agent-docs` 跳过。
+普通启动先进入本地首页。直接输入第一条任务开始新会话，空输入框按 ↑ 选择当前工作区最近的五段对话，或用 `/sessions` 浏览所有工作区的历史。打开后按原顺序显示最近三轮，`/history` 显示当前对话全文。仅浏览历史无需模型密钥，也不会创建空会话。
 
-选择结果会作为可信运行时状态直接提供给 Agent。输入目录和输出目录都不得越过当前任务工作区；普通相对输出写入该工作区根目录。默认工作区同时是应用历史的统一存放地：所有项目的会话、完整输入输出日志、Trace、命令日志、来源缓存及备份均写入 `~/GenesisAI/workspace/.genesis/`。会话保存原工作目录，启动界面分别显示任务与历史路径。指定其他工作区不会改变历史存储位置。
+默认工作区是 `~/GenesisAI/workspace`（Windows 为 `%USERPROFILE%\GenesisAI\workspace`），首次启动自动创建，不随应用安装目录或启动位置变化。交互式和 `--prompt` 模式都可直接使用默认值；使用 `--workspace "E:\my-project"` 指定其他任务目录，不存在时自动创建。提交任务时，所选模型会收到本次请求的会话上下文和相关工具结果，首次明确要求开发时可初始化 `agent_docs/` 项目工作记忆；非交互模式使用 `--yes-agent-docs` 初始化或 `--no-agent-docs` 跳过。
+
+选择结果会作为可信运行时状态直接提供给 Agent。输入目录和输出目录都不得越过当前任务工作区；普通相对输出写入该工作区根目录。默认工作区同时是应用历史的统一存放地：所有项目的会话、完整输入输出日志、Trace、命令日志、来源缓存及备份均写入 `~/GenesisAI/workspace/.genesis/`。会话保存原工作目录，使用 `/status` 查看任务与历史路径。指定其他工作区不会改变历史存储位置。
 
 `--session` 只从统一历史目录读取当前格式的会话，不转换历史格式。清理已有用户数据前必须确认范围。模型终端配置保存于 `~/.genesisai/config.json`（可通过 `--config-dir` 指定）。
 
-网络、工作区写入和 Shell 默认分别询问，可在当前 Session 中授权：
+新会话默认使用用户审批。读取本地授权文件直接执行。写入、网络请求、运行命令、启动或调用 MCP 服务都逐次审批。
 
 ```text
-/allow network
-/allow writes
-/allow shell
+/permissions
+/permissions user
+/permissions auto
 ```
 
-也可以在启动时使用 `--yes-search`、`--yes-writes`、`--yes-shell`。Session 授权会被保存；删除、覆盖、越界和 Git 写操作仍受固定边界约束。
+自动审批允许已启用的工具直接执行，内置文件工具可用绝对路径读写工作区外的宿主文件，命令以当前系统账号运行。可用 `--permissions user` 或 `--permissions auto` 指定启动模式。恢复会话时使用该会话保存的模式，`/new` 回到用户审批。
 
 ## 连续会话
 
 完整输入输出日志统一写入 `~/GenesisAI/workspace/.genesis/logs/<session_id>.jsonl`，可用 `/logs` 查看路径。记录完整模型请求与响应、工具参数与结果、确认、重试及错误；认证信息脱敏。不再生成重复的截断摘要 `.log`。详见 [日志与可用性检查](docs/日志与可用性检查.md)。
 
-CLI 未退出且未输入 `/new` 时，普通输入均属于同一 Session。上一轮用户问题、回答、已读取来源和已加载 Skills 会保留。长会话会压缩早期内容，但保留最近一轮、目标、来源、变更和待办。重启后用 `--session SESSION_ID` 恢复，自动使用会话原工作目录；如同时提供 `--workspace`，必须与原目录一致。原目录已不存在时报告错误，不自动重新创建。
+`/new` 回到当前工作区首页，`/workspace 路径` 切换工作区；在首页发送任务才建立新会话。进入某个会话后，普通输入均追加到该会话。上一轮用户问题、回答、已读取来源和已加载 Skills 会保留。长会话会压缩早期内容，但保留最近一轮、目标、来源、变更和待办。重启后用 `--session SESSION_ID` 恢复，自动使用会话原工作目录；如同时提供 `--workspace`，必须与原目录一致。原目录已不存在时报告错误，不自动重新创建。
 
 ## 主要命令
 
@@ -86,10 +101,12 @@ CLI 未退出且未输入 `/new` 时，普通输入均属于同一 Session。上
 | `/help`、`/status`、`/history`、`/model`        | 查看使用方法和当前状态                   |
 | `/`、`/sessions`、`/new`、`/resume`、`/cancel`、`/exit` | 选择历史会话、创建会话或管理当前运行 |
 | `/tools`                                              | 查看启用与禁用的工具                     |
+| `/queue`、`/queue resume`、`/queue clear` | 查看、继续或清空本次交互的排队消息 |
+| `/pet` | 唤出跟随当前会话的 Windows 桌宠，任务运行中也可使用 |
 | `/skills list\|search\|show\|load\|unload`                | 管理按需 Skill                           |
 | `/logs`                                               | 查看当前会话完整 JSONL 日志路径          |
 | `/project`、`/project init`                         | 查看或初始化 `agent_docs` 项目工作记忆 |
-| `/permissions`、`/allow`、`/approve`、`/reject` | 查看或处理权限                           |
+| `/permissions`、`/approve`、`/reject` | 查看或处理权限                           |
 | `/budget`、`/trace`、`/compact`                   | 查看预算、脱敏执行链和压缩上下文         |
 | `/diff` | 查看本次文件变更记录 |
 | `/details` | 展开或收起工具输出 |

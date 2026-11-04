@@ -6,7 +6,7 @@ content:
   instructions:
     - 先识别真实文件类型，再加载对应 DOCX、XLSX、PPTX 或 PDF 工具
     - 修改现有 DOCX/XLSX 时使用 docx_edit/xlsx_edit，不用 create 工具重建来代替局部修改
-    - 创建和修改工具的输出 path 必须是输出目录内的相对文件名；读取产物可以使用工具返回的完整 path
+    - 输出文件默认使用输出目录内的相对路径。自动审批时可按用户要求指定宿主绝对路径
     - 新产物必须重新打开验证，并报告 artifact_ref、哈希和限制
     - 重新读取产物时优先使用创建或修改工具返回的完整 path；也可直接使用输出文件名
   constraints:

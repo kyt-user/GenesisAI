@@ -5,21 +5,13 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from pathlib import Path
+from contextlib import ExitStack
+from threading import Event, Lock, Thread
 
 from genesisai.shared.security import ToolError
 from genesisai.core.state.store import uid
-
-
-BLOCKED_EXECUTABLES = frozenset({
-    'cmd', 'cmd.exe', 'powershell', 'powershell.exe', 'pwsh', 'pwsh.exe',
-    'bash', 'sh', 'zsh', 'rm', 'rmdir', 'del', 'erase', 'format', 'shutdown',
-})
-BLOCKED_GIT = frozenset({
-    'add', 'am', 'apply', 'branch', 'checkout', 'cherry-pick', 'clean', 'clone',
-    'commit', 'fetch', 'init', 'merge', 'mv', 'pull', 'push', 'rebase', 'reset',
-    'restore', 'revert', 'rm', 'stash', 'switch', 'tag', 'worktree',
-})
+from genesisai.shared.run_control import current_run
+from .process_tree import owned_process
 
 
 def validate_command(command):
@@ -27,19 +19,84 @@ def validate_command(command):
         raise ToolError('validation_error', 'command 必须是非空字符串数组且不超过 64 项')
     if any(not isinstance(item, str) or not item or len(item) > 4000 for item in command):
         raise ToolError('validation_error', 'command 参数无效')
-    executable = Path(command[0]).name.casefold()
-    if executable in BLOCKED_EXECUTABLES:
-        raise ToolError('command_forbidden', '不允许通过命令解释器或破坏性程序绕过 Runtime')
-    if executable in {'git', 'git.exe'}:
-        subcommand = next((item.casefold() for item in command[1:] if not item.startswith('-')), '')
-        if subcommand in BLOCKED_GIT:
-            raise ToolError('git_write_forbidden', f'V1 不允许 Git 写操作：{subcommand}')
     return command
 
 
 def safe_environment():
     blocked = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')
     return {key: value for key, value in os.environ.items() if not any(word in key.upper() for word in blocked)}
+
+
+TOOL_OUTPUT_LIMIT = 12000
+LOG_CHUNK_SIZE = 16384
+
+
+def _capture(context, command, cwd, timeout, log_path):
+    control = current_run.get()
+    deadline = time.monotonic() + timeout
+    logger = context.runtime.logger
+    wake = Event()
+    write_lock = Lock()
+    errors = []
+    summaries = {}
+    readers = []
+
+    with log_path.open('x', encoding='utf-8', newline='') as log, ExitStack() as cleanup:
+        def read(pipe, name):
+            summary, size, batch, batch_size = [], 0, [], 0
+
+            def flush():
+                nonlocal batch_size
+                if batch:
+                    text = ''.join(batch)
+                    logger.record('command_output_chunk', log_path=str(log_path), stream=name, text=text)
+                    batch.clear()
+                    batch_size = 0
+
+            try:
+                with pipe:
+                    for line in pipe:
+                        line = logger.journal.clean(line)
+                        if size < LOG_CHUNK_SIZE:
+                            summary.append(line[:LOG_CHUNK_SIZE - size])
+                        size += len(line)
+                        with write_lock:
+                            log.write(line)
+                        if control:
+                            control.emit('command_output', {'stream': name, 'text': line})
+                        batch.append(line)
+                        batch_size += len(line)
+                        if batch_size >= LOG_CHUNK_SIZE:
+                            flush()
+                    flush()
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                summaries[name] = (''.join(summary), size)
+                wake.set()
+
+        with owned_process(command, cwd=str(cwd), env=safe_environment(), stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            for name in ('stdout', 'stderr'):
+                # Reader owns this descriptor until EOF, including bytes left in
+                # the pipe after the process tree is terminated.
+                pipe = os.fdopen(os.dup(getattr(process, name).fileno()), encoding='utf-8', errors='replace')
+                thread = Thread(target=read, args=(pipe, name))
+                thread.start()
+                readers.append(thread)
+                cleanup.callback(thread.join)
+            while process.poll() is None or any(thread.is_alive() for thread in readers):
+                if errors:
+                    raise errors[0]
+                if control and control.cancelled.is_set():
+                    raise ToolError('command_cancelled', '命令已启动后取消，可能已产生部分修改，请检查输出。')
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                wake.wait(.05)
+                wake.clear()
+        if errors:
+            raise errors[0]
+    return process.returncode, summaries
 
 
 def run_process(context, command, cwd, timeout, *, kind):
@@ -51,48 +108,26 @@ def run_process(context, command, cwd, timeout, *, kind):
             raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
         timeout = min(timeout, remaining)
     started = time.monotonic()
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd),
-            env=safe_environment(),
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-            timeout=timeout,
-            shell=False,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        context.runtime.logger.error('command_error', exc, command=command, cwd=str(cwd))
-        raise ToolError('command_not_found', '命令不存在或不可执行') from exc
-    except subprocess.TimeoutExpired as exc:
-        decode = lambda value: value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value
-        context.runtime.logger.error('command_error', exc, command=command, cwd=str(cwd),
-                                     stdout=decode(exc.stdout), stderr=decode(exc.stderr), timeout=timeout)
-        raise ToolError('command_timeout', f'命令超过 {timeout} 秒上限', retryable=False) from exc
-    stdout, stderr = completed.stdout or '', completed.stderr or ''
-    context.runtime.logger.record('command_output', command=command, cwd=str(cwd),
-                                  exit_code=completed.returncode, stdout=stdout, stderr=stderr)
-    full = stdout + ('\n' if stdout and stderr else '') + stderr
     log_dir = context.store.root / 'command_logs'
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{uid(kind)}.log"
-    log_path.write_text(context.runtime.logger.journal.clean(full), encoding='utf-8')
-    limit = 12000
-    result = {
-        'command': command,
-        'cwd': str(cwd),
-        'exit_code': completed.returncode,
-        'stdout': stdout[:limit],
-        'stderr': stderr[:limit],
-        'truncated': len(stdout) > limit or len(stderr) > limit,
-        'log_path': str(log_path),
-        'elapsed_ms': round((time.monotonic() - started) * 1000),
-        'passed': completed.returncode == 0,
-    }
-    return result
-
-
-
+    logger = context.runtime.logger
+    metadata = dict(command=command, cwd=str(cwd), log_path=str(log_path))
+    try:
+        exit_code, summaries = _capture(context, command, cwd, timeout, log_path)
+    except FileNotFoundError as exc:
+        logger.error('command_error', exc, **metadata)
+        raise ToolError('command_not_found', '命令不存在或不可执行') from exc
+    except subprocess.TimeoutExpired as exc:
+        logger.error('command_error', exc, timeout=timeout, **metadata)
+        raise ToolError('command_timeout', f'命令超过 {timeout} 秒上限', retryable=False) from exc
+    except ToolError as exc:
+        logger.error('command_error', exc, **metadata)
+        raise
+    stdout, out_size = summaries['stdout']
+    stderr, err_size = summaries['stderr']
+    logger.record('command_output', **metadata, exit_code=exit_code, stdout=stdout, stderr=stderr,
+                  truncated=max(out_size, err_size) > LOG_CHUNK_SIZE)
+    return dict(**metadata, exit_code=exit_code, stdout=stdout[:TOOL_OUTPUT_LIMIT],
+                stderr=stderr[:TOOL_OUTPUT_LIMIT], truncated=max(out_size, err_size) > TOOL_OUTPUT_LIMIT,
+                elapsed_ms=round((time.monotonic() - started) * 1000), passed=exit_code == 0)

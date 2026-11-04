@@ -23,7 +23,7 @@ def runtime(tmp_path):
     output = tmp_path / "output"
     store.data.update(grants=[str(inputs)], output=str(output))
     store.save()
-    return ToolRuntime(store, Access([inputs], output, store.root), providers=[], confirm_writes=False, confirm_search=False)
+    return ToolRuntime(store, Access([inputs], output, store.root), providers=[], permission_mode="auto")
 
 
 def definition_names(runtime):

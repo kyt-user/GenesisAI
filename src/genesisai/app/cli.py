@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from contextlib import ExitStack
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -12,8 +13,11 @@ from genesisai.model.config import build_model, load_model_config
 from genesisai.model.settings import load_settings
 from genesisai.model.providers.catalog import PROVIDERS
 from genesisai.app import onboarding
-from genesisai.app.session_picker import choose_session
-from genesisai.app.select import select
+from genesisai.app.desktop_pet import DesktopPet
+from genesisai.app.session_picker import choose_session, session_entries
+from genesisai.app.select import is_interactive, select
+from genesisai.app.run_queue import QueueItem, RunQueue
+from genesisai.shared.ids import uid
 from genesisai.app.command_input import COMMANDS
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
 from genesisai.agent.loop import Runner
@@ -22,6 +26,9 @@ from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
 from genesisai.core.state.store import HostLock, Store, application_state_root, default_workspace
 from genesisai.core.tools.tool_runtime import ToolRuntime
+from genesisai.core.tools.permissions import PermissionPolicy
+from genesisai.core.tools.catalog import ToolCatalog
+from genesisai.core.tools.registry import ToolRegistry
 from genesisai.core.project_docs import AgentDocsManager
 
 
@@ -59,29 +66,24 @@ def build_cli_session(
     *,
     roots,
     output,
-    remote,
     model,
-    confirm_writes,
-    confirm_search,
+    permission_mode,
     max_rounds,
     seconds,
     on_event,
     workspace=None,
-    confirm_shell=True,
     logger=None,
     request_timeout=DEFAULT_REQUEST_TIMEOUT,
 ):
     """将一个持久化 Session 绑定到访问边界、Runtime、Runner 和 UI 快照。"""
-    store.data.update(grants=list(roots), output=str(output), remote_allowed=remote)
+    store.data.update(grants=list(roots), output=str(output))
     store.save()
     actual_workspace = Path(workspace or store.data.get('workspace') or store.workspace).resolve()
     access = Access(roots, output, store.root, workspace_root=actual_workspace)
     runtime = ToolRuntime(
         store,
         access,
-        confirm_writes=confirm_writes,
-        confirm_search=confirm_search,
-        confirm_shell=confirm_shell,
+        permission_mode=permission_mode,
         logger=logger,
     )
     inventory = runtime.inventory()
@@ -106,17 +108,6 @@ def build_cli_session(
     store.data['run_runtime']['request_timeout_seconds'] = request_timeout
     store.save()
     return CliSession(store=store, runtime=runtime, runner=runner, snapshot=snapshot)
-
-
-def apply_permission_command(runtime, text):
-    """解析 `/permissions <network|writes|shell> <ask|allow>`。"""
-    parts = text.casefold().split()
-    if len(parts) == 1:
-        return False
-    if len(parts) != 3 or parts[0] != '/permissions':
-        raise ValueError('用法：/permissions network|writes|shell ask|allow')
-    runtime.set_permission(parts[1], parts[2])
-    return True
 
 
 def load_environment(explicit=None, workspace=None):
@@ -149,10 +140,7 @@ def main(argv=None):
     parser.add_argument('--input', type=Path, action='append', default=[], help='授权读取目录/文件，可重复')
     parser.add_argument('--output', type=Path, help='新文件输出目录')
     parser.add_argument('--session', help='恢复会话 ID')
-    parser.add_argument('--allow-remote-data', action='store_true', help='允许授权资料与会话发送至远程模型，并允许据其生成公开搜索词')
-    parser.add_argument('--yes-writes', action='store_true', help='预先允许输出目录内的新文件创建/复制，仍禁止覆盖')
-    parser.add_argument('--yes-search', action='store_true', help='允许模型生成的关键词和URL发送到公开网络；否则每次网络请求需确认')
-    parser.add_argument('--yes-shell', action='store_true', help='允许当前 Session 的受控 Shell 与测试命令')
+    parser.add_argument('--permissions', choices=['user', 'auto'], help='用户审批或自动审批；自动审批可读写工作区外的宿主文件')
     docs_group = parser.add_mutually_exclusive_group()
     docs_group.add_argument('--yes-agent-docs', action='store_true', help='在已指定工作区初始化 GenesisAI 管理的 agent_docs')
     docs_group.add_argument('--no-agent-docs', action='store_true', help='本次启动不初始化 agent_docs')
@@ -191,136 +179,339 @@ def main(argv=None):
             rendered = console.export_text(clear=True)
             if rendered:
                 target.record('cli_output', text=rendered)
+        elif console.record:
+            console.export_text(clear=True)
 
     state_root = application_state_root()
     initial_environment = dict(os.environ)
+    environment_from_files = set()
     try:
-        with HostLock(state_root):
-            store = Store(state_root, args.session,
-                          workspace=None if args.session and args.workspace is None else actual_workspace)
-            actual_workspace = store.workspace
-            if not actual_workspace.is_dir():
-                raise ValueError('历史会话的工作区已不存在，请恢复原目录或新建会话')
-            load_environment(args.env_file, actual_workspace)
-            environment_from_files = {key for key in os.environ if initial_environment.get(key) != os.environ[key]}
-            session_logger = store.get_logger()
+        with HostLock(state_root), ExitStack() as lifetime:
+            pet = DesktopPet()
+            lifetime.callback(pet.close)
+            runs = RunQueue() if interactive and is_interactive(console) else None
             console.record = True
-            session_logger.record('session_open', workspace=str(actual_workspace), resumed=bool(args.session),
-                                  log_path=str(session_logger.journal.path), options=vars(args))
-            d = store.data
-            roots = [str(p.resolve(strict=True)) for p in args.input] or d['grants'] or [str(actual_workspace)]
-            if any(not Path(root).is_relative_to(actual_workspace) for root in roots):
-                raise ValueError('输入目录必须位于用户指定的工作区内')
-            output_path = (args.output or (Path(d['output']) if d['output'] else actual_workspace)).resolve()
-            if not output_path.is_relative_to(actual_workspace):
-                raise ValueError('输出目录必须位于用户指定的工作区内')
-            if any(output_path.is_relative_to(root) for root in (state_root, actual_workspace / '.genesis')):
-                raise ValueError('输出目录不能位于 .genesis 运行状态目录内')
-            output = str(output_path)
-            if args.session and (roots != d['grants'] or output != d['output']):
-                raise ValueError('恢复时不能更改授权根目录或输出目录，请创建新会话')
-            current_settings = load_settings(args.config_dir)
-            needs_config = current_settings is None or not onboarding.has_credentials(current_settings)
-            if current_settings is None and interactive and not args.prompt:
-                configured_model = load_model_config(args.config)
-                needs_config = not onboarding.env_key(configured_model.provider)
-            if needs_config and interactive and not args.prompt:
-                current_settings = onboarding.run_onboarding(
-                    console, directory=args.config_dir, initial=current_settings
-                ) or current_settings
-            if current_settings is not None and not onboarding.has_credentials(current_settings) and not interactive:
-                raise ValueError('模型配置缺少 API Key；请运行 python cli.py --auth 完成配置')
-            model, remote = (
-                build_model(args.config, settings=current_settings)
-                if current_settings is not None
-                else build_model(args.config)
-            )
-            # 即使没有授权本地输入目录，远程提供商仍会收到用户提示词。
-            # 因此应对整段远程会话取得授权，而不只是对本地文件外发授权。
-            if remote and not args.allow_remote_data:
-                if args.prompt:
-                    raise ValueError('远程模型需 --allow-remote-data 明确允许会话、授权资料和搜索词发送')
-                view.render_remote_consent(roots, getattr(model, 'model', None))
-                consent = view.request_consent('允许本次会话使用远程模型', '远程模型授权')
-                session_logger.record('startup_input', purpose='remote_data_consent', text=consent)
-                if consent != 'allow':
-                    raise ValueError('未允许远程资料发送')
-            if not AgentDocsManager.exists(actual_workspace) and not args.no_agent_docs:
-                initialize_docs = args.yes_agent_docs
-                if interactive and not initialize_docs:
+            store = None
+            model = None
+            env_workspace = None
+            docs_offered = set()
+            roots = [str(p.resolve(strict=True)) for p in args.input] or [str(actual_workspace)]
+            output = str((args.output or actual_workspace).resolve())
+            mode = args.permissions or 'user'
+            staged_skills = []
+
+            def restore_environment():
+                for key in environment_from_files:
+                    if key in initial_environment:
+                        os.environ[key] = initial_environment[key]
+                    else:
+                        os.environ.pop(key, None)
+
+            def workspace_env():
+                nonlocal env_workspace, environment_from_files
+                if env_workspace == actual_workspace:
+                    return
+                restore_environment()
+                load_environment(args.env_file, actual_workspace)
+                environment_from_files = {k for k in os.environ if os.environ[k] != initial_environment.get(k)}
+                env_workspace = actual_workspace
+
+            def check_paths(workspace, inputs, destination):
+                if any(not Path(root).resolve().is_relative_to(workspace) for root in inputs):
+                    raise ValueError('输入目录必须位于用户指定的工作区内')
+                path = Path(destination).resolve()
+                if not path.is_relative_to(workspace):
+                    raise ValueError('输出目录必须位于用户指定的工作区内')
+                if any(path.is_relative_to(root) for root in (state_root, workspace / '.genesis')):
+                    raise ValueError('输出目录不能位于 .genesis 运行状态目录内')
+
+            def leave_session():
+                nonlocal state, session_logger, model
+                if state:
+                    state.runtime.mcp.close()
+                client = getattr(model, 'client', None)
+                if client:
+                    client.close()
+                record_console_output()
+                if session_logger:
+                    session_logger.record('session_close', status=store.data['status'])
+                state = session_logger = model = None
+                view.draft = ''
+
+            def open_session(session_id, *, startup=False):
+                nonlocal store, actual_workspace, roots, output, session_logger, mode, staged_skills
+                selected = Store(state_root, session_id, workspace=args.workspace if startup else None)
+                workspace = select_workspace(selected.workspace, create=False)
+                saved = selected.data
+                inputs = saved['grants'] or [str(workspace)]
+                destination = saved['output'] or str(workspace)
+                check_paths(workspace, inputs, destination)
+                if startup and ((args.input and roots != inputs) or (args.output and output != destination)):
+                    raise ValueError('恢复时不能更改授权根目录或输出目录')
+                if session_logger:
+                    session_logger.record('session_switch', next_session_id=session_id)
+                leave_session()
+                store, actual_workspace, roots, output = selected, workspace, inputs, destination
+                mode = (args.permissions if startup else None) or saved.get('permission_mode', 'user')
+                staged_skills = list(saved['tool_runtime']['active_skills'])
+                session_logger = store.get_logger()
+                session_logger.record('session_open', resumed=True, workspace=str(workspace))
+                view.recent = []
+                view.render_opened(store)
+                pet.update(saved['status'])
+
+            def home():
+                pet.update('idle')
+                view.recent = session_entries(console, state_root, workspace=actual_workspace)[:5]
+                view.render_home(actual_workspace, view.recent)
+
+            def create_store():
+                nonlocal store, session_logger
+                store = Store(state_root, workspace=actual_workspace)
+                session_logger = store.get_logger()
+                session_logger.record('session_open', resumed=False, workspace=str(actual_workspace), options=vars(args))
+
+            def activate():
+                nonlocal state, model
+                if model is not None:
+                    return
+                workspace_env()
+                current_settings = load_settings(args.config_dir)
+                if current_settings:
+                    needs_key = not onboarding.has_credentials(current_settings)
+                else:
+                    needs_key = interactive and not onboarding.env_key(load_model_config(args.config).provider)
+                if needs_key:
+                    if not interactive:
+                        raise ValueError('模型配置缺少 API Key；请运行 python cli.py --auth 完成配置')
+                    current_settings = onboarding.run_onboarding(console, directory=args.config_dir, initial=current_settings)
+                    if current_settings is None:
+                        raise ValueError('已取消模型配置，草稿已保留')
+                selected_model, _ = (build_model(args.config, settings=current_settings)
+                                          if current_settings is not None else build_model(args.config))
+                try:
+                    if store is None:
+                        create_store()
+                    store.data['tool_runtime']['active_skills'] = staged_skills
+                    state = build_cli_session(store, roots=roots, output=output, model=selected_model,
+                                              permission_mode=mode, max_rounds=args.max_rounds,
+                                              seconds=args.seconds, request_timeout=args.request_timeout,
+                                              on_event=runs.emit if runs else view.render_progress,
+                                              workspace=actual_workspace, logger=session_logger)
+                    view.recent = []
+                    model = selected_model
+                except BaseException:
+                    client = getattr(selected_model, 'client', None)
+                    if client:
+                        client.close()
+                    raise
+
+            def submit(text, *, on_registered=None):
+                view.draft = text
+                if len(text) > 16000 or not text.strip():
+                    raise ValueError('输入不能为空或超过16000字符')
+                new = store is None
+                if store:
+                    Runner.check_available(store.data)
+                if new and args.prompt:
+                    create_store()
+                activate()
+                if new:
+                    session_logger.record('cli_input', text=text)
+                view.draft = ''
+                selector = state.runtime.prompt
+                if (interactive and not args.no_agent_docs and actual_workspace not in docs_offered
+                        and not AgentDocsManager.exists(actual_workspace)
+                        and selector.requests_development_execution(text, selector.protocols_for(text))):
+                    docs_offered.add(actual_workspace)
                     view.render_agent_docs_consent(str(actual_workspace / 'agent_docs'))
                     consent = view.request_consent('创建项目任务记录', '初始化项目记录')
                     session_logger.record('startup_input', purpose='agent_docs_consent', text=consent)
-                    initialize_docs = consent.casefold() == 'allow'
-                if initialize_docs:
-                    AgentDocsManager(actual_workspace, create=True)
-            saved_modes = d.get('permission_modes', {'network': 'ask', 'writes': 'ask', 'shell': 'ask'})
-            base_confirm_writes = False if args.yes_writes else saved_modes['writes'] == 'ask'
-            base_confirm_search = False if args.yes_search else saved_modes['network'] == 'ask'
-            base_confirm_shell = False if args.yes_shell else saved_modes['shell'] == 'ask'
-            if args.yes_writes:
-                d['permission_modes']['writes'] = 'allow'
-            if args.yes_search:
-                d['permission_modes']['network'] = 'allow'
-            if args.yes_shell:
-                d['permission_modes']['shell'] = 'allow'
-            store.save()
+                    if consent == 'allow':
+                        AgentDocsManager(actual_workspace, create=True)
+                return run_and_show(lambda: state.runner.start(text, on_registered=on_registered))
 
-            def progress(kind, value):
-                view.render_progress(kind, value)
-
-            state = build_cli_session(
-                store,
-                roots=roots,
-                output=output,
-                remote=remote,
-                model=model,
-                confirm_writes=base_confirm_writes,
-                confirm_search=base_confirm_search,
-                max_rounds=args.max_rounds,
-                seconds=args.seconds,
-                request_timeout=args.request_timeout,
-                on_event=progress,
-                workspace=actual_workspace,
-                confirm_shell=base_confirm_shell,
-                logger=session_logger,
-            )
-            view.render_startup(state.snapshot, state.store.data)
+            if args.session:
+                open_session(args.session, startup=True)
+            else:
+                check_paths(actual_workspace, roots, output)
+                if not args.prompt:
+                    home()
+            if args.yes_agent_docs and not AgentDocsManager.exists(actual_workspace):
+                AgentDocsManager(actual_workspace, create=True)
             record_console_output()
 
             def show(result):
                 d = state.store.data
+                pet.update(result['status'])
                 view.render_result(result, d)
                 if result['status'] == 'awaiting_confirmation':
                     call = d['pending'][0]
                     preview = d['calls'][call['id']]['preview']
                     view.render_confirmation(call['name'], preview)
 
+            def close_queue():
+                runs.close()
+                if runs.future is not None:
+                    runs.drain(render_progress)
+                    runs.flush_preview(view.render_progress)
+                    result = runs.finish()
+                    if result['status'] == 'awaiting_confirmation':
+                        result = state.runner.cancel()
+                    show(result)
+                if runs.pending and session_logger:
+                    session_logger.record('queue_discard', count=len(runs.pending), reason='exit')
+
+            if runs:
+                lifetime.callback(close_queue)
+
+            def render_progress(kind, value):
+                view.render_progress(kind, value)
+                if kind == 'command_output':
+                    # Flush Rich's transcript for each displayed batch, even
+                    # while the user keeps the same input prompt open.
+                    record_console_output()
+
             def run_and_show(action, message='GenesisAI 正在处理...'):
+                if runs:
+                    view.prepare_run(state.snapshot, store.data)
+                    runs.start(action)
+                    pet.update('running')
+                    return
+                pet.update('running')
                 try:
                     with view.working(message):
                         result = action()
                     show(result)
                     return result
+                except Exception:
+                    pet.update('failed')
+                    raise
                 finally:
                     record_console_output()
 
-            def apply_model_settings(new_settings):
-                nonlocal model, remote, current_settings
-                model, remote = build_model(args.config, settings=new_settings)
-                current_settings = new_settings
-                state.runner.set_model(model)
-                state.snapshot = replace(state.snapshot, model_name=getattr(model, 'model', new_settings.model))
-                view.render_model_settings(new_settings)
+            def configure_model(command):
+                nonlocal model, state
+                workspace_env()
+                current_settings = load_settings(args.config_dir)
+                if not interactive:
+                    name = current_settings.model if current_settings else load_model_config(args.config).model
+                    console.print('模型  ' + name if command == '/model' else '配置需要交互式终端；请运行 python cli.py --auth。')
+                    return
+                if command == '/model' and current_settings:
+                    updated = onboarding.select_model_only(console, current_settings, directory=args.config_dir)
+                else:
+                    updated = onboarding.run_onboarding(console, directory=args.config_dir, initial=current_settings)
+                if updated:
+                    if state:
+                        state.runtime.mcp.close()
+                    client = getattr(model, 'client', None)
+                    if client:
+                        client.close()
+                    model = state = None
+                    view.render_model_settings(updated)
 
             if args.prompt:
-                run_and_show(lambda: state.runner.start(args.prompt))
+                submit(args.prompt)
                 return 0 if state.store.data['status'] == 'completed' else 2
+
+            def print_queue():
+                console.print(f'队列{"已暂停" if runs.paused else ""} · 等待 {len(runs.pending)} 项')
+                for index, item in enumerate(runs.pending, 1):
+                    console.print(f'{index}. {item.text[:100]}', markup=False, highlight=False)
+                if runs.paused:
+                    console.print('输入 /queue resume 继续，或 /queue clear 清空。')
+
+            def enqueue(text):
+                if len(text) > 16000:
+                    raise ValueError('输入不能超过16000字符')
+                item = QueueItem(uid('queue'), text)
+                runs.pending.append(item)
+                session_logger.record('queue_add', event_run_id=None, round_num=0,
+                                      queue_id=item.id, position=len(runs.pending), text=text)
+                console.print(f'已排队 · 第 {len(runs.pending)} 项')
+
+            def start_next():
+                draft = view.draft
+                item = runs.pending[0]
+
+                def registered(run_id):
+                    item.run_id = run_id
+                    session_logger.record('queue_start', event_run_id=run_id, round_num=0, queue_id=item.id)
+
+                try:
+                    session_logger.record('queue_dispatch', event_run_id=None, round_num=0, queue_id=item.id)
+                    submit(item.text, on_registered=registered)
+                except BaseException:
+                    runs.paused = True
+                    raise
+                else:
+                    runs.starting = runs.pending.popleft()
+                finally:
+                    view.draft = draft
+
             while True:
                 try:
-                    view.bind_session(state.snapshot, state.store.data)
-                    text = view.prompt()
-                    state.runtime.logger.record('cli_input', text=getattr(view, 'last_input_raw', text))
+                    if runs and runs.future is not None:
+                        if runs.future.done():
+                            runs.drain(render_progress)
+                            runs.flush_preview(view.render_progress)
+                            stop_requested = runs.control.cancelled.is_set()
+                            try:
+                                result = runs.finish()
+                            except (ValueError, RuntimeError, OSError):
+                                pet.update('failed')
+                                if runs.paused:
+                                    print_queue()
+                                raise
+                            if stop_requested and result['status'] == 'awaiting_confirmation':
+                                result = state.runner.cancel()
+                            show(result)
+                            if runs.pending:
+                                if result['status'] == 'completed' and not runs.paused:
+                                    start_next()
+                                else:
+                                    print_queue()
+                            continue
+                        raw = view.prompt_running(runs, render_progress)
+                        if raw is None:
+                            continue
+                        text = raw.strip()
+                        command = text.casefold()
+                        session_logger.record('cli_input', text=raw)
+                        if command == '/exit':
+                            console.print(f'正在停止当前任务，退出后丢弃 {len(runs.pending)} 项排队消息。')
+                            break
+                        if command == '/cancel':
+                            runs.control.cancel()
+                            console.print('已请求取消，正在等待当前操作收尾。')
+                        elif command == '/status':
+                            console.print(f'{"取消中" if runs.control.cancelled.is_set() else runs.stage} · 等待 {len(runs.pending)} 项')
+                        elif command == '/pet':
+                            pet.show()
+                        elif command == '/queue':
+                            print_queue()
+                        elif command == '/queue clear':
+                            runs.pending.clear()
+                            console.print('排队消息已清空。')
+                        elif command.startswith('/'):
+                            console.print('运行中可使用 /pet、/status、/cancel、/queue、/queue clear 或 /exit。')
+                        elif text:
+                            enqueue(text)
+                        continue
+                    data = store.data if store else {}
+                    staged_skills = data.get('tool_runtime', {}).get('active_skills', staged_skills)
+                    snapshot = state.snapshot if state else CliSnapshot(
+                        store.id if store else '', 'GenesisAI', str(actual_workspace), roots,
+                        output, mode, 0, history_root=str(state_root))
+                    view.bind_session(snapshot, data)
+                    try:
+                        text = view.prompt()
+                    except OSError as exc:
+                        view.render_error(str(exc), title='无法读取终端输入')
+                        return 2
+                    if session_logger:
+                        session_logger.record('cli_input', text=getattr(view, 'last_input_raw', text))
                     command = text.casefold()
                     if command == '/' or (command == '/help' and interactive):
                         if interactive:
@@ -333,202 +524,193 @@ def main(argv=None):
                             continue
                         text = selected_command
                         command = text.casefold()
-                        state.runtime.logger.record('cli_menu_choice', command=command)
-                    awaiting = state.store.data['status'] == 'awaiting_confirmation'
+                        if session_logger:
+                            session_logger.record('cli_menu_choice', command=command)
+                    awaiting = data.get('status') == 'awaiting_confirmation'
+                    if command == '/pet':
+                        pet.show()
+                        continue
                     if command == '/exit':
+                        if runs and runs.pending:
+                            console.print(f'退出后丢弃 {len(runs.pending)} 项排队消息。')
                         view.render_goodbye()
                         break
+                    if not text:
+                        continue
+                    if command in {'/queue', '/queue resume', '/queue clear'}:
+                        if not runs:
+                            console.print('队列需要交互式终端。')
+                        elif command == '/queue clear':
+                            runs.pending.clear()
+                            runs.paused = False
+                            console.print('排队消息已清空。')
+                        elif command == '/queue resume' and runs.pending:
+                            Runner.check_available(data)
+                            runs.paused = False
+                            start_next()
+                        else:
+                            print_queue()
+                        continue
+                    if runs and runs.pending and (command in {'/sessions', '/recent', '/new', '/auth', '/model'}
+                            or command.startswith(('/workspace ', '/workflow '))):
+                        raise ValueError('请先处理当前会话的队列。使用 /queue 查看或 /queue clear 清空。')
+                    if runs and not command.startswith('/') and (awaiting or runs.pending):
+                        if not awaiting or command not in APPROVE_ALIASES | REJECT_ALIASES:
+                            enqueue(text)
+                            continue
+                    if command == '/workspace':
+                        console.print(str(actual_workspace), markup=False)
+                        console.print('输入 /workspace 路径 打开该工作区的首页。')
+                        continue
+                    if command in {'/sessions', '/recent', '/new'} or command.startswith('/workspace '):
+                        if store:
+                            Runner.check_available(data)
+                        if command == '/new' or command.startswith('/workspace '):
+                            workspace = actual_workspace if command == '/new' else select_workspace(
+                                Path(text.split(maxsplit=1)[1].strip('"')))
+                            leave_session()
+                            if workspace != actual_workspace:
+                                actual_workspace, roots, output = workspace, [str(workspace)], str(workspace)
+                            store = None
+                            mode = 'user'
+                            staged_skills = []
+                            home()
+                        else:
+                            if command == '/recent' and view.recent:
+                                picked = select(console, '最近对话', [(t, d) for _, t, d in view.recent])
+                                selected = view.recent[picked][0] if picked is not None else None
+                            else:
+                                selected = choose_session(console, state_root, store.id if store else None)
+                            if selected:
+                                open_session(selected)
+                        continue
+                    if command in {'/auth', '/model'}:
+                        configure_model(command)
+                        continue
+                    if command == '/history':
+                        view.render_history(data)
+                        continue
+                    if command == '/help':
+                        view.render_help()
+                        continue
+                    if command == '/status':
+                        view.render_status(data, snapshot)
+                        if runs and runs.pending:
+                            print_queue()
+                        continue
+                    if command == '/logs':
+                        if session_logger:
+                            view.render_logs(str(session_logger.journal.path))
+                        else:
+                            console.print('发送第一条消息后生成会话日志。')
+                        continue
+                    if command in {'/project', '/project status', '/project init'}:
+                        manager = AgentDocsManager(actual_workspace, create=command == '/project init')
+                        view.render_data('Agent Docs', manager.context() if manager.available else {
+                            'available': False, 'path': str(actual_workspace / 'agent_docs'), 'next': '/project init'})
+                        continue
+                    if command.split()[0] == '/permissions':
+                        parts = command.split()
+                        if len(parts) == 2:
+                            selected_mode = PermissionPolicy(parts[1]).mode
+                            if state:
+                                state.runtime.set_permission(selected_mode)
+                                state.snapshot = replace(state.snapshot, permission_mode=selected_mode)
+                            elif store:
+                                store.data['permission_mode'] = selected_mode
+                                store.save()
+                            mode = selected_mode
+                        elif len(parts) > 2:
+                            raise ValueError('用法：/permissions user 或 /permissions auto')
+                        view.render_permissions(mode)
+                        if awaiting:
+                            console.print('已有待确认操作，请使用 /approve 或 /reject。')
+                        continue
+                    if command == '/tools':
+                        inventory = state.runtime.inventory() if state else ToolCatalog(ToolRegistry(), None, store).inventory()
+                        view.render_tools(inventory)
+                        continue
+                    if command == '/budget':
+                        view.render_budget(data)
+                        continue
+                    if command == '/trace':
+                        if store:
+                            view.render_trace(store)
+                        else:
+                            console.print('当前没有运行记录。')
+                        continue
+                    if command == '/diff':
+                        view.render_changes(data.get('changes', []), data.get('run_id'))
+                        continue
+                    if command == '/details':
+                        view.toggle_details()
+                        continue
+                    if runs and command == '/cancel' and data.get('status') not in {'running', 'awaiting_confirmation', 'interrupted'}:
+                        console.print('当前没有运行中的任务。')
+                        continue
+                    if state is None:
+                        if command == '/cancel' and store:
+                            # Cancellation is local and must work without model credentials.
+                            local_state = build_cli_session(store, roots=roots, output=output,
+                                model=None, permission_mode=mode,
+                                max_rounds=args.max_rounds, seconds=args.seconds, request_timeout=args.request_timeout,
+                                on_event=view.render_progress)
+                            try:
+                                result = local_state.runner.cancel()
+                                pet.update(result['status'])
+                                view.render_result(result, data)
+                                if runs and runs.pending:
+                                    runs.paused = True
+                                    print_queue()
+                            finally:
+                                local_state.runtime.mcp.close()
+                            continue
+                        if command.startswith('/') and not command.startswith(('/skills', '/workflow')):
+                            if store and command in {'/approve', '/reject', '/resume', '/compact'}:
+                                activate()
+                            elif command in {cmd for cmd, _, _ in COMMANDS}:
+                                console.print('当前没有活动任务。')
+                                continue
+                            else:
+                                view.render_error('未知命令；使用 /help 查看可用命令。', title='未知命令')
+                                continue
+                        if awaiting and command in APPROVE_ALIASES | REJECT_ALIASES:
+                            activate()
                     if awaiting and command in APPROVE_ALIASES:
                         run_and_show(lambda: state.runner.confirm(True), '正在执行已批准操作...')
-                    elif command == '/allow network run':
-                        state.runtime.policy.allow_network_run()
-                        state.store.save()
-                        if awaiting and state.runtime.registry.get(state.store.data['pending'][0]['name']).spec.permission == 'network':
-                            run_and_show(lambda: state.runner.confirm(True), '正在执行并允许本轮后续网络请求...')
-                        else:
-                            view.render_status(state.store.data, state.snapshot)
-                    elif command in {'/allow network', '/allow writes', '/allow shell'}:
-                        capability = command.split()[1]
-                        state.runtime.set_permission(capability, 'allow')
-                        state.snapshot = replace(state.snapshot, permission_mode=state.runtime.permission_mode)
-                        pending_permission = None
-                        if awaiting and state.store.data['pending']:
-                            pending_name = state.store.data['pending'][0]['name']
-                            pending_permission = state.runtime.registry.get(pending_name).spec.permission
-                        aliases = {'network': 'network', 'writes': 'write', 'shell': 'shell'}
-                        if awaiting and pending_permission == aliases[capability]:
-                            run_and_show(lambda: state.runner.confirm(True), f'正在执行并允许本会话后续{capability}操作...')
-                        else:
-                            view.render_permissions(confirm_writes=state.runtime.confirm_writes, confirm_search=state.runtime.confirm_search, confirm_shell=state.runtime.confirm_shell)
                     elif awaiting and command in REJECT_ALIASES:
                         run_and_show(lambda: state.runner.confirm(False), '正在拒绝待确认操作...')
-                    elif command == '/help':
-                        view.render_help()
-                    elif command == '/status':
-                        view.render_status(state.store.data, state.snapshot)
-                    elif command == '/budget':
-                        view.render_budget(state.store.data)
                     elif command == '/compact':
                         summary = state.runner.context_budgeter.compact(force=True)
                         view.render_data('Context Compact', {'summary': summary, 'report': state.store.data['run_runtime'].get('context_report', {})})
-                    elif command == '/trace':
-                        view.render_trace(state.store)
-                    elif command == '/details':
-                        view.toggle_details()
-                    elif command == '/history':
-                        view.render_history(state.store.data['messages'])
-                    elif command == '/model':
-                        if not interactive:
-                            view.render_model(state.snapshot)
-                        elif current_settings is None:
-                            updated = onboarding.run_onboarding(console, directory=args.config_dir)
-                            if updated is not None:
-                                apply_model_settings(updated)
-                        else:
-                            updated = onboarding.select_model_only(console, current_settings, directory=args.config_dir)
-                            if updated is not None:
-                                apply_model_settings(updated)
-                    elif command == '/auth':
-                        if interactive:
-                            updated = onboarding.run_onboarding(console, directory=args.config_dir, initial=current_settings)
-                            if updated is not None:
-                                apply_model_settings(updated)
-                        else:
-                            view.render_error('配置需要交互式终端；请运行 python cli.py --auth。', title='模型配置')
-                    elif command.startswith('/permissions'):
-                        apply_permission_command(state.runtime, text)
-                        state.snapshot = replace(state.snapshot, permission_mode=state.runtime.permission_mode)
-                        view.render_permissions(
-                            confirm_writes=state.runtime.confirm_writes,
-                            confirm_search=state.runtime.confirm_search,
-                            confirm_shell=state.runtime.confirm_shell,
-                        )
-                    elif command == '/tools':
-                        view.render_tools(state.runtime.inventory())
-                    elif command in {'/project', '/project status'}:
-                        manager = AgentDocsManager(actual_workspace)
-                        value = manager.context() if manager.available else {
-                            'available': False,
-                            'path': str(actual_workspace / 'agent_docs'),
-                            'next': '/project init',
-                        }
-                        view.render_data('Agent Docs', value)
-                    elif command == '/project init':
-                        manager = AgentDocsManager(actual_workspace, create=True)
-                        state.snapshot = replace(state.snapshot, agent_docs_status=manager.summary().get('active_status') or '就绪')
-                        view.render_data('Agent Docs · 已初始化', manager.summary())
-                    elif command == '/sessions':
-                        state.runner.ensure_available()
-                        selected_id = choose_session(console, state_root, state.store.id)
-                        if selected_id is None:
-                            continue
-                        restored = Store(state_root, selected_id)
-                        selected_workspace = select_workspace(restored.workspace, create=False)
-                        selected_roots = restored.data['grants'] or [str(selected_workspace)]
-                        selected_output = Path(restored.data['output'] or selected_workspace).resolve()
-                        if any(not Path(p).resolve().is_relative_to(selected_workspace) for p in selected_roots):
-                            raise ValueError('历史会话的授权目录已越出工作区')
-                        if (not selected_output.is_relative_to(selected_workspace)
-                                or selected_output.is_relative_to(state_root)
-                                or selected_output.is_relative_to(selected_workspace / '.genesis')):
-                            raise ValueError('历史会话的输出目录无效')
-                        previous_environment = dict(os.environ)
-                        selected_model = None
-                        try:
-                            for key in environment_from_files:
-                                if key in initial_environment:
-                                    os.environ[key] = initial_environment[key]
-                                else:
-                                    os.environ.pop(key, None)
-                            load_environment(args.env_file, selected_workspace)
-                            selected_model, selected_remote = (build_model(args.config, settings=current_settings)
-                                if current_settings is not None else build_model(args.config))
-                            if selected_remote and not (args.allow_remote_data or restored.data['remote_allowed']):
-                                view.render_remote_consent(selected_roots, getattr(selected_model, 'model', None))
-                                consent = view.request_consent('允许所选会话使用远程模型', '远程模型授权')
-                                state.runtime.logger.record('startup_input', purpose='restore_remote_consent', text=consent)
-                                if consent != 'allow':
-                                    raise ValueError('已取消恢复远程会话')
-                            modes = restored.data['permission_modes']
-                            selected_state = build_cli_session(
-                                restored, roots=selected_roots, output=str(selected_output), remote=selected_remote,
-                                model=selected_model, confirm_writes=modes['writes'] == 'ask',
-                                confirm_search=modes['network'] == 'ask', confirm_shell=modes['shell'] == 'ask',
-                                max_rounds=args.max_rounds, seconds=args.seconds, request_timeout=args.request_timeout,
-                                on_event=progress, workspace=selected_workspace)
-                        except Exception:
-                            selected_client = getattr(selected_model, 'client', None)
-                            if selected_client is not None:
-                                selected_client.close()
-                            for key in set(os.environ) | set(previous_environment):
-                                if key in previous_environment:
-                                    os.environ[key] = previous_environment[key]
-                                else:
-                                    os.environ.pop(key, None)
-                            raise
-                        environment_from_files = {key for key in os.environ if initial_environment.get(key) != os.environ[key]}
-                        old_logger = state.runtime.logger
-                        record_console_output(old_logger)
-                        old_logger.record('session_switch', next_session_id=selected_id)
-                        previous_client = getattr(model, 'client', None)
-                        if previous_client is not None and selected_model is not model:
-                            previous_client.close()
-                        state = selected_state
-                        actual_workspace, roots, output = selected_workspace, selected_roots, str(selected_output)
-                        model, remote = selected_model, selected_remote
-                        session_logger = state.runtime.logger
-                        session_logger.record('session_open', workspace=str(actual_workspace), resumed=True)
-                        view.render_startup(state.snapshot, state.store.data)
-                        view.render_status(state.store.data, state.snapshot)
-                    elif command == '/new':
-                        state.runner.ensure_available()
-                        old_logger = state.runtime.logger
-                        record_console_output(old_logger)
-                        new_store = Store(state_root, workspace=actual_workspace)
-                        new_output = output
-                        state = build_cli_session(
-                            new_store,
-                            roots=roots,
-                            output=new_output,
-                            remote=remote,
-                            model=model,
-                            confirm_writes=True,
-                            confirm_search=True,
-                            max_rounds=args.max_rounds,
-                            seconds=args.seconds,
-                            request_timeout=args.request_timeout,
-                            on_event=progress,
-                            workspace=actual_workspace,
-                            confirm_shell=True,
-                        )
-                        old_logger.record('session_switch', next_session_id=state.store.id)
-                        session_logger = state.runtime.logger
-                        state.runtime.logger.record('session_open', workspace=str(actual_workspace), resumed=False)
-                        view.render_startup(state.snapshot, state.store.data)
-                    elif command == '/logs':
-                        state.runtime.logger.record('log_location', path=str(state.runtime.logger.journal.path))
-                        view.render_logs(str(state.runtime.logger.journal.path))
                     elif command.startswith('/skills'):
-                        registry = SkillRegistry(actual_workspace, state.runtime.registry)
+                        registry = SkillRegistry(actual_workspace, state.runtime.registry if state else ToolRegistry())
                         parts = text.split(maxsplit=2)
                         action = parts[1].casefold() if len(parts) > 1 else 'list'
                         if action == 'list':
-                            value = {'skills': registry.search(), 'loaded': state.store.data['tool_runtime']['active_skills'], 'diagnostics': registry.diagnostics}
+                            value = {'skills': registry.search(), 'loaded': staged_skills, 'diagnostics': registry.diagnostics}
                         elif action == 'search':
                             value = registry.search(parts[2] if len(parts) > 2 else '')
                         elif action == 'show' and len(parts) > 2:
                             value = registry.describe(parts[2], include_content=True)
                         elif action == 'load' and len(parts) > 2:
                             names = [item.strip() for item in parts[2].split(',') if item.strip()]
-                            value = registry.load(names, state.store.data['tool_runtime']['active_skills'])
-                            state.store.data['tool_runtime']['active_skills'] = value; state.store.save()
+                            value = registry.load(names, staged_skills)
+                            staged_skills = value
+                            if store:
+                                store.data['tool_runtime']['active_skills'] = value
+                                store.save()
                         elif action == 'unload':
-                            current = state.store.data['tool_runtime']['active_skills']
+                            current = staged_skills
                             value = [] if len(parts) < 3 else [item for item in current if item != parts[2]]
-                            state.store.data['tool_runtime']['active_skills'] = value; state.store.save()
+                            staged_skills = value
+                            if store:
+                                store.data['tool_runtime']['active_skills'] = value
+                                store.save()
                         else:
                             raise ValueError('用法：/skills list|search 词|show 名称|load 名称[,名称]|unload [名称]')
-                        state.snapshot = replace(state.snapshot, skill_name=','.join(state.store.data['tool_runtime']['active_skills']) or None)
+                        if state:
+                            state.snapshot = replace(state.snapshot, skill_name=','.join(staged_skills) or None)
                         view.render_data('Skills', value)
                     elif command.startswith('/workflow'):
                         registry = WorkflowRegistry(actual_workspace)
@@ -541,9 +723,7 @@ def main(argv=None):
                             except WorkflowError as exc:
                                 view.render_data('Workflows', {'error': str(exc), 'workflows': registry.summary()})
                             else:
-                                run_and_show(lambda: state.runner.start(prompt), '正在展开工作流...')
-                    elif command == '/diff':
-                        view.render_changes(state.store.data.get('changes', []), state.store.data.get('run_id'))
+                                submit(prompt)
                     elif command == '/approve':
                         run_and_show(lambda: state.runner.confirm(True), '正在执行已批准操作...')
                     elif command == '/reject':
@@ -552,20 +732,29 @@ def main(argv=None):
                         run_and_show(state.runner.resume, '正在恢复会话...')
                     elif command == '/cancel':
                         show(state.runner.cancel())
+                        if runs and runs.pending:
+                            runs.paused = True
+                            print_queue()
                     elif command.startswith('/'):
                         view.render_error('未知命令；使用 /help 查看可用命令。', title='未知命令')
                     elif awaiting and text:
                         view.render_error('请先处理确认。输入 /approve 或“确认”仅批准当前操作；/reject 拒绝，/cancel 取消。其他语句不会自动批准。')
-                        pending = state.store.data['pending'][0]
-                        view.render_confirmation(pending['name'], state.store.data['calls'].get(pending['id'], {}).get('preview', {}))
+                        pending = data['pending'][0]
+                        view.render_confirmation(pending['name'], data['calls'].get(pending['id'], {}).get('preview', {}))
                     elif text:
-                        run_and_show(lambda: state.runner.start(text))
-                except (EOFError, KeyboardInterrupt):
-                    state.runtime.logger.record('cli_closed', reason='eof_or_interrupt')
+                        submit(text)
+                except (EOFError, KeyboardInterrupt) as exc:
+                    if isinstance(exc, KeyboardInterrupt) and runs and runs.future is not None:
+                        runs.control.cancel()
+                        console.print('已请求取消当前任务。')
+                        continue
+                    if session_logger:
+                        session_logger.record('cli_closed', reason='eof_or_interrupt')
                     view.render_goodbye()
                     break
-                except (ValueError, SkillError, OSError) as exc:
-                    state.runtime.logger.error('cli_error', exc)
+                except (ValueError, RuntimeError, SkillError, OSError) as exc:
+                    if session_logger:
+                        session_logger.error('cli_error', exc)
                     view.render_error(str(exc))
                 finally:
                     record_console_output()
@@ -576,6 +765,13 @@ def main(argv=None):
         view.render_error(str(exc), title='启动失败')
         return 2
     finally:
+        if environment_from_files:
+            restore_environment()
+        if state:
+            state.runtime.mcp.close()
+            client = getattr(state.runner.model, 'client', None)
+            if client:
+                client.close()
         if session_logger is not None:
             record_console_output()
             session_logger.record('session_close', status=session_logger.store.data['status'])

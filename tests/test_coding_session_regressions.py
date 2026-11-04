@@ -18,8 +18,7 @@ def test_approved_code_change_and_tests_finish_then_allow_followup(tmp_path):
     workspace, _, _, store, runtime = development_env(tmp_path)
     source = workspace / 'calc.py'
     source.write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
-    runtime.set_permission('writes', 'ask')
-    runtime.set_permission('shell', 'ask')
+    runtime.set_permission("user")
     model = FakeModel(
         tool_response('read_files', {'paths': ['calc.py', 'agent_docs/index.json']}, 'read'),
         tool_response('editor', {'operation': 'patch', 'path': 'calc.py',

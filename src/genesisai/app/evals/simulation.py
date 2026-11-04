@@ -71,7 +71,7 @@ def make_runtime(workspace, run_root, *, providers=None, network=None):
     store = Store(state, workspace=workspace)
     store.data.update(grants=[str(workspace)], output=str(output), run_id="run_simulation")
     store.save()
-    runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=providers, network=network, confirm_writes=False, confirm_search=False, confirm_shell=False)
+    runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=providers, network=network, permission_mode="auto")
     return store, runtime, output
 
 
@@ -102,11 +102,7 @@ def runtime_report(store, runtime):
         "tokens": (data.get("usage") or {}).get("total_tokens", 0),
         "prompt_hashes": run.get("prompt_hashes", {}),
         "active_skills": list(data.get("tool_runtime", {}).get("active_skills", [])),
-        "permissions": {
-            "network": "ask" if runtime.confirm_search else "allow",
-            "writes": "ask" if runtime.confirm_writes else "allow",
-            "shell": "ask" if runtime.confirm_shell else "allow",
-        },
+        "permissions": runtime.permission_mode,
         "recovery_counts": run.get("recovery_counts", {}),
         "calls": [
             {"id": identifier, "name": item.get("call", {}).get("name"), "state": item.get("state")}
@@ -149,7 +145,7 @@ def run_offline_case(case, workspace, run_root):
         query = require_ok(call(runtime, "fetch_web_content", {"query": "Apple event today"}))
         fetched = require_ok(call(runtime, "fetch_web_content", {"url": query["hits"][0]["url"]}))
         state = store.data["run_runtime"]
-        checks = {"candidate": state["candidate_count"] == 1, "fetched": state["fetched_count"] == 1, "evidence": bool(state["evidence_refs"]), "source": bool(fetched["source_refs"]), "session_allow": not runtime.confirm_search}
+        checks = {"candidate": state["candidate_count"] == 1, "fetched": state["fetched_count"] == 1, "evidence": bool(state["evidence_refs"]), "source": bool(fetched["source_refs"]), "session_allow": runtime.permission_mode == "auto"}
     elif identifier == "case_04_skill":
         skill = SkillRegistry(workspace, runtime.registry).describe("project_check", include_content=True)
         test = require_ok(call(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))

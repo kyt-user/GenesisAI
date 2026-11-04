@@ -28,9 +28,7 @@ def build_runtime(workspace):
         store,
         Access([inputs], output, store.root, workspace_root=workspace),
         providers=[],
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
     )
 
 
@@ -181,17 +179,31 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
         return transport
 
     bridge = McpBridge(tmp_path, runtime.registry, runtime.loader, transport_factory=factory)
-    bridge.connect_all()
+    bridge.configure({})
+    runtime.set_permission("user")
+    connect = tool_call("connect_mcp", {"server": "fixture"}, "connect")
+    assert runtime.execute(connect)["pending"] and not transports
+    assert runtime.execute(connect, approved=runtime.store.data["calls"]["connect"]["digest"])["ok"]
+    assert len(transports) == 1
 
     names = {item["function"]["name"] for item in runtime.definitions()}
     assert "mcp_fixture_echo" in names
     descriptor = runtime.registry.get("mcp_fixture_echo")
     assert descriptor.category == "mcp"
-    assert descriptor.spec.permission == "read"
+    assert descriptor.spec.permission == "network"
 
-    result = runtime.execute(tool_call("mcp_fixture_echo", {"text": "hi"}, "mcp"))
+    call = tool_call("mcp_fixture_echo", {"text": "hi"}, "mcp")
+    assert runtime.execute(call)["pending"]
+    result = runtime.execute(call, approved=runtime.store.data["calls"]["mcp"]["digest"])
     assert result["ok"]
     assert result["data"]["text"] == "echo:hi"
+
+    pending = tool_call("mcp_fixture_echo", {"text": "again"}, "mcp2")
+    assert runtime.execute(pending)["pending"]
+    bridge.close()
+    assert len(transports) == 1
+    assert runtime.execute(pending, approved=runtime.store.data["calls"]["mcp2"]["digest"])["ok"]
+    assert len(transports) == 2
 
     # refresh（每次下发都会触发）必须保留动态注册。
     runtime.catalog.refresh()
@@ -205,10 +217,11 @@ def test_mcp_write_server_maps_permission(tmp_path):
     bridge = McpBridge(
         tmp_path, runtime.registry, runtime.loader, transport_factory=lambda spec: FakeTransport(spec)
     )
-    bridge.connect_all()
+    bridge.configure({})
+    bridge.ensure_connected("fixture")
 
     descriptor = runtime.registry.get("mcp_fixture_echo")
-    assert descriptor.spec.permission == "write"
+    assert descriptor.spec.permission == "network"
     assert descriptor.spec.side_effect is True
 
 
@@ -222,7 +235,7 @@ def test_mcp_invalid_config_is_reported(tmp_path):
     bridge = McpBridge(
         tmp_path, runtime.registry, runtime.loader, transport_factory=lambda spec: FakeTransport(spec)
     )
-    bridge.connect_all()
+    bridge.configure({})
     assert bridge.servers == []
     assert bridge.diagnostics
 
@@ -237,7 +250,9 @@ def test_mcp_connection_failure_is_isolated(tmp_path):
         runtime.loader,
         transport_factory=lambda spec: FakeTransport(spec, fail=True),
     )
-    bridge.connect_all()
+    bridge.configure({})
+    with pytest.raises(McpError):
+        bridge.ensure_connected("fixture")
 
-    assert bridge.diagnostics and bridge.servers == []
+    assert bridge.servers == []
     assert "mcp_fixture_echo" not in {item["function"]["name"] for item in runtime.definitions()}

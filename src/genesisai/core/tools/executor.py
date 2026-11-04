@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from genesisai.shared.results import error_result
+from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.security import ToolError
 from genesisai.core.tools.base import SchemaConfigError, SchemaValidationError, Tool
 
@@ -50,19 +51,22 @@ class ToolExecutor:
             implementation = self.loader.load(descriptor)
             preview = implementation.prepare(self.context, args)
 
-            confirmation_required = self.policy.requires_confirmation(descriptor.spec) or (
+            confirmation_required = self.policy.requires_confirmation(descriptor, args) or (
                 prior is not None and prior.get("state") == "prepared"
             )
             if confirmation_required:
                 if not isinstance(preview, dict):
                     raise ToolError("permission_error", "需要确认的工具没有提供资源预览")
+                preview = {**preview, "args": args}
                 if approved is None:
-                    if not prior or prior.get("state") != "prepared":
+                    if not prior or prior.get("state") != "prepared" or prior.get("expires", 0) < time.time():
                         digest_value, expires = self.policy.freeze(preview)
                         self.ledger.prepare(call, preview, digest_value, expires)
                     return {"pending": True, "call_id": call["id"], "preview": preview}
                 self.policy.validate(preview, prior, approved)
 
+            if cancellation_requested():
+                raise ToolError('user_cancelled', '任务已取消')
             self.ledger.start(call)
             self.ledger.store.data['calls'][call['id']]['executed'] = True
             execution_started = True
@@ -87,7 +91,7 @@ class ToolExecutor:
                 current.get("state") == "started"
                 and descriptor is not None
                 and descriptor.spec.side_effect
-                and getattr(exc, "error_type", None) != "command_not_found"
+                and getattr(exc, "error_type", None) not in {"command_not_found", "command_cancelled"}
                 and target
                 and Path(target).exists()
             ):
@@ -126,6 +130,7 @@ class ToolExecutor:
                         "call": call,
                         "state": "unknown",
                         "result": result,
+                        "executed": True,
                     }
                     try:
                         self.ledger.store.save()

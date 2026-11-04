@@ -63,9 +63,7 @@ def test_runner_passes_final_stream_token_limit(tmp_path):
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
         providers=[],
     )
 
@@ -87,3 +85,50 @@ def test_runner_passes_final_stream_token_limit(tmp_path):
 
     assert response.content == "done"
     assert model.options["max_tokens"] == 600
+
+
+def test_ordinary_cli_answer_is_visible_before_final_chunk(tmp_path):
+    from test_development_continuation import development_env
+
+    _, _, _, store, runtime = development_env(tmp_path)
+    sink = StringIO()
+    view = CliView(Console(file=sink, force_terminal=False))
+
+    class Model:
+        def stream_chat(self, messages, tools=None, **options):
+            assert any(tool['function']['name'] == 'read_files' for tool in tools)
+            yield '王维'
+            assert '王维' in sink.getvalue() and '鹿柴' not in sink.getvalue()
+            yield '的《鹿柴》。'
+            yield Response(content='王维的《鹿柴》。', finish_reason='stop')
+
+    with view.working():
+        result = Runner(Model(), runtime, on_event=view.render_progress).start('推荐一首古诗')
+    view.render_result(result, store.data)
+    assert result['status'] == 'completed'
+    assert sink.getvalue().count('王维的《鹿柴》。') == 1
+    assert store.data['messages'][-1]['content'] == '王维的《鹿柴》。'
+
+
+def test_stream_assembles_fragmented_call_alongside_reasoning_and_usage():
+    def chunk(delta, finish=None):
+        return SimpleNamespace(usage=None, choices=[SimpleNamespace(delta=delta, finish_reason=finish)])
+
+    def delta(reasoning, text, name, arguments, call_id=None):
+        call = SimpleNamespace(index=0, id=call_id, function=SimpleNamespace(name=name, arguments=arguments))
+        return SimpleNamespace(reasoning_content=reasoning, content=text, tool_calls=[call])
+
+    chunks = [
+        chunk(delta('private', '正在读取。', 'read_', '{"paths":', 'c1')),
+        chunk(delta(None, None, 'files', '["main.py"]}'), 'tool_calls'),
+        SimpleNamespace(choices=[], usage=SimpleNamespace(model_dump=lambda: {'total_tokens': 12})),
+    ]
+    model = object.__new__(DeepSeekClient)
+    model.model, model.generation = 'fixture', {}
+    model.reasoning_enabled, model.reasoning_effort = True, 'low'
+    model.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: iter(chunks))))
+    reasoning, text, response = model.stream_chat([], tools=[{'type': 'function'}])
+    assert reasoning == ('reasoning', 'private') and text == '正在读取。'
+    call, = response.tool_calls
+    assert (call.id, call.name, call.arguments) == ('c1', 'read_files', '{"paths":["main.py"]}')
+    assert response.finish_reason == 'tool_calls' and response.usage['total_tokens'] == 12

@@ -84,10 +84,11 @@ class Implementation:
             raise ToolError("invalid_path", "路径必须是文件或目录")
         results, total_todos = [], []
         for f in files:
-            rel = str(f.relative_to(context.access.workspace))
             try:
+                f = context.access.workspace_path(f, must_exist=True)
+                rel = context.access.display_path(f)
                 text = f.read_text(encoding="utf-8", errors="replace")
-            except (OSError, UnicodeError):
+            except (ToolError, OSError, UnicodeError):
                 continue
             if len(text) > _MAX_FILE_SIZE:
                 text = text[:_MAX_FILE_SIZE]

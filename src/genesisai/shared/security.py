@@ -29,6 +29,7 @@ def safe_name(path):
 
 class Access:
     def __init__(self, roots, output, state_root, *, workspace_root=None):
+        self.host_access = False
         self.roots = [Path(p).resolve(strict=True) for p in roots]
         self.output = Path(output).resolve()
         self.state_root = Path(state_root).resolve()
@@ -39,8 +40,15 @@ class Access:
         if self.output == self.state_root:
             raise ValueError('输出目录不能等于程序状态目录')
 
+    def _file_path(self, value):
+        path = Path(value)
+        if os.name == 'nt' and path.drive.startswith('\\\\'):
+            if not self.host_access or path.drive.startswith(('\\\\.\\', '\\\\?\\')):
+                raise ToolError('permission_denied', '当前文件权限不允许该网络或设备路径')
+        return path
+
     def read(self, value):
-        raw = Path(value)
+        raw = self._file_path(value)
         if not raw.is_absolute():
             if not self.roots:
                 raise ToolError('permission_denied', '没有授权输入目录')
@@ -52,37 +60,40 @@ class Access:
         path = raw.resolve(strict=True)
         if any(path.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能读取程序状态文件')
-        if path.name == '.env' or path.name.startswith('.env.'):
+        if path.name.casefold() == '.env' or path.name.casefold().startswith('.env.'):
             raise ToolError('permission_denied', '不向工具开放密钥文件')
-        if not any(path == root or path.is_relative_to(root) for root in [*self.roots, self.output]):
+        if not self.host_access and not any(path == root or path.is_relative_to(root) for root in [*self.roots, self.output]):
             raise ToolError('permission_denied', '路径超出授权范围')
         return path
 
+    def display_path(self, path):
+        return str(path.relative_to(self.workspace) if path.is_relative_to(self.workspace) else path)
+
     def workspace_path(self, value, *, must_exist=False, allow_directory=False):
-        raw = Path(value)
+        raw = self._file_path(value)
         target = raw.resolve(strict=must_exist) if raw.is_absolute() else (self.workspace / raw).resolve(strict=must_exist)
         safe_name(target)
-        if not target.is_relative_to(self.workspace) or (target == self.workspace and not allow_directory):
+        if (not self.host_access and not target.is_relative_to(self.workspace)) or (target == self.workspace and not allow_directory):
             raise ToolError('permission_denied', '路径超出工作区')
         if any(target.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能操作程序状态文件')
-        if target.name == '.env' or target.name.startswith('.env.'):
+        if target.name.casefold() == '.env' or target.name.casefold().startswith('.env.'):
             raise ToolError('permission_denied', '不能操作密钥文件')
         if must_exist and target.is_dir() and not allow_directory:
             raise ToolError('invalid_path', '目标必须是文件')
         return target
 
     def write(self, value):
-        relative = Path(value)
-        if relative.is_absolute() or '..' in relative.parts:
+        relative = self._file_path(value)
+        if not self.host_access and (relative.is_absolute() or '..' in relative.parts):
             raise ToolError('permission_denied', '输出只能使用输出目录内的相对路径')
         safe_name(relative)
         target = (self.output / relative).resolve()
-        if target == self.output or not target.is_relative_to(self.output):
+        if target == self.output or (not self.host_access and not target.is_relative_to(self.output)):
             raise ToolError('permission_denied', '输出路径越界')
         if any(target.is_relative_to(root) for root in self._state_roots):
             raise ToolError('permission_denied', '不能操作程序状态文件')
-        if target.name == '.env' or target.name.startswith('.env.'):
+        if target.name.casefold() == '.env' or target.name.casefold().startswith('.env.'):
             raise ToolError('permission_denied', '不能操作密钥文件')
         if target.exists():
             raise ToolError('target_exists', '目标已存在；请使用新文件名')

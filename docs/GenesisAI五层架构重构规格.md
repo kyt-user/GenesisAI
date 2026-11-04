@@ -2,7 +2,7 @@
 
 日期：2026-10-04
 状态：规格已定稿；S0–S7 代码实施已完成（§11 为回填的实施结果）
-适用范围：`src/genesisai/`（不含 `cline_sdk/`）
+适用范围：`src/genesisai/`
 关系：本文与《GenesisAI升级路线.md》配套。**本文覆盖升级路线 §8「Tool Catalog 与全量下发」的全部内容**（该机制因产品约束变更而作废，见 §1.2）。
 
 ---
@@ -11,14 +11,14 @@
 
 ### 1.1 本轮锁定项
 
-| # | 决策 | 含义 |
-| --- | --- | --- |
-| D1 | **Route B：架构全面对齐 Cline 五层** | `src/genesisai` 重组成 `shared ← model ← agent ← core ← app` 单向依赖，并用机械防线强制 |
-| D2 | **只面向 DeepSeek / Qwen 等云模型** | 上下文足够大，延迟加载工具（按需加载）失去存在理由；首版移除 Ollama / 百炼 |
-| D3 | **工具面：引入外部扩展缝** | 少量通用内核 + 新建 Skills(可执行) / Rules / MCP / Workflows 四条扩展缝承载领域能力 |
-| D4 | Python 惯用命名 | 目标目录/符号用 Python 惯用名（`model`/`agent`），不照搬 Cline 的 TS 名（`llms`/`agents`） |
-| D5 | 工具定义落位 `core/extensions/tools/` | 原 `capabilities/` 迁入该路径 |
-| D6 | 全量下发 | 每次模型请求下发全部启用工具的完整定义，不再有 Core/Active 两阶段 |
+| #  | 决策                                       | 含义                                                                                               |
+| -- | ------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| D1 | **Route B：架构全面对齐 Cline 五层** | `src/genesisai` 重组成 `shared ← model ← agent ← core ← app` 单向依赖，并用机械防线强制    |
+| D2 | **只面向 DeepSeek / Qwen 等云模型**  | 上下文足够大，延迟加载工具（按需加载）失去存在理由；首版移除 Ollama / 百炼                         |
+| D3 | **工具面：引入外部扩展缝**           | 少量通用内核 + 新建 Skills(可执行) / Rules / MCP / Workflows 四条扩展缝承载领域能力                |
+| D4 | Python 惯用命名                            | 目标目录/符号用 Python 惯用名（`model`/`agent`），不照搬 Cline 的 TS 名（`llms`/`agents`） |
+| D5 | 工具定义落位 `core/extensions/tools/`    | 原 `capabilities/` 迁入该路径                                                                    |
+| D6 | 全量下发                                   | 每次模型请求下发全部启用工具的完整定义，不再有 Core/Active 两阶段                                  |
 
 ### 1.2 对既有文档的冲击（Supersede）
 
@@ -32,20 +32,20 @@
 
 ### 2.1 模块体量（非 `capabilities` 部分）
 
-| 模块 | 文件 | 行数 | 说明 |
-| --- | --- | --- | --- |
-| `agent/` | 6 | 1340 | `runner.py` 822 行为上帝类 |
-| `app/` | 4 | 936 | `cli.py` 440、`terminal_view.py` 456 |
-| `capabilities/` | 148 | 2696 | 50 个工具目录（filesystem 11 / office 11 / git 8 / memory_tools 7 / novel 5 / shell 4 / web 4） |
-| `evals/` | 4 | 726 | 仿真与验收数据集 |
-| `memory/` | 10 | 1381 | |
-| `model/` | 7 | 339 | 已是干净契约（`base.py` 仅 `ModelClient` ABC） |
-| `project_docs/` | 2 | 371 | `agent_docs/` 托管式项目工作记忆 |
-| `prompt/` | 3 | 502 | `composer.py` + `context_budgeter.py` |
-| `runtime/` | 28 | 1144 | 工具引擎 + 6 个元工具 |
-| `shared/` | 5 | 218 | |
-| `skills/` | 2 | 107 | 只读 Markdown 提示，不可执行 |
-| `state/` | 3 | 351 | |
+| 模块              | 文件 | 行数 | 说明                                                                                            |
+| ----------------- | ---- | ---- | ----------------------------------------------------------------------------------------------- |
+| `agent/`        | 6    | 1340 | `runner.py` 822 行为上帝类                                                                    |
+| `app/`          | 4    | 936  | `cli.py` 440、`terminal_view.py` 456                                                        |
+| `capabilities/` | 148  | 2696 | 50 个工具目录（filesystem 11 / office 11 / git 8 / memory_tools 7 / novel 5 / shell 4 / web 4） |
+| `evals/`        | 4    | 726  | 仿真与验收数据集                                                                                |
+| `memory/`       | 10   | 1381 |                                                                                                 |
+| `model/`        | 7    | 339  | 已是干净契约（`base.py` 仅 `ModelClient` ABC）                                              |
+| `project_docs/` | 2    | 371  | `agent_docs/` 托管式项目工作记忆                                                              |
+| `prompt/`       | 3    | 502  | `composer.py` + `context_budgeter.py`                                                       |
+| `runtime/`      | 28   | 1144 | 工具引擎 + 6 个元工具                                                                           |
+| `shared/`       | 5    | 218  |                                                                                                 |
+| `skills/`       | 2    | 107  | 只读 Markdown 提示，不可执行                                                                    |
+| `state/`        | 3    | 351  |                                                                                                 |
 
 ### 2.2 跨模块依赖图（实测）
 
@@ -66,28 +66,28 @@ evals       -> 全部                                 ← 顶层，合法
 
 ### 2.3 违规边清单（精确到 file:line，必须清除）
 
-| 编号 | 位置 | 现依赖 | 目标修法 |
-| --- | --- | --- | --- |
-| V1 | `shared/changes.py:9` | `from genesisai.state.store import sha, uid` | `sha/uid` 下沉到 `shared/ids.py`，`state.store` 改为引用它 |
-| V2 | `shared/filetypes.py:7` | `from genesisai.capabilities.filesystem.shared import TEXT_SUFFIXES` | 常量下沉到 `shared/filetypes.py`，工具侧改为引用它 |
-| V3 | `state/store.py:39,126,130` | `from genesisai.agent.research import ResearchController` | `state` 不再持有研究编排；研究状态由 `agent` 经端口写入 |
-| V4 | `state/store.py:215` | `from genesisai.agent.state_machine import RUN_STATES` | `RUN_STATES` 常量下沉到 `shared`，双方共用 |
-| V5 | `runtime/tool_runtime.py:14-18` | `capabilities.web.*` + `agent.research` | 网络提供方由 `core` 注入；`ResearchController` 移除出运行时装配 |
+| 编号 | 位置                              | 现依赖                                                                 | 目标修法                                                            |
+| ---- | --------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------- |
+| V1   | `shared/changes.py:9`           | `from genesisai.state.store import sha, uid`                         | `sha/uid` 下沉到 `shared/ids.py`，`state.store` 改为引用它    |
+| V2   | `shared/filetypes.py:7`         | `from genesisai.capabilities.filesystem.shared import TEXT_SUFFIXES` | 常量下沉到 `shared/filetypes.py`，工具侧改为引用它                |
+| V3   | `state/store.py:39,126,130`     | `from genesisai.agent.research import ResearchController`            | `state` 不再持有研究编排；研究状态由 `agent` 经端口写入         |
+| V4   | `state/store.py:215`            | `from genesisai.agent.state_machine import RUN_STATES`               | `RUN_STATES` 常量下沉到 `shared`，双方共用                      |
+| V5   | `runtime/tool_runtime.py:14-18` | `capabilities.web.*` + `agent.research`                            | 网络提供方由 `core` 注入；`ResearchController` 移除出运行时装配 |
 
 > 其余现边（如 `capabilities→memory/state/runtime`、`prompt→memory/skills`、`memory→state`）在目标分层中均落入 `core` 内部，不再是跨层违规。
 
 ### 2.4 按需加载机制清点（待删除）
 
-| 载体 | 位置 | 处置 |
-| --- | --- | --- |
-| 6 个元工具定义 | `runtime/builtin_tools/core/*` | 整个目录删除 |
-| `CORE_NAMES` 常量 | `runtime/registry.py:17` | 删除；注册表不再要求 Core 工具存在 |
-| 四态机 `status()` | `runtime/catalog.py:51-62` | 删除；保留 `enabled/disabled` 判据 |
-| `active_limit` / `activate()` | `catalog.py:162-197` | 删除 |
-| `definitions()` 拼接 Core+Active | `catalog.py:77-83` | 改为返回**全部启用工具** |
-| Active 持久化/还原 | `catalog.py:26-42`、`store["tool_runtime"]["active_tools"]` | 删除 |
-| `tool_runtime.load_tools/reset_task/snapshot` | `runtime/tool_runtime.py:184-194` | 删除 |
-| CLI `/tools` 的四态展示 | `app/cli.py` | 改为"启用/禁用清单" |
+| 载体                                            | 位置                                                            | 处置                                 |
+| ----------------------------------------------- | --------------------------------------------------------------- | ------------------------------------ |
+| 6 个元工具定义                                  | `runtime/builtin_tools/core/*`                                | 整个目录删除                         |
+| `CORE_NAMES` 常量                             | `runtime/registry.py:17`                                      | 删除；注册表不再要求 Core 工具存在   |
+| 四态机 `status()`                             | `runtime/catalog.py:51-62`                                    | 删除；保留 `enabled/disabled` 判据 |
+| `active_limit` / `activate()`               | `catalog.py:162-197`                                          | 删除                                 |
+| `definitions()` 拼接 Core+Active              | `catalog.py:77-83`                                            | 改为返回**全部启用工具**       |
+| Active 持久化/还原                              | `catalog.py:26-42`、`store["tool_runtime"]["active_tools"]` | 删除                                 |
+| `tool_runtime.load_tools/reset_task/snapshot` | `runtime/tool_runtime.py:184-194`                             | 删除                                 |
+| CLI `/tools` 的四态展示                       | `app/cli.py`                                                  | 改为"启用/禁用清单"                  |
 
 > **保留不动**：`registry`（扫描校验）、`loader`（执行期惰性 import，避免可选依赖启动即崩）、`executor`（权限/台账/`unknown_execution` 防重放）、`permissions`、`ledger`。这些是安全管线，与"延迟下发"无关。
 
@@ -117,6 +117,7 @@ L1  shared    纯数据契约 + 无依赖工具         messages, changes, filet
 > 一个能力若依赖 **`contextWindow` / 上一轮真实 token / 用户配置 / 会话持久化 / 文件系统 I-O**，则它属于 `core`；`agent` 只定义**它需要什么**（端口），不定义**怎么做**。
 
 推论：
+
 - `agent/ports.py` 定义 `ToolPort`（拿到工具定义 + 执行调用）、`PromptPort`（拿到系统提示 + 上下文）、`MemoryPort`、`SessionPort`。
 - `core/` 提供这些端口的策略实现（工具运行时、Prompt Composer、Memory、Session Store）。
 - `app/` 作为组合根，把 `core` 的实现注入 `agent`。
@@ -158,23 +159,23 @@ src/genesisai/
 
 ### 3.4 现状 → 目标映射表
 
-| 现状 | 目标 | 层 | 动作 |
-| --- | --- | --- | --- |
-| `shared/` | `shared/` | L1 | 净化，消除 V1/V2；新增 `ids.py`/`errors.py` |
-| `model/` | `model/` | L2 | 删 ollama/bailian，加 qwen（或复用 openai_compatible） |
-| `agent/runner.py`(822) | `agent/loop.py` + `agent/recovery.py` + `core/*` | L3/L4 | 拆解，见 §7 |
-| `agent/{completion,evidence,state_machine}` | `agent/` | L3 | 保留；`RUN_STATES` 下沉 shared（V4） |
-| `agent/research.py` | `core/`（研究编排）| L4 | 迁出 agent；从 `runtime`/`state` 解耦（V3/V5） |
-| `runtime/*`（引擎） | `core/tools/` | L4 | 迁入；删四态机与元工具 |
-| `runtime/builtin_tools/core/*` | — | — | **删除** |
-| `capabilities/*` | `core/extensions/tools/*` | L4 | 迁入（D5） |
-| `prompt/` | `core/prompt/` | L4 | 迁入 |
-| `memory/` | `core/memory/` | L4 | 迁入 |
-| `state/` | `core/state/` | L4 | 迁入；消除 V3/V4 |
-| `skills/` | `core/extensions/skills/` | L4 | 升级为可执行缝（§5.1） |
-| `project_docs/` | `core/extensions/rules/`（或 `core/project_docs/`） | L4 | 与 Rules 缝对齐（§5.2） |
-| `app/` | `app/` | L5 | 保留 |
-| `evals/` | `app/evals/` | L5 | 迁入 |
+| 现状                                          | 目标                                                    | 层    | 动作                                                   |
+| --------------------------------------------- | ------------------------------------------------------- | ----- | ------------------------------------------------------ |
+| `shared/`                                   | `shared/`                                             | L1    | 净化，消除 V1/V2；新增 `ids.py`/`errors.py`        |
+| `model/`                                    | `model/`                                              | L2    | 删 ollama/bailian，加 qwen（或复用 openai_compatible） |
+| `agent/runner.py`(822)                      | `agent/loop.py` + `agent/recovery.py` + `core/*`  | L3/L4 | 拆解，见 §7                                           |
+| `agent/{completion,evidence,state_machine}` | `agent/`                                              | L3    | 保留；`RUN_STATES` 下沉 shared（V4）                 |
+| `agent/research.py`                         | `core/`（研究编排）                                   | L4    | 迁出 agent；从 `runtime`/`state` 解耦（V3/V5）     |
+| `runtime/*`（引擎）                         | `core/tools/`                                         | L4    | 迁入；删四态机与元工具                                 |
+| `runtime/builtin_tools/core/*`              | —                                                      | —    | **删除**                                         |
+| `capabilities/*`                            | `core/extensions/tools/*`                             | L4    | 迁入（D5）                                             |
+| `prompt/`                                   | `core/prompt/`                                        | L4    | 迁入                                                   |
+| `memory/`                                   | `core/memory/`                                        | L4    | 迁入                                                   |
+| `state/`                                    | `core/state/`                                         | L4    | 迁入；消除 V3/V4                                       |
+| `skills/`                                   | `core/extensions/skills/`                             | L4    | 升级为可执行缝（§5.1）                                |
+| `project_docs/`                             | `core/extensions/rules/`（或 `core/project_docs/`） | L4    | 与 Rules 缝对齐（§5.2）                               |
+| `app/`                                      | `app/`                                                | L5    | 保留                                                   |
+| `evals/`                                    | `app/evals/`                                          | L5    | 迁入                                                   |
 
 ---
 
@@ -211,17 +212,17 @@ Cline 的内核只有 9 个工具，其余能力由 **4 条外部扩展路径**�
 
 在缝就位后，把现有 50 个工具目录向通用内核收敛。**首版内核（建议）**：
 
-| 内核工具 | 吸收原工具 |
-| --- | --- |
-| `read_files` | `file_read`（多文件 + 分页） |
-| `list_files` | `file_list` |
-| `search_codebase` | `file_search` + `code_index`（正则） |
+| 内核工具                     | 吸收原工具                                                                                      |
+| ---------------------------- | ----------------------------------------------------------------------------------------------- |
+| `read_files`               | `file_read`（多文件 + 分页）                                                                  |
+| `list_files`               | `file_list`                                                                                   |
+| `search_codebase`          | `file_search` + `code_index`（正则）                                                        |
 | `editor` / `apply_patch` | `file_create`+`file_patch`+`file_move`+`file_delete`+`file_copy`+`directory_create` |
-| `run_commands` | `shell_run`+`test_run`+`git_*`（经 shell 权限） |
-| `fetch_web_content` | `search_query`+`search_fetch` |
-| `use_skill` | skills 缝 |
-| `memory` | `memory_*` |
-| `attempt_completion` | `submit_and_exit` 同构 |
+| `run_commands`             | `shell_run`+`test_run`+`git_*`（经 shell 权限）                                           |
+| `fetch_web_content`        | `search_query`+`search_fetch`                                                               |
+| `use_skill`                | skills 缝                                                                                       |
+| `memory`                   | `memory_*`                                                                                    |
+| `attempt_completion`       | `submit_and_exit` 同构                                                                        |
 
 > 收敛是**行为变更**，风险最高，排在扩展缝就位之后（见 §9，S6），并需全量回归。office/novel 等可按"技能 + 既可保留为工具包"两条路择一，由实施阶段决定。
 
@@ -248,15 +249,15 @@ def definitions(self) -> list[dict]:
 
 `agent/runner.py`（822 行）按职责切成 5 块，落到 L3/L4：
 
-| 职责 | 方法（现位置） | 目标归属 | 层 |
-| --- | --- | --- | --- |
-| 循环控制 | `drive/start/stop/fail/cancel/resume/confirm/_confirm/close_pending/status/ensure_available` | `agent/loop.py` | L3 |
-| 模型轮次 | `_call_model/_handle_length/_handle_empty/_recover_serialized_tool_output/_recover_tool_protocol/model_error` | `agent/recovery.py` | L3 |
-| 协议/恢复校验 | `_can_reuse_answer/_invalid_calls/_answer_refs_valid/_recover_bad_refs/_evidence_fallback/_recover_unsupported_prices/_price_claims/_price_amounts` | `agent/recovery.py` | L3 |
-| 上下文与工具结果 | `context/append_result/_execute_pending` | `agent/loop.py` 经 `ToolPort`/`PromptPort` 调 `core` | L3 |
-| 开发验证 | `_should_auto_verify/_requires_change_verification/_development_change_required/_recover_tool_required/_inject_verification_test` | `core/development/` | L4 |
-| 项目文档收尾 | `_finish_project_docs` | `core/project_docs/` | L4 |
-| 任务协议选择 | `_is_development_continuation/_accepts_default_plan/_requests_development_execution/_protocols_for` | `core/prompt/`（经 `PromptPort`） | L4 |
+| 职责             | 方法（现位置）                                                                                                                                        | 目标归属                                                     | 层 |
+| ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | -- |
+| 循环控制         | `drive/start/stop/fail/cancel/resume/confirm/_confirm/close_pending/status/ensure_available`                                                        | `agent/loop.py`                                            | L3 |
+| 模型轮次         | `_call_model/_handle_length/_handle_empty/_recover_serialized_tool_output/_recover_tool_protocol/model_error`                                       | `agent/recovery.py`                                        | L3 |
+| 协议/恢复校验    | `_can_reuse_answer/_invalid_calls/_answer_refs_valid/_recover_bad_refs/_evidence_fallback/_recover_unsupported_prices/_price_claims/_price_amounts` | `agent/recovery.py`                                        | L3 |
+| 上下文与工具结果 | `context/append_result/_execute_pending`                                                                                                            | `agent/loop.py` 经 `ToolPort`/`PromptPort` 调 `core` | L3 |
+| 开发验证         | `_should_auto_verify/_requires_change_verification/_development_change_required/_recover_tool_required/_inject_verification_test`                   | `core/development/`                                        | L4 |
+| 项目文档收尾     | `_finish_project_docs`                                                                                                                              | `core/project_docs/`                                       | L4 |
+| 任务协议选择     | `_is_development_continuation/_accepts_default_plan/_requests_development_execution/_protocols_for`                                                 | `core/prompt/`（经 `PromptPort`）                        | L4 |
 
 **解耦要点**：`agent/loop.py` 只持有 `ports`，不 import 任何 `core.*`；`core` 的实现由 `app` 注入。
 
@@ -307,16 +308,16 @@ modules = ["genesisai.shared"]
 
 ## 8. 迁移切片（有序、每片可测）
 
-| 片 | 内容 | 退出条件 | 状态 |
-| --- | --- | --- | --- |
-| **S0** | 冻结基线：记录 336 用例与当前依赖图 | 基线测试全绿、依赖图存档 | 完成 |
-| **S1** | shared 净化（V1/V2）：新增 `ids.py`/`errors.py`，移除 L1→L4 依赖 | `lint-imports` 中 shared 独立性通过 | 完成 |
-| **S2** | agent 端口化 + Runner 拆解（§6），消除 V3/V4/V5 与 L3→L4 违规 | agent 不再 import core；runner 单测拆分后全绿 | 完成 |
-| **S3** | 目录重排到五层（`capabilities→core/extensions/tools` 等）+ `import-linter` 上线 | 五层契约通过；导入路径全量替换 | 完成 |
-| **S4** | 拆除按需加载 + 全量下发（§5） | 首轮请求含全量定义；删除项无残留引用 | 完成 |
-| **S5** | 扩展缝落地（Skills 可执行 / Rules / MCP / Workflows） | 每条缝有契约测试；`use_skill` 可用 | 完成 |
-| **S6** | 内核收敛（§4.5，行为变更） | 全量回归通过；工具面达到内核形态 | 完成 |
-| **S7** | 全量回归 + 文档同步（回填本文与升级路线 §8） | `lint-imports` + 336 用例 + 真实云模型冒烟 | 完成 |
+| 片           | 内容                                                                                 | 退出条件                                      | 状态 |
+| ------------ | ------------------------------------------------------------------------------------ | --------------------------------------------- | ---- |
+| **S0** | 冻结基线：记录 336 用例与当前依赖图                                                  | 基线测试全绿、依赖图存档                      | 完成 |
+| **S1** | shared 净化（V1/V2）：新增 `ids.py`/`errors.py`，移除 L1→L4 依赖                | `lint-imports` 中 shared 独立性通过         | 完成 |
+| **S2** | agent 端口化 + Runner 拆解（§6），消除 V3/V4/V5 与 L3→L4 违规                      | agent 不再 import core；runner 单测拆分后全绿 | 完成 |
+| **S3** | 目录重排到五层（`capabilities→core/extensions/tools` 等）+ `import-linter` 上线 | 五层契约通过；导入路径全量替换                | 完成 |
+| **S4** | 拆除按需加载 + 全量下发（§5）                                                       | 首轮请求含全量定义；删除项无残留引用          | 完成 |
+| **S5** | 扩展缝落地（Skills 可执行 / Rules / MCP / Workflows）                                | 每条缝有契约测试；`use_skill` 可用          | 完成 |
+| **S6** | 内核收敛（§4.5，行为变更）                                                          | 全量回归通过；工具面达到内核形态              | 完成 |
+| **S7** | 全量回归 + 文档同步（回填本文与升级路线 §8）                                        | `lint-imports` + 336 用例 + 真实云模型冒烟  | 完成 |
 
 > S1–S4 为**结构性**改造（原则上不改外部行为），S5–S6 含**行为变更**，风险递增。
 
@@ -328,19 +329,19 @@ modules = ["genesisai.shared"]
 2. **契约测试**：每条扩展缝一个契约测试（skills 解析、rules 注入顺序、mcp 动态注册、workflow 展开）。
 3. **回归**：现有 336 用例必须保持通过；S3 搬迁后先跑全量再继续。
 4. **拆除验证**：断言首轮模型请求携带全部启用工具；断言 6 元工具与 `active_tools` 字段彻底消失。
-5. **真实模型冒烟**：DeepSeek 执行一个“读代码→改→跑测试→出 diff”的端到端任务（对齐升级路线 §19.2）。**回填结果：已通过**。`deepseek-v4-flash` 在真实仓库中完成：`run_commands` 复现失败（`2 failed`）→ `read_files` 定位 `calc.py` 的 `add` 运算符缺陷 → `editor` 打补丁修复（sha256 变更）→ 复测 `2 passed` → `git diff` 展示唯一改动 → 会话 `status=completed`，并自动把已验证测试命令写入 Memory（`type=command`）。运行方式：`python cli.py --env-file .env --workspace <ws> --input <ws> --output <ws> --prompt ... --yes-writes --yes-shell --allow-remote-data`。
+5. **真实模型冒烟**：DeepSeek 执行一个“读代码→改→跑测试→出 diff”的端到端任务（对齐升级路线 §19.2）。**回填结果：已通过**。`deepseek-v4-flash` 在真实仓库中完成：`run_commands` 复现失败（`2 failed`）→ `read_files` 定位 `calc.py` 的 `add` 运算符缺陷 → `editor` 打补丁修复（sha256 变更）→ 复测 `2 passed` → `git diff` 展示唯一改动 → 会话 `status=completed`，并自动把已验证测试命令写入 Memory（`type=command`）。运行方式：`python cli.py --env-file .env --workspace <ws> --input <ws> --output <ws> --prompt ... --permissions auto`。
 
 ---
 
 ## 10. 风险与回滚
 
-| 风险 | 影响 | 缓解 |
-| --- | --- | --- |
-| 全量下发后首轮 prompt 变大 | token/延迟上升 | 依赖缺失工具自动剔除；持续量测 token |
-| 内核收敛（S6）改变行为 | 破坏既有验收 | 排在最后、独立片、全量回归；必要时拆为子片 |
-| MCP 动态工具与静态工具冲突 | 注册/权限错配 | 命名空间前缀 `mcp__<server>__<tool>`；统一走 executor |
-| import 路径大迁移 | 遗漏引用 | 机械替换 + `lint-imports` + 全量测试三重校验 |
-| Rules 注入隐私泄露 | 敏感内容入提示 | 复用 `project_docs.manager` 的密钥脱敏（`SECRET` 正则） |
+| 风险                       | 影响           | 缓解                                                        |
+| -------------------------- | -------------- | ----------------------------------------------------------- |
+| 全量下发后首轮 prompt 变大 | token/延迟上升 | 依赖缺失工具自动剔除；持续量测 token                        |
+| 内核收敛（S6）改变行为     | 破坏既有验收   | 排在最后、独立片、全量回归；必要时拆为子片                  |
+| MCP 动态工具与静态工具冲突 | 注册/权限错配  | 命名空间前缀 `mcp__<server>__<tool>`；统一走 executor     |
+| import 路径大迁移          | 遗漏引用       | 机械替换 + `lint-imports` + 全量测试三重校验              |
+| Rules 注入隐私泄露         | 敏感内容入提示 | 复用 `project_docs.manager` 的密钥脱敏（`SECRET` 正则） |
 
 回滚策略：S1–S6 每片独立提交，任一片失败可回退该片而不影响前序成果。
 

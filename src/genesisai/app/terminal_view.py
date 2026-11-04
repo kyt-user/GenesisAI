@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
+import json
 import re
 import time
 
 from rich import box
 from rich.console import Console, Group
-from rich.json import JSON
+from rich.highlighter import JSONHighlighter
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from genesisai.app.command_input import COMMANDS, TaskInput
 from genesisai.app.select import is_interactive, select
+from genesisai.app.terminal_text import terminal_text
 
 
 @dataclass(frozen=True)
@@ -75,23 +77,6 @@ class CliView:
     def _value(value, pending="未启用") -> str:
         return str(value) if value not in {None, ""} else pending
 
-    def render_startup(self, snapshot: CliSnapshot, data=None) -> None:
-        self.snapshot = snapshot
-        self.console.print()
-        self.console.print(Text('GenesisAI', style='bold'))
-        mode = {'ASK': '操作需确认', 'ALLOW': '操作已授权', 'MIXED': '自定义权限'}.get(snapshot.permission_mode, snapshot.permission_mode)
-        self.console.print(Text(f'{snapshot.model_name}  |  {mode}'))
-        self.console.print(Text('工作区  ' + snapshot.workspace))
-        history = (data or {}).get('messages', [])
-        title = next((m.get('content', '') for m in reversed(history) if m.get('role') == 'user'), '')
-        if title:
-            self.console.print(Text('已恢复会话 · ' + ' '.join(title.split())[:80]))
-            label = STATUS_STYLE.get((data or {}).get('status'), ('已保存', ''))[0]
-            self.console.print(Text('上次状态 · ' + label))
-        else:
-            self.console.print('当前为新会话')
-        self.render_command_hint()
-
     def render_agent_docs_consent(self, path: str) -> None:
         body = Text()
         body.append("GenesisAI 将创建受管理的项目工作记忆：\n", style="white")
@@ -101,9 +86,6 @@ class CliView:
         if not is_interactive(self.console):
             body.append("\n\n输入 allow 初始化，回车跳过。之后可用 /project init。", style="yellow")
         self.console.print(Panel(body, title="初始化 agent_docs", title_align="left", border_style="yellow"))
-
-    def render_command_hint(self) -> None:
-        self.console.print('直接描述你要完成的任务，输入 / 选择操作。')
 
     def render_help(self) -> None:
         table = Table(box=box.SIMPLE, show_header=True)
@@ -130,6 +112,8 @@ class CliView:
         if getattr(self, 'session_id', None) != snapshot.session_id:
             self._input = None
             self._confirmation_seen = None
+            self._last_tool_result = None
+            self._running_tools.clear()
         self.session_id = snapshot.session_id
         self.snapshot, self.session_data = snapshot, data
 
@@ -178,15 +162,16 @@ class CliView:
         body.append(str(path or settings_path()), style="dim")
         self.console.print(Panel(body, title="模型配置", title_align="left", border_style="green"))
 
-    def render_permissions(self, *, confirm_writes: bool, confirm_search: bool, confirm_shell: bool = True) -> None:
+    def render_permissions(self, mode: str) -> None:
+        auto = mode == 'auto'
         table = Table.grid(padding=(0, 2))
         table.add_column(style="dim")
         table.add_column()
-        table.add_row("文件写入", "逐次确认" if confirm_writes else "本次会话已允许")
-        table.add_row("公开网络", "逐次确认" if confirm_search else "本次会话已允许")
-        table.add_row("命令执行", "逐次确认" if confirm_shell else "本次会话已允许")
-        table.add_row("工作区外", "禁止")
-        footer = Text("\n切换：/permissions network|writes|shell ask|allow", style="dim")
+        table.add_row("当前模式", "自动审批" if auto else "用户审批")
+        table.add_row("本地只读", "直接执行")
+        table.add_row("写入、公开网络、命令、MCP", "自动执行" if auto else "逐次确认")
+        table.add_row("内置文件工具", "可访问工作区外的宿主文件" if auto else "限已授权路径")
+        footer = Text("\n/permissions user    /permissions auto", style="dim")
         self.console.print(Panel(Group(table, footer), title="权限", title_align="left", border_style="yellow"))
 
     def render_tools(self, snapshot: dict[str, list[dict]]) -> None:
@@ -240,14 +225,12 @@ class CliView:
         table.add_row('授权输入', '、'.join(snapshot.input_roots))
         table.add_row('输出目录', snapshot.output)
         table.add_row('历史目录', snapshot.history_root or '—')
-        table.add_row("权限", snapshot.permission_mode)
+        table.add_row("权限", "自动审批" if snapshot.permission_mode == "auto" else "用户审批")
         table.add_row("轮次", str(data.get("rounds", 0)))
         table.add_row("工具", str(data.get("tool_count", 0)))
         table.add_row("Token", str(usage.get("total_tokens", "未知")))
         runtime = data.get("run_runtime") or {}
-        modes = data.get('permission_modes', {})
-        scope = '本轮' if runtime.get('network_grant_scope') == 'run' else ('本会话' if modes.get('network') == 'allow' else '逐次确认')
-        table.add_row('网络授权', scope)
+
         now = runtime.get('confirmation_paused_at') or time.time()
         table.add_row('剩余执行时间', f"{max(0, data.get('deadline', 0) - now):.0f} 秒")
         table.add_row("Profile", str(runtime.get("profile", "—")))
@@ -288,25 +271,60 @@ class CliView:
         entries = []
         for line in lines:
             try:
-                value = __import__("json").loads(line)
+                value = json.loads(line)
                 entries.append({key: value[key] for key in ("event", "run_id", "model_call_id", "tool_call_id", "tool", "profile", "phase", "status", "code", "finish_reason", "stop_reason", "elapsed_ms", "diagnostic") if key in value})
             except ValueError:
                 continue
-        self.console.print(Panel(JSON.from_data(entries, ensure_ascii=False, indent=2), title="Trace · 脱敏", border_style="cyan"))
+        self.render_data("Trace · 脱敏", entries)
 
-    def render_history(self, messages: list[dict]) -> None:
-        visible = [{key: value for key, value in message.items() if key != "reasoning"} for message in messages]
-        self.console.print(
-            Panel(
-                JSON.from_data(visible, ensure_ascii=False, indent=2),
-                title=f"历史 · {len(visible)} 条",
-                title_align="left",
-                border_style="cyan",
-            )
-        )
+    def render_home(self, workspace, recent):
+        self.console.print(Text('GenesisAI', style='bold'))
+        self.console.print(Text(f'工作区  {workspace}'))
+        if recent:
+            self.console.print('最近对话')
+            for _, title, detail in recent:
+                self.console.print(Text(f'  {title}  {detail.split(" · ")[0]}'))
+            self.console.print('↑ 选择最近对话 · /sessions 浏览全部')
+        self.console.print('直接输入开始新对话，输入 / 查看操作。')
+        self.console.print(Text('/auth 切换模型提供商 · /model 切换模型', style='cyan'))
+
+    def render_history(self, data, *, recent_turns=None):
+        # Some answers (errors, cancellation, and attempt_completion) only exist in the run outcome.
+        turns = []
+        for message in data.get('messages', []):
+            content = message.get('content')
+            if message['role'] == 'user':
+                turns.append([content or '', None])
+            elif turns and message['role'] == 'assistant' and not message.get('tool_calls') and content:
+                turns[-1][1] = content.removeprefix('[[PARTIAL]]').lstrip()
+        outcomes = [*data.get('history', []), data]
+        if len(outcomes) == len(turns):
+            for turn, outcome in zip(turns, outcomes):
+                if outcome.get('answer'):
+                    turn[1] = outcome['answer']
+        if recent_turns and len(turns) > recent_turns:
+            self.console.print(f'还有 {len(turns) - recent_turns} 轮更早对话，输入 /history 查看。')
+            turns = turns[-recent_turns:]
+        for question, answer in turns:
+            self.console.print(Text('你', style='bold cyan'))
+            self.console.print(Text(terminal_text(question)))
+            if answer:
+                self.console.print(Text('GenesisAI', style='bold cyan'))
+                self.console.print(Markdown(terminal_text(answer)))
+
+    def render_opened(self, store):
+        self.console.print(Text(f'已打开历史会话 · {store.id} · {store.workspace}', style='bold'))
+        self.render_history(store.data, recent_turns=3)
+        self.console.print(Text('/auth 切换模型提供商 · /model 切换模型', style='cyan'))
+        if store.data['status'] == 'awaiting_confirmation' and store.data['pending']:
+            call = store.data['pending'][0]
+            self.render_confirmation(call['name'], store.data['calls'][call['id']].get('preview') or {})
+        elif store.data['status'] == 'interrupted':
+            self.console.print('上次运行已中断。输入 /resume 继续，或 /cancel 取消。')
 
     def render_data(self, title: str, value) -> None:
-        self.console.print(Panel(JSON.from_data(value, ensure_ascii=False, indent=2), title=title, title_align="left", border_style="cyan"))
+        serialized = terminal_text(json.dumps(value, ensure_ascii=False, indent=2))
+        self.console.print(Panel(JSONHighlighter()(Text(serialized)), title=title, title_align="left", border_style="cyan"))
 
     def render_logs(self, path: str) -> None:
         self.console.print(Text('完整输入输出日志（JSONL）', style='bold cyan'))
@@ -314,6 +332,9 @@ class CliView:
         self.console.print(Text('每行一个事件；正文不截断，认证信息脱敏。', style='dim'))
 
     def render_progress(self, kind: str, value: dict) -> None:
+        if kind == 'command_output':
+            self.console.print(Text(terminal_text(value['text'])), end='')
+            return
         if kind == "reasoning_token":
             if not self._reasoning_active:
                 self._reasoning_active = True
@@ -333,11 +354,13 @@ class CliView:
             text = value.get("text", "")
             self._stream_chars += len(text)
             self._streamed_text += text
-            self.console.print(Text(text), end="", highlight=False)
+            self.console.print(Text(terminal_text(text)), end="", highlight=False)
             return
         if kind == "model":
             if self._streaming:
                 self.console.print()
+                if value.get("retry"):
+                    self.console.print("响应中断，正在重试…", style="dim")
             self._streaming = False
             self._streamed_text = ''
             # 重置新一轮的推理状态。
@@ -356,7 +379,7 @@ class CliView:
             if self._working_status is not None:
                 self._working_status.update(f'{label} · Ctrl+C 停止')
             else:
-                self.console.print(Text('● ' + label + ' · 运行中'))
+                self.console.print(Text('● ' + terminal_text(label) + ' · 运行中'))
             return
         if kind == "tool_result":
             self._last_tool_result = value
@@ -370,12 +393,12 @@ class CliView:
                 detail = f' · {target}' if target else ''
                 if name == 'run_commands' and 'exit_code' in data:
                     detail += f" · 退出码 {data['exit_code']}"
-                self.console.print(Text.assemble(('✓ ', 'green'), (label + '完成' + detail, '')))
+                self.console.print(Text.assemble(('✓ ', 'green'), (terminal_text(label + '完成' + detail), '')))
             else:
                 message = (value.get("error") or {}).get("message", "未知错误")
                 code = (value.get("error") or {}).get("code")
                 detail = f"[{code}] {message}" if code else message
-                self.console.print(Text.assemble(("× ", "red"), (label + '失败 ', ''), (detail, '')))
+                self.console.print(Text.assemble(("× ", "red"), (terminal_text(label) + '失败 ', ''), (terminal_text(detail), '')))
                 self.console.print('使用 /logs 查看完整输入输出。', style='dim')
             if self.show_details:
                 self.render_data('工具输出', value)
@@ -426,33 +449,42 @@ class CliView:
         if total_tokens is not None:
             footer.append(f"   Token {total_tokens}", style="dim")
         self.console.print(Text(label, style=style))
-        self.console.print(Markdown(str(answer)))
+        self.console.print(Markdown(terminal_text(answer)))
         self.console.print(footer)
 
     def render_confirmation(self, tool_name: str, preview: dict) -> None:
         body = Text()
         body.append("工具    ", style="dim")
-        body.append(tool_name, style="bold yellow")
+        body.append(terminal_text(tool_name), style="bold yellow")
         body.append("\n目标    ", style="dim")
-        body.append(str(preview.get("target", "未知")), style="white")
+        body.append(terminal_text(preview.get("target", "未知")), style="white")
         args = preview.get("args") or {}
         operation = preview.get("operation")
+        if operation:
+            body.append("\n操作    " + terminal_text(operation))
         if tool_name == "editor" and operation == "create":
             content = str(args.get("content", ""))
             body.append(f"\n内容    {len(content)} 字符", style="dim")
             if content:
-                body.append('\n\n' + content[:800])
+                body.append('\n\n' + terminal_text(content[:800]))
                 if len(content) > 800:
                     body.append('\n…预览已截断', style='dim')
         elif operation == 'patch':
-            body.append('\n\n' + str(args.get('patch', ''))[:1200])
+            body.append('\n\n' + terminal_text(str(args.get('patch', ''))[:1200]))
         elif args.get('source'):
-            body.append('\n来源  ' + str(args['source']))
+            body.append('\n来源  ' + terminal_text(args['source']))
+        elif args and not preview.get('command') and tool_name != 'fetch_web_content':
+            details = json.dumps(args, ensure_ascii=False)
+            body.append('\n参数    ' + terminal_text(details[:1200]))
+            if len(details) > 1200:
+                body.append('\n…预览已截断', style='dim')
+        if tool_name.startswith('mcp_'):
+            body.append('\n发送参数    ' + terminal_text(json.dumps(args, ensure_ascii=False)))
         if not is_interactive(self.console):
             body.append("\n\n/approve  /reject  /cancel  /exit", style="cyan")
         body.append("\n仅本次操作 · 参数已冻结", style="dim")
         if preview.get('command'):
-            body.append('\n执行命令  ' + ' '.join(str(arg) for arg in preview['command']))
+            body.append('\n执行命令  ' + terminal_text(json.dumps(preview['command'], ensure_ascii=False)))
         self.console.print(
             Panel(body, title="◆ 操作确认", title_align="left", border_style="yellow", box=box.ROUNDED)
         )
@@ -476,23 +508,20 @@ class CliView:
                 index += 1
         return '\n'.join(output)
 
-    def render_remote_consent(self, input_roots: list[str], model_name=None) -> None:
-        body = Text()
-        if model_name:
-            body.append(str(model_name) + '\n', style='bold')
-        body.append("远程模型将接收当前会话内容。", style="white")
-        body.append("\n读取的授权资料和搜索词也可能发送给模型。")
-        body.append("\n授权输入：", style="dim")
-        body.append("、".join(input_roots) if input_roots else "未指定", style="white")
-        if not is_interactive(self.console):
-            body.append("\n\n输入 allow 允许本次会话。", style="yellow")
-        self.console.print(Panel(body, title="远程数据确认", title_align="left", border_style="yellow"))
-
     def render_error(self, message: str, *, title="错误") -> None:
         self.console.print(Text.assemble(('× ' + title + '\n', 'red bold'), (message, '')))
 
     def render_goodbye(self) -> None:
-        self.console.print("\n[dim]会话状态已保存。[/dim] [bright_green]再见。[/bright_green]")
+        self.console.print('再见。', style='bright_green')
+
+    def prompt_running(self, runs, render):
+        raw, self.draft = self._get_input().read_running(runs, render, self.draft)
+        return raw
+
+    def prepare_run(self, snapshot, data):
+        self.bind_session(snapshot, data)
+        # Materialize the editor history while the session is still idle.
+        self._get_input()
 
     def prompt(self) -> str:
         data = getattr(self, 'session_data', {})
@@ -513,9 +542,14 @@ class CliView:
             if context.get('input_limit'):
                 status += f" · 上下文约 {context.get('tokens_after', 0) / context['input_limit']:.0%}"
             self.console.rule(style='dim')
-            self.last_input_raw = self._get_input().read(status)
+            self.last_input_raw = self._get_input().read(status, default=getattr(self, 'draft', ''),
+                                                          recent=bool(getattr(self, 'recent', [])))
+            self.draft = ''
         else:
-            self.last_input_raw = self.console.input('\n> ')
+            if getattr(self, 'draft', ''):
+                self.console.print(Text('草稿（回车重试）：' + self.draft))
+            self.last_input_raw = self.console.input('\n> ') or getattr(self, 'draft', '')
+            self.draft = ''
         return self.last_input_raw.strip()
 
     @contextmanager

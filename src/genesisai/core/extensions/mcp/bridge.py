@@ -1,7 +1,7 @@
 """MCP 桥接缝：读取 ``.genesis/mcp.json``，连接 MCP server 并动态注册工具。
 
 MCP 工具以 ``category="mcp"`` 注册进同一 :class:`ToolRegistry`，与内置工具
-走同一条 executor/permissions/ledger 管线；只读/写/网络权限按 server 配置映射。
+走同一条 executor/permissions/ledger 管线。服务启动和外部调用分别授权。
 """
 
 from __future__ import annotations
@@ -10,11 +10,11 @@ import json
 import os
 import re
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from genesisai.core.tools.base import ToolDescriptor, ToolSpec
-from genesisai.shared.security import ToolError
+from genesisai.core.tools.base import ToolDescriptor, ToolSpec, object_schema
+from genesisai.shared.security import ToolError, digest
 
 
 MCP_CONFIG = Path(".genesis") / "mcp.json"
@@ -132,9 +132,10 @@ class McpToolImplementation:
         self.tool = tool
 
     def prepare(self, context, args):
-        return None
+        return {**self.bridge.launch_preview(self.server), "target": f"{self.server}/{self.tool}", "args": args}
 
     def execute(self, context, args):
+        self.bridge.ensure_connected(self.server)
         return self.bridge.call(self.server, self.tool, args)
 
 
@@ -150,38 +151,67 @@ class McpBridge:
         self.transports: dict[str, object] = {}
         self.diagnostics: list[str] = []
 
-    def connect_all(self) -> "McpBridge":
+    def configure(self, cache: dict) -> "McpBridge":
+        self.cache = cache
         try:
-            specs = load_servers(self.workspace)
+            self.config = {spec.name: spec for spec in load_servers(self.workspace)}
         except McpError as exc:
             self.diagnostics.append(str(exc))
             return self
-        for spec in specs:
-            try:
-                self._connect(spec)
-            except (McpError, OSError, ValueError) as exc:
-                self.diagnostics.append(f"{spec.name}: {exc}")
+        if self.config:
+            name = "connect_mcp"
+            spec = ToolSpec(parameters=object_schema(["server"], server={"type": "string", "enum": list(self.config)}),
+                            permission="shell", side_effect=True)
+            self.registry.register(ToolDescriptor(name, True, "mcp", "启动指定 MCP 服务并发现工具", self.workspace, spec))
+            self.loader.register(name, self)
+        for server, spec in self.config.items():
+            for tool in cache.get(digest(asdict(spec)), []):
+                self.registry.register(self._descriptor(spec, tool))
         return self
+
+    def launch_preview(self, server):
+        spec = self.config.get(server)
+        if spec is None:
+            raise McpError("未知 MCP 服务")
+        return {"target": server, "command": [spec.command, *spec.args], "config_digest": digest(asdict(spec))}
+
+    def prepare(self, context, args):
+        return self.launch_preview(args["server"])
+
+    def execute(self, context, args):
+        server = args["server"]
+        self.ensure_connected(server)
+        tools = self.cache[digest(asdict(self.config[server]))]
+        return {"server": server, "tools": [self._tool_name(server, tool["name"]) for tool in tools]}
+
+    def ensure_connected(self, server):
+        if server not in self.transports:
+            self._connect(self.config[server])
 
     def _connect(self, spec: McpServerSpec) -> None:
         transport = self.transport_factory(spec)
-        transport.request(
-            "initialize",
-            {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": CLIENT_INFO},
-        )
-        transport.notify("notifications/initialized", {})
-        listing = transport.request("tools/list", {})
-        tools = listing.get("tools", []) if isinstance(listing, dict) else []
-        registered = 0
-        for tool in tools:
-            if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]:
-                continue
-            descriptor = self._descriptor(spec, tool)
-            self.registry.register(descriptor)
-            registered += 1
+        try:
+            transport.request(
+                "initialize",
+                {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": CLIENT_INFO},
+            )
+            transport.notify("notifications/initialized", {})
+            listing = transport.request("tools/list", {})
+            tools = listing.get("tools", []) if isinstance(listing, dict) else []
+            discovered = []
+            for tool in tools:
+                if not isinstance(tool, dict) or not isinstance(tool.get("name"), str) or not tool["name"]:
+                    continue
+                descriptor = self._descriptor(spec, tool)
+                self.registry.register(descriptor)
+                discovered.append(tool)
+        except BaseException:
+            transport.close()
+            raise
+        self.cache[digest(asdict(spec))] = discovered
         self.servers.append(spec)
         self.transports[spec.name] = transport
-        if registered == 0:
+        if not discovered:
             self.diagnostics.append(f"{spec.name}: 未发现任何工具")
 
     def _descriptor(self, spec: McpServerSpec, tool: dict) -> ToolDescriptor:
@@ -189,10 +219,9 @@ class McpBridge:
         description = tool.get("description")
         if not isinstance(description, str) or not description.strip():
             description = f"MCP 工具 {tool['name']}（{spec.name}）"
-        permission = "read" if spec.read_only else "write"
         tool_spec = ToolSpec(
             parameters=self._normalize_schema(tool.get("inputSchema")),
-            permission=permission,
+            permission="network", network=True,
             path_scope="none",
             side_effect=not spec.read_only,
         )
@@ -255,3 +284,5 @@ class McpBridge:
     def close(self) -> None:
         for transport in self.transports.values():
             transport.close()
+        self.transports.clear()
+        self.servers.clear()

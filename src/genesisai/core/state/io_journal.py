@@ -13,9 +13,9 @@ import traceback
 from uuid import uuid4
 
 
-_SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|password|secret|credential|access[_-]?token|refresh[_-]?token)", re.I)
+_SECRET_KEY = re.compile(r"(?:api[_-]?key|authorization|password|secret|credential|access[_-]?token|refresh[_-]?token|qwen_token_plan)", re.I)
 _ASSIGNMENT = re.compile(
-    r'''(?i)((?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|[^\s,"'\\}]+)'''
+    r'''(?i)((?:api[_-]?key|password|secret|access[_-]?token|refresh[_-]?token|qwen_token_plan)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'[^']*'|[^\s,"'\\}]+)'''
 )
 _BEARER = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+")
 
@@ -53,13 +53,13 @@ class IOJournal:
             return value
         return self.clean(str(value))
 
-    def write(self, event, *, round_num=None, **payload):
+    def write(self, event, *, round_num=None, event_run_id=..., **payload):
         record = self.clean({
             "schema_version": 1,
             "event_id": uuid4().hex,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "session_id": self.store.id,
-            "run_id": self.store.data.get("run_id"),
+            "run_id": self.store.data.get("run_id") if event_run_id is ... else event_run_id,
             "round_num": self.store.data.get("rounds", 0) if round_num is None else round_num,
             "event": event,
             "payload": payload,

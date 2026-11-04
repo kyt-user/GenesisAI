@@ -107,7 +107,7 @@ def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, mon
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        providers=[], confirm_writes=False, confirm_search=False,
+        providers=[], permission_mode="auto",
     )
     result = runtime.execute(call("editor", {
         "operation": "create", "path": "hello.txt", "content": "hello", "source_refs": [],

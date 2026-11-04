@@ -48,7 +48,6 @@ def _new_session(session_id, workspace):
         pending=[],
         grants=[],
         output='',
-        remote_allowed=False,
         run_id=None,
         rounds=0,
         tool_count=0,
@@ -57,7 +56,7 @@ def _new_session(session_id, workspace):
         usage={},
         history=[],
         changes=[],
-        permission_modes={'network': 'ask', 'writes': 'ask', 'shell': 'ask'},
+        permission_mode='user',
         tool_runtime=dict(active_skills=[]),
         run_runtime=initial_run_runtime(),
     )
@@ -81,13 +80,11 @@ def validate_session(data, expected_id=None):
         'pending': list,
         'grants': list,
         'output': str,
-        'remote_allowed': bool,
         'usage': dict,
         'history': list,
         'tool_runtime': dict,
         'run_runtime': dict,
         'changes': list,
-        'permission_modes': dict,
     }
     missing = [name for name in field_types if name not in data]
     missing.extend(
@@ -114,9 +111,8 @@ def validate_session(data, expected_id=None):
     factor = data.get('context_estimate_factor', 1.0)
     if type(factor) not in (int, float) or not 1 <= factor <= 4:
         raise ValueError('会话 context_estimate_factor 无效')
-    modes = data['permission_modes']
-    if set(modes) != {'network', 'writes', 'shell'} or any(value not in {'ask', 'allow'} for value in modes.values()):
-        raise ValueError('会话字段 permission_modes 无效')
+    if data.get('permission_mode', 'user') not in ('user', 'auto'):
+        raise ValueError('会话字段 permission_mode 无效')
     if data['run_id'] is not None and not isinstance(data['run_id'], str):
         raise ValueError('会话字段 run_id 类型无效')
     for name in ('rounds', 'tool_count', 'failures'):
@@ -223,14 +219,18 @@ class Store:
             if workspace is not None and self.workspace != saved_workspace:
                 raise ValueError('恢复会话的工作区与指定目录不一致，请使用原工作区或新建会话')
             self.workspace = saved_workspace
-            if self.data['status'] == 'running':
+            interrupted = self.data['status'] == 'running'
+            if interrupted:
                 self.data['status'] = 'interrupted'
             for call in self.data['calls'].values():
                 if call['state'] == 'started':
                     call['state'] = 'unknown'
+                    interrupted = True
+            if interrupted:
+                self.save()
         else:
             self.data = _new_session(self.id, self.workspace)
-        self.save()
+            self.save()
 
     def save(self):
         validate_session(self.data, self.id)
@@ -260,9 +260,16 @@ class Store:
         with path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(payload, ensure_ascii=False) + '\n')
 
+    def _file_roots(self):
+        return [Path(p).resolve() for p in [*self.data['grants'], self.data['output']] if p]
+
     def source(self, **data):
         identity = json.dumps(data, sort_keys=True, ensure_ascii=False)
         key = 'src_' + hashlib.sha256(identity.encode()).hexdigest()[:16]
+        if data.get('kind') == 'file' and self.data.get('permission_mode') == 'auto':
+            path = Path(data['path']).resolve()
+            if not any(path.is_relative_to(root) for root in self._file_roots()):
+                data['host_file'] = True
         self.data['sources'][key] = data
         self.save()
         return key
@@ -271,7 +278,10 @@ class Store:
         path = Path(path).resolve()
         digest = sha(path)
         key = 'artifact_' + hashlib.sha256((str(path) + digest).encode()).hexdigest()[:16]
-        self.data['artifacts'][key] = dict(path=str(path), sha256=digest, run_id=self.data['run_id'])
+        item = dict(path=str(path), sha256=digest, run_id=self.data['run_id'])
+        if self.data.get('permission_mode') == 'auto' and not path.is_relative_to(Path(self.data['output']).resolve()):
+            item['host_file'] = True
+        self.data['artifacts'][key] = item
         self.save()
         return key
 
@@ -283,8 +293,10 @@ class Store:
             last_run = change.get('run_id') if change else data.get('run_id')
             if current_run_only and last_run != self.data['run_id']:
                 continue
+            if data.get('host_file') and self.data.get('permission_mode') != 'auto':
+                continue
             path = Path(data['path']).resolve()
-            if not path.is_relative_to(Path(self.data['output']).resolve()):
+            if not data.get('host_file') and not path.is_relative_to(Path(self.data['output']).resolve()):
                 raise ValueError('产物越界：' + path.name)
             if change and change['operation'] in {'delete', 'move'}:
                 continue  # 已记录的合法删除/移动使原路径退出当前产物集合，历史仍保留。
@@ -313,15 +325,15 @@ class Store:
         """标记已变化的本地快照；保留原始哈希和历史，不阻断继续读取。"""
         changed = []
         digests = {}
-        roots = [Path(p).resolve() for p in self.data['grants']]
-        if self.data['output']:
-            roots.append(Path(self.data['output']).resolve())
+        roots = self._file_roots()
         for collection in ('sources', 'artifacts'):
             for ref, data in self.data[collection].items():
                 if collection == 'sources' and data['kind'] != 'file':
                     continue
+                if data.get('host_file') and self.data.get('permission_mode') != 'auto':
+                    continue
                 path = Path(data['path']).resolve()
-                if not any(path == root or path.is_relative_to(root) for root in roots):
+                if not data.get('host_file') and not any(path.is_relative_to(root) for root in roots):
                     raise ValueError('历史文件已不在授权范围：' + path.name)
                 if path not in digests:
                     digests[path] = sha(path) if path.is_file() else None

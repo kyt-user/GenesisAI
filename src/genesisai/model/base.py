@@ -22,5 +22,5 @@ class ModelClient(ABC):
         messages: list[Message] | list[dict],
         tools: list[dict] | None = None,
         **kwargs,
-    ) -> Iterator[str | Response]:
-        """流式调用模型。"""
+    ) -> Iterator[str | tuple[str, str] | Response]:
+        """依次产生正文片段、可选推理片段和一个完整的最终响应。"""

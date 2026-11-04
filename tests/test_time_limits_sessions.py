@@ -30,12 +30,12 @@ def test_retry_uses_remaining_task_time(tmp_path):
     class InternalServerError(Exception):
         pass
     class Model:
-        def chat(self, messages, tools=None, **options):
+        def stream_chat(self, messages, tools=None, **options):
             seen.append(options['timeout'])
             if len(seen) == 1:
                 store.data['deadline'] = time.time() + 5
                 raise InternalServerError('busy')
-            return Response(content='answer')
+            yield Response(content='answer')
     result = Runner(Model(), runtime, seconds=300, request_timeout=60).start('hello')
     assert result['status'] == 'completed'
     assert seen[0] == 60 and 0 < seen[1] <= 5
@@ -47,7 +47,7 @@ def test_expired_task_does_not_retry_or_execute_returned_tools(tmp_path):
         pass
     class Model:
         calls = 0
-        def chat(self, *args, **kwargs):
+        def stream_chat(self, *args, **kwargs):
             self.calls += 1
             store.data['deadline'] = time.time() - 1
             raise APITimeoutError('timeout')
@@ -128,13 +128,115 @@ def test_session_switch_loads_selected_workspace_environment(tmp_path, monkeypat
     seen = []
     def build(_):
         seen.append(os.environ.get(name))
-        return FakeModel(), False
+        return FakeModel(Response(content='done')), False
     monkeypatch.setattr(cli, 'build_model', build)
     monkeypatch.setattr(cli, 'choose_session', lambda *a: previous.id)
-    prompts = iter(['/sessions', '/exit'])
+    prompts = iter(['first task', '/sessions', 'second task', '/exit'])
     monkeypatch.setattr(Console, 'input', lambda *a, **k: next(prompts))
     try:
         assert cli.main(['--workspace', str(first)]) == 0
         assert seen == ['first', 'second']
     finally:
         os.environ.pop(name, None)
+
+
+def test_home_and_history_are_local_and_do_not_create_sessions(tmp_path, monkeypatch):
+    work = tmp_path / 'poems'
+    work.mkdir()
+    root = application_state_root()
+    saved = Store(root, workspace=work)
+    question = '给我推荐一首古诗，并说明原因'
+    answer = '推荐王维的《鹿柴》。'
+    saved.data['messages'] = [{'role': 'user', 'content': question},
+                              {'role': 'assistant', 'content': answer}]
+    saved.save()
+    empty = Store(root, workspace=work)
+    before = {s.id: (s.path.read_bytes(), s.path.stat().st_mtime_ns) for s in (empty, saved)}
+    output = StringIO()
+    monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=output, width=120))
+    def unexpected(*args, **kwargs):
+        raise AssertionError('Browsing must be local')
+    monkeypatch.setattr(cli, 'build_model', unexpected)
+    monkeypatch.setattr(cli, 'load_settings', unexpected)
+    monkeypatch.setattr(cli, 'choose_session', lambda *args: saved.id)
+    inputs = iter(['/sessions', '/history', '/new', '/exit'])
+    monkeypatch.setattr(Console, 'input', lambda *args, **kw: next(inputs))
+    assert cli.main(['--workspace', str(work)]) == 0
+    assert answer in output.getvalue() and question in output.getvalue()
+    assert empty.id not in output.getvalue()
+    inputs = iter(['/exit'])
+    assert cli.main(['--session', saved.id]) == 0
+    for path in (root / 'sessions').glob('*.json'):
+        assert before[path.stem] == (path.read_bytes(), path.stat().st_mtime_ns)
+
+
+def test_remote_model_answers_first_message_directly(tmp_path, monkeypatch):
+    model = FakeModel(Response(content='王维的《鹿柴》。'))
+    monkeypatch.setattr(cli, 'build_model', lambda _: (model, True))
+    inputs = iter(['推荐一首古诗', '/exit'])
+    monkeypatch.setattr(Console, 'input', lambda *args, **kw: next(inputs))
+    assert cli.main(['--workspace', str(tmp_path / 'poems')]) == 0
+    saved, = (application_state_root() / 'sessions').glob('*.json')
+    messages = json.loads(saved.read_text(encoding='utf-8'))['messages']
+    assert [m['content'] for m in messages] == ['推荐一首古诗', '王维的《鹿柴》。']
+    assert len(model.contexts) == 1
+
+
+def test_recent_titles_and_workspace_filter(tmp_path):
+    work = tmp_path / 'work'
+    root = application_state_root()
+    for folder in (work, tmp_path / 'other'):
+        item = Store(root, workspace=folder)
+        item.data['messages'] = [{'role': 'user', 'content': '最初的问题'}, {'role': 'user', 'content': '继续'}]
+        item.save()
+    Store(root, workspace=work)
+    console = Console(file=StringIO())
+    entries = session_picker.session_entries(console, root, workspace=work)
+    assert len(entries) == 1 and entries[0][1] == '最初的问题'
+    assert len(session_picker.session_entries(console, root)) == 2
+
+
+def test_reopened_poem_followup_belongs_to_original_session(tmp_path, monkeypatch):
+    work = tmp_path / 'poems'
+    work.mkdir()
+    store = Store(application_state_root(), workspace=work)
+    answer = '我推荐王维的《鹿柴》。'
+    store.data['messages'] = [{'role': 'user', 'content': '推荐一首古诗'}, {'role': 'assistant', 'content': answer}]
+    store.save()
+    model = FakeModel(Response(content='王维的《鹿柴》。'))
+    monkeypatch.setattr(cli, 'build_model', lambda _: (model, False))
+    monkeypatch.setattr(cli, 'choose_session', lambda *args: store.id)
+    stream = StringIO()
+    monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=stream, width=100))
+    prompts = iter(['/sessions', '你前面推荐了哪首诗？', '/exit'])
+    def read(*args, **kwargs):
+        value = next(prompts)
+        if value.startswith('你前面'):
+            assert answer in stream.getvalue() and not model.contexts
+        return value
+    monkeypatch.setattr(Console, 'input', read)
+    assert cli.main(['--workspace', str(work)]) == 0
+    saved, = (store.root / 'sessions').glob('*.json')
+    assert saved == store.path
+    data = json.loads(saved.read_text(encoding='utf-8'))
+    assert len(data['messages']) == 4 and data['status'] == 'completed'
+    assert any(m.content == answer for m in model.contexts[0])
+
+
+def test_project_memory_prompt_waits_for_development_request(tmp_path, monkeypatch):
+    work = tmp_path / 'work'
+    model = FakeModel(Response(content='王维'), Response(content='完成'))
+    monkeypatch.setattr(cli.sys, 'stdin', type('TTY', (), {'isatty': lambda self: True})())
+    monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=StringIO(), force_terminal=False))
+    monkeypatch.setenv('DEEPSEEK_API_KEY', 'test-key')
+    monkeypatch.setattr(cli, 'build_model', lambda _: (model, False))
+    prompts = iter(['推荐一首古诗', '实现一个 Python 函数', '/exit'])
+    monkeypatch.setattr(Console, 'input', lambda *args, **kw: next(prompts))
+    offered = []
+    def consent(self, purpose, title):
+        offered.append((purpose, len(model.contexts)))
+        return 'allow'
+    monkeypatch.setattr(cli.CliView, 'request_consent', consent)
+    assert cli.main(['--workspace', str(work)]) == 0
+    assert offered == [('创建项目任务记录', 1)]
+    assert (work / 'agent_docs').is_dir()

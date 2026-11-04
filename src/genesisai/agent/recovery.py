@@ -42,7 +42,7 @@ class RecoveryMixin:
             context = self.context_budgeter.prepare(context, tools)
         except ValueError as exc:
             return self.stop('failed', str(exc), 'context_error')
-        d = self.store.data; d['rounds'] += 1; self.store.save(); self.on_event('model', dict(round=d['rounds']))
+        d = self.store.data; d['rounds'] += 1; self.store.save()
         state = d['run_runtime']; call_id = self.trace.model_start(state); started = time.monotonic(); attempts = 0
         overflow_retried = False
         
@@ -62,41 +62,55 @@ class RecoveryMixin:
                     options['max_tokens'] = min(options['max_tokens'], 900)
                 elif state.get('profile') == 'direct_answer':
                     options['max_tokens'] = min(options['max_tokens'], 600)
+            self.on_event('model', dict(round=d['rounds'], retry=bool(attempts)))
             log_details = {'model_call_id': call_id, 'attempt': attempts + 1}
             if hasattr(self.model, 'bind_logging'):
                 self.model.bind_logging(self.run_logger, **log_details)
             self.run_logger.log_model_input(d['rounds'], context, tools,
                 model=getattr(self.model, 'model', type(self.model).__name__),
-                options=options, stream=tools == [], **log_details)
+                options=options, stream=True, **log_details)
             try:
-                if tools == []:
-                    # 流式输出纯文本轮次，让用户实时看到 token。
-                    collected: list[str] = []
-                    reasoning_collected: list[str] = []
-                    final_response = None
-                    stream = self.model.stream_chat(context, tools=[], **options)
+                # Research and verification answers must pass the evidence checks before display.
+                preview = (not state['profile'].startswith('web')
+                           and not state.get('evidence_refs') and not state.get('execution_requested')
+                           and not state.get('verification_required') and state.get('phase') != 'recover')
+                prefix = ''
+                started_text = False
+                response = None
+                stream = self.model.stream_chat(context, tools=tools, **options)
+                try:
                     for chunk in stream:
                         if time.monotonic() - request_started >= request_limit:
-                            stream.close()
                             return self.finish_timeout(task_expired=self.remaining_seconds() <= 0)
-                        if isinstance(chunk, tuple) and chunk[0] == 'reasoning':
+                        if isinstance(chunk, tuple):
                             self.run_logger.record('model_stream_chunk', kind='reasoning', text=chunk[1], **log_details)
-                            reasoning_collected.append(chunk[1])
                             self.on_event('reasoning_token', {})
                         elif isinstance(chunk, str):
                             self.run_logger.record('model_stream_chunk', kind='content', text=chunk, **log_details)
-                            collected.append(chunk)
+                            if not preview:
+                                continue
+                            if not started_text:
+                                prefix += chunk
+                                head = prefix.lstrip()
+                                if not head or '[[PARTIAL]]'.startswith(head):
+                                    continue
+                                if head.startswith('<') and '>' not in head and len(head) < 48:
+                                    continue
+                                if head.startswith('[[PARTIAL]]') or re.match(r'<[^>\n]{0,40}DSML', head, re.I):
+                                    preview = False
+                                    continue
+                                started_text = True
+                                chunk = prefix
                             self.on_event('stream_token', {'text': chunk})
                         else:
-                            final_response = chunk
-                    if final_response is None:
-                        from genesisai.shared.messages import Response
-                        final_response = Response(content=''.join(collected))
-                    # 如果最终响应缺少推理内容，则补充已收集的推理。
-                    if reasoning_collected and not final_response.reasoning:
-                        final_response.reasoning = ''.join(reasoning_collected)
-                    response = final_response; break
-                response = self.model.chat(context, tools=tools, **options); break
+                            response = chunk
+                finally:
+                    stream.close()
+                if response is None:
+                    raise ValueError('模型流提前结束，未收到完整响应')
+                break
+            except KeyboardInterrupt:
+                raise
             except BaseException as exc:
                 self.run_logger.error('model_error', exc, **log_details)
                 if not isinstance(exc, Exception):

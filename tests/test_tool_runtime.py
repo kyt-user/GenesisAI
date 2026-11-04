@@ -26,8 +26,7 @@ def make_runtime(tmp_path, **kwargs):
         store,
         Access([inputs], output, work),
         providers=kwargs.pop("providers", []),
-        confirm_writes=kwargs.pop("confirm_writes", False),
-        confirm_search=kwargs.pop("confirm_search", False),
+        permission_mode=kwargs.pop("permission_mode", "auto"),
         **kwargs,
     )
     return inputs, output, store, runtime
@@ -191,7 +190,7 @@ def test_network_confirmation_uses_network_message(tmp_path):
         def search(self, query, limit=5):
             return []
 
-    _, _, _, runtime = make_runtime(tmp_path, providers=[Provider()], confirm_search=True)
+    _, _, _, runtime = make_runtime(tmp_path, providers=[Provider()], permission_mode="user")
     model = FakeModel(
         response(call("fetch_web_content", {"query": "Apple"}, "network_call")),
     )
@@ -221,55 +220,49 @@ def test_session_restore_keeps_messages_for_followup(tmp_path):
     ]
 
 
-def test_permission_modes_are_independent_and_session_local(tmp_path):
-    _, _, _, runtime = make_runtime(tmp_path, confirm_writes=True, confirm_search=True)
-    assert runtime.permission_mode == "ASK"
-
-    runtime.set_permission("network", "allow")
-    assert runtime.confirm_search is False and runtime.confirm_writes is True
-    assert runtime.permission_mode == "MIXED"
-
-    runtime.set_permission("writes", "allow")
-    assert runtime.confirm_search is False and runtime.confirm_writes is False
-    assert runtime.permission_mode == "MIXED"
-
-    runtime.set_permission("shell", "allow")
-    assert runtime.permission_mode == "ALLOW"
-
-    runtime.set_permission("network", "ask")
-    assert runtime.confirm_search is True and runtime.confirm_writes is False
-    assert runtime.permission_mode == "MIXED"
-
-    with pytest.raises(ValueError, match="权限类型"):
-        runtime.set_permission("database", "allow")
+@pytest.mark.parametrize("mode", ["user", "auto"])
+def test_permission_matrix_and_session_restore(tmp_path, mode):
+    _, _, store, runtime = make_runtime(tmp_path, permission_mode=mode)
+    for name in ("editor", "fetch_web_content", "run_commands"):
+        assert runtime.policy.requires_confirmation(runtime.registry.get(name), {}) == (mode == "user")
+    assert not runtime.policy.requires_confirmation(runtime.registry.get("read_files"), {})
+    restored = ToolRuntime(Store(store.root, store.id), runtime.access)
+    assert restored.permission_mode == mode
     with pytest.raises(ValueError, match="权限模式"):
-        runtime.set_permission("network", "always")
+        restored.set_permission("sometimes")
 
 
-@pytest.mark.parametrize(
-    "confirm_writes,confirm_search,write_pending,network_pending",
-    [
-        (True, True, True, True),
-        (True, False, True, False),
-        (False, True, False, True),
-        (False, False, False, False),
-    ],
-)
-def test_permission_matrix_is_independent(
-    tmp_path, confirm_writes, confirm_search, write_pending, network_pending
-):
-    _, _, _, runtime = make_runtime(
-        tmp_path,
-        confirm_writes=confirm_writes,
-        confirm_search=confirm_search,
-    )
+def test_local_project_inspection_needs_no_approval(tmp_path):
+    _, _, _, runtime = make_runtime(tmp_path, permission_mode="user")
+    inspected = runtime.execute(call("run_commands", {"operation": "inspect", "cwd": "."}, "inspect"))
+    assert inspected["ok"]
+    command = {"operation": "run", "command": ["git", "status"]}
+    assert runtime.execute(call("run_commands", command, "shell"))["pending"]
 
-    assert runtime.policy.requires_confirmation(runtime.registry.get("editor").spec) is write_pending
-    assert runtime.policy.requires_confirmation(runtime.registry.get("fetch_web_content").spec) is network_pending
+
+def test_host_file_access_follows_mode_and_survives_session_restore(tmp_path):
+    _, _, store, runtime = make_runtime(tmp_path, permission_mode="user")
+    outside = tmp_path / "host.md"
+    outside.write_text("host", encoding="utf-8")
+    read_host = {"path": str(outside)}
+    assert runtime.execute(call("read_files", read_host, "blocked"))["error"]["code"] == "permission_denied"
+    runtime.set_permission("auto")
+    assert runtime.execute(call("read_files", read_host, "read"))["ok"]
+    target = tmp_path / "created.md"
+    create = {"operation": "create", "path": str(target), "content": "outside"}
+    assert runtime.execute(call("editor", create, "write"))["ok"]
+    store.verify_sources()
+    store.verify_artifacts()
+    assert target.read_text() == "outside"
+    runtime.set_permission("user")
+    store.refresh_local_files()
+    store.verify_artifacts()
+    assert runtime.execute(call("editor", {"operation": "delete", "path": str(target)}, "blocked_delete"))["error"]["code"] == "permission_denied"
+    assert target.exists()
 
 
 def test_permission_switch_does_not_unfreeze_prepared_call(tmp_path):
-    inputs, output, store, runtime = make_runtime(tmp_path, confirm_writes=True)
+    inputs, output, store, runtime = make_runtime(tmp_path, permission_mode="user")
     model = FakeModel(
         response(call("editor", {"operation": "copy", "source": "note.md", "path": "copy.md"}, "frozen_copy")),
         Response(content="handled"),
@@ -277,7 +270,7 @@ def test_permission_switch_does_not_unfreeze_prepared_call(tmp_path):
     runner = Runner(model, runtime)
     assert runner.start("复制文件")["status"] == "awaiting_confirmation"
 
-    runtime.set_permission("writes", "allow")
+    runtime.set_permission("auto")
     (inputs / "note.md").write_text("CHANGED", encoding="utf-8")
     result = runner.confirm(True)
 
@@ -295,7 +288,7 @@ def test_unknown_tool_is_unavailable_and_not_offered(tmp_path):
 
 
 def test_confirmation_restart_restores_write(tmp_path):
-    _, output, store, runtime = make_runtime(tmp_path, confirm_writes=True)
+    _, output, store, runtime = make_runtime(tmp_path, permission_mode="user")
     model = FakeModel(
         response(call("editor", {"operation": "create", "path": "result.md", "content": "ok", "source_refs": []}, "write")),
     )
@@ -303,7 +296,7 @@ def test_confirmation_restart_restores_write(tmp_path):
     assert runner.start("创建文件")["status"] == "awaiting_confirmation"
 
     loaded = Store(store.root, store.id)
-    restored = ToolRuntime(loaded, runtime.access, providers=[], confirm_writes=True)
+    restored = ToolRuntime(loaded, runtime.access, providers=[], permission_mode="user")
 
     result = Runner(FakeModel(Response(content="done")), restored).confirm(True)
     assert result["status"] == "completed"
@@ -311,7 +304,7 @@ def test_confirmation_restart_restores_write(tmp_path):
 
 
 def test_disabled_tool_cannot_execute_after_confirmation(tmp_path, monkeypatch):
-    _, output, store, runtime = make_runtime(tmp_path, confirm_writes=True)
+    _, output, store, runtime = make_runtime(tmp_path, permission_mode="user")
     model = FakeModel(
         response(call("editor", {"operation": "create", "path": "blocked.md", "content": "x", "source_refs": []}, "write_disabled")),
         Response(content="handled"),
@@ -360,6 +353,9 @@ def test_cancel_acknowledges_unknown_without_replaying_it(tmp_path):
         "result": runtime.error(uncertain, "unknown_execution", "结果不确定"),
     }
     store.data["status"] = "interrupted"
+    store.data["pending"] = [uncertain]
+    store.data['messages'].extend([dict(role='user', content='创建文件'),
+                                   dict(role='assistant', content=None, tool_calls=[uncertain])])
     store.save()
     runner = Runner(FakeModel(Response(content="继续完成")), runtime)
 
@@ -367,6 +363,10 @@ def test_cancel_acknowledges_unknown_without_replaying_it(tmp_path):
         runner.start("直接继续")
 
     assert runner.cancel()["status"] == "cancelled"
+    delivered = json.loads(store.data['messages'][-1]['content'])
+    assert delivered['error']['code'] == 'unknown_execution'
+    assert '未执行' not in delivered['error']['message']
+    assert store.data['last_run_outcome']['tool_activity'][-1]['executed'] is None
     assert runner.start("确认后继续")["status"] == "completed"
     assert store.data["calls"]["unknown"]["state"] == "unknown"
     assert store.data["calls"]["unknown"]["acknowledged"] is True

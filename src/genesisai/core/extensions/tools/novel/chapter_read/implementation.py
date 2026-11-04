@@ -38,7 +38,7 @@ class Implementation:
                 break
 
         return {
-            "path": str(target.relative_to(context.access.workspace)),
+            "path": context.access.display_path(target),
             "heading": heading,
             "total_chars": total,
             "line_count": line_count,

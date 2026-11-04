@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 import json
 import time
 from pathlib import Path
@@ -38,14 +39,12 @@ class ToolRuntime:
         *,
         network=None,
         providers=None,
-        confirm_writes: bool = True,
-        confirm_search: bool = True,
-        confirm_shell: bool = True,
+        permission_mode: str | None = None,
         registry: ToolRegistry | None = None,
         logger=None,
     ):
         self.store = store
-        self.access = access
+        self.access = copy(access)
         self.logger = logger or store.get_logger()
         self._network = network or Network()
         self._providers = providers if providers is not None else [
@@ -55,12 +54,7 @@ class ToolRuntime:
         ]
         self.registry = registry or ToolRegistry()
         self.loader = ToolLoader()
-        self.policy = PermissionPolicy(
-            confirm_writes=confirm_writes,
-            confirm_search=confirm_search,
-            confirm_shell=confirm_shell,
-            store=self.store,
-        )
+        self.set_permission(permission_mode if permission_mode is not None else store.data.get("permission_mode", "user"))
         self.catalog = ToolCatalog(
             self.registry,
             self.loader,
@@ -92,31 +86,7 @@ class ToolRuntime:
         # Skills 可执行缝：内核工具 use_skill 经此取回 SKILL.md 正文。
         self.skills = SkillRegistry(workspace, self.registry)
         # MCP 桥接缝：读取 .genesis/mcp.json 并动态注册 category="mcp" 工具。
-        self.mcp = McpBridge(workspace, self.registry, self.loader).connect_all()
-
-    @property
-    def confirm_writes(self) -> bool:
-        return self.policy.confirm_writes
-
-    @confirm_writes.setter
-    def confirm_writes(self, value: bool) -> None:
-        self.policy.confirm_writes = value
-
-    @property
-    def confirm_search(self) -> bool:
-        return self.policy.confirm_search
-
-    @confirm_search.setter
-    def confirm_search(self, value: bool) -> None:
-        self.policy.confirm_search = value
-
-    @property
-    def confirm_shell(self) -> bool:
-        return self.policy.confirm_shell
-
-    @confirm_shell.setter
-    def confirm_shell(self, value: bool) -> None:
-        self.policy.confirm_shell = value
+        self.mcp = McpBridge(workspace, self.registry, self.loader).configure(self.store.data.setdefault('mcp_tools', {}))
 
     @property
     def network(self):
@@ -146,7 +116,7 @@ class ToolRuntime:
         invocation_id = uid('invocation')
         info = call if isinstance(call, dict) else {}
         prior = self.store.data['calls'].get(info.get('id', '')) if isinstance(info.get('id', ''), str) else None
-        details = {'invocation_id': invocation_id, 'approved': approved is not None,
+        details = {'invocation_id': invocation_id, 'permission_mode': self.permission_mode, 'approved': approved is not None,
                    'prior_state': (prior or {}).get('state')}
         self.logger.log_tool_execution_start(info.get('id'), info.get('name'), info.get('arguments'), **details)
         started = time.monotonic()
@@ -206,14 +176,30 @@ class ToolRuntime:
     def permission_mode(self) -> str:
         return self.policy.mode
 
-    def set_permission(self, capability: str, mode: str) -> None:
-        self.policy.set_mode(capability, mode)
+    def set_permission(self, mode: str) -> None:
+        policy = PermissionPolicy(mode)
+        previous = self.store.data.get('permission_mode', 'user')
+        if previous != mode:
+            self.store.data['permission_mode'] = mode
+            try:
+                self.store.save()
+            except Exception:
+                self.store.data['permission_mode'] = previous
+                raise
+            if mode == 'user' and hasattr(self, 'mcp'):
+                self.mcp.close()
+        self.policy = policy
+        self.access.host_access = mode == 'auto'
+        if hasattr(self, 'executor'):
+            self.executor.policy = policy
 
     def confirmation_message(self, name: str) -> str:
         """根据工具固定 Spec 返回准确的待确认类型。"""
         self.registry.refresh()
         if name in self.registry:
             permission = self.registry.get(name).spec.permission
+            if self.registry.get(name).category == "mcp":
+                return "需要确认 MCP 服务启动或调用"
             if permission == "network":
                 return "需要确认公开网络请求"
             if permission == "write":

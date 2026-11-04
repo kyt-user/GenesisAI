@@ -19,6 +19,7 @@ from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.model.providers.deepseek import DeepSeekClient
 from genesisai.shared.messages import Response
 from genesisai.shared.security import Access
+from genesisai.shared.run_control import RunControl
 from test_acceptance import FakeModel, call, response
 
 
@@ -189,7 +190,8 @@ def test_provider_request_and_raw_response_with_defaults(runtime_factory):
     model.client = OpenAI(api_key='sk-fixture-private', base_url='https://fixture.invalid',
                           http_client=httpx.Client(transport=httpx.MockTransport(handler)), max_retries=0)
     try:
-        assert Runner(model, rt).start('hello')['status'] == 'completed'
+        model.bind_logging(rt.logger)
+        model.chat(rt.context_budgeter.build('direct_answer'), tools=rt.definitions())
         req = events(rt, 'provider_request')[0]['payload']['request']
         assert req['messages'] == captured[0]['messages']
         assert req['tools'] == captured[0]['tools']
@@ -227,18 +229,64 @@ def test_provider_stream_raw_chunks_and_complete_answer(runtime_factory):
 
 
 def test_shell_full_output_exceeds_tool_truncation(runtime_factory):
-    _, rt = runtime_factory(confirm_shell=False)
+    _, rt = runtime_factory(permission_mode="auto")
     result = rt.execute(call('run_commands', {'command':[sys.executable,'-c',"print('x'*13000+'TAIL_STDOUT')"]}))
     assert result['data']['truncated'] is True
     assert 'TAIL_STDOUT' not in result['data']['stdout']
     assert events(rt, 'command_output')[0]['payload']['stdout'].endswith('TAIL_STDOUT\n')
 
 
+@pytest.mark.parametrize('ask', [False, True])
+def test_cancel_started_command_reports_side_effect_once(runtime_factory, ask):
+    ws, rt = runtime_factory(permission_mode="user" if ask else "auto")
+    script = "from pathlib import Path; import time; Path('marker').write_text('ran'); print('ready',flush=True); time.sleep(5)"
+    cmd = call('run_commands', {'command': [sys.executable, '-c', script]})
+    runner = Runner(FakeModel(response(cmd)), rt)
+    control = RunControl(lambda kind, _: control.cancel() if kind == 'command_output' else None)
+    if ask:
+        assert runner.start('run test')['status'] == 'awaiting_confirmation'
+        result = control.execute(lambda: runner.confirm(True))
+    else:
+        result = control.execute(lambda: runner.start('run test'))
+    assert result['status'] == 'cancelled' and (ws / 'marker').read_text() == 'ran'
+    entry = rt.store.data['calls'][cmd['id']]
+    assert entry['executed'] and entry['state'] == 'failed'
+    delivered, = [json.loads(m['content']) for m in rt.store.data['messages'] if m['role'] == 'tool']
+    assert delivered['error']['code'] == 'command_cancelled'
+    assert '可能已产生部分修改' in delivered['error']['message']
+    assert not rt.store.data['pending']
+    Runner.check_available(rt.store.data)
+
+
+def test_fast_command_bounds_display_and_preserves_full_log(runtime_factory):
+    from pathlib import Path
+    from genesisai.app.run_queue import RunQueue
+
+    _, rt = runtime_factory(permission_mode="auto")
+    runs = RunQueue()
+    script = "import sys; print('x\\n' * 20000,end=''); print('stderr tail',file=sys.stderr)"
+    try:
+        runs.start(lambda: rt.execute(call('run_commands', {'command': [sys.executable, '-c', script]})))
+        data = runs.future.result(timeout=10)['data']
+        assert runs.events.qsize() == 1
+        display = []
+        runs.drain(lambda kind, item: display.append(item['text']))
+        assert len(display) == 1 and len(display[0]) < 4200 and '省略' in display[0]
+        chunks = [r['payload'] for r in events(rt, 'command_output_chunk')]
+        assert ''.join(c['text'] for c in chunks if c['stream'] == 'stdout') == 'x\n' * 20000
+        assert ''.join(c['text'] for c in chunks if c['stream'] == 'stderr') == 'stderr tail\n'
+        assert len(chunks) < 10
+        assert Path(data['log_path']).read_text(encoding='utf8').count('x\n') == 20000
+        assert data['truncated'] and len(data['stdout']) == 12000
+    finally:
+        runs.close()
+
+
 def test_cli_inputs_outputs_logs_command_and_new_session(tmp_path, monkeypatch):
     from genesisai.app import cli
     monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=StringIO(), width=120, force_terminal=False))
     monkeypatch.setattr(cli, 'build_model', lambda *a, **kw: (FakeModel(), False))
-    commands = iter(['/logs', '/help', '/new', '/logs', '/exit'])
+    commands = iter(['first', '/logs', '/help', '/new', 'second', '/logs', '/exit'])
     monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: next(commands))
     ws = tmp_path/'cli'
     assert cli.main(['--workspace',str(ws),'--no-agent-docs']) == 0
@@ -246,7 +294,7 @@ def test_cli_inputs_outputs_logs_command_and_new_session(tmp_path, monkeypatch):
     assert len(files) == 2
     records = [[json.loads(line) for line in p.read_text(encoding='utf-8').splitlines()] for p in files]
     commands_by_session = [[r['payload']['text'] for r in rows if r['event']=='cli_input'] for rows in records]
-    assert sorted(commands_by_session) == sorted([['/logs','/help','/new'],['/logs','/exit']])
+    assert sorted(commands_by_session) == sorted([['first','/logs','/help','/new'],['second','/logs','/exit']])
     assert all(any(r['event']=='cli_output' and '.jsonl' in r['payload']['text'] for r in rows) for rows in records)
 
 

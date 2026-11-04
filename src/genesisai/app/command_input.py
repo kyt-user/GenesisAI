@@ -1,15 +1,26 @@
 """Terminal input and the shared command catalogue."""
+import asyncio
+from collections import deque
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
+from rich.cells import chop_cells
+
+from genesisai.app.run_queue import PREVIEW_ROWS
+from genesisai.app.terminal_text import terminal_text
 
 
 COMMANDS = [
     ('/sessions', '继续历史会话', '会话'),
-    ('/new', '开始新会话', '会话'),
-    ('/model', '选择模型', '模型与权限'),
+    ('/new', '返回工作区首页', '会话'),
+    ('/pet', '唤出 Windows 桌宠', '会话'),
+    ('/workspace', '查看或切换工作区', '项目'),
+    ('/auth', '切换模型提供商和配置密钥', '模型与权限'),
+    ('/model', '切换当前提供商的模型', '模型与权限'),
     ('/permissions', '查看操作权限', '模型与权限'),
     ('/compact', '压缩当前上下文', '会话'),
     ('/help', '查看全部操作', '帮助'),
@@ -25,18 +36,15 @@ COMMANDS = [
     ('/tools', '查看可用工具', '项目'),
     ('/skills', '列出可加载的 Skill', '项目'),
     ('/workflow', '列出工作区工作流', '项目'),
-    ('/auth', '配置提供商和密钥', '模型与权限'),
-    ('/allow writes', '允许本会话的文件写入', '模型与权限'),
-    ('/allow shell', '允许本会话的命令执行', '模型与权限'),
-    ('/allow network', '允许本会话的网络请求', '模型与权限'),
-    ('/allow network run', '允许本轮的网络请求', '模型与权限'),
-    ('/permissions writes ask', '恢复逐次确认文件写入', '模型与权限'),
-    ('/permissions shell ask', '恢复逐次确认命令执行', '模型与权限'),
-    ('/permissions network ask', '恢复逐次确认网络请求', '模型与权限'),
+    ('/permissions user', '用户审批，写入与对外调用逐次确认', '模型与权限'),
+    ('/permissions auto', '自动审批，允许读写宿主文件', '模型与权限'),
     ('/approve', '允许当前操作一次', '运行'),
     ('/reject', '拒绝当前操作', '运行'),
     ('/resume', '继续中断的运行', '运行'),
     ('/cancel', '取消当前任务', '运行'),
+    ('/queue', '查看排队消息', '运行'),
+    ('/queue resume', '继续已暂停的消息队列', '运行'),
+    ('/queue clear', '移除尚未开始的排队消息', '运行'),
     ('/exit', '保存会话并退出', '会话'),
 ]
 
@@ -53,8 +61,15 @@ class CommandCompleter(Completer):
                                  display_meta=f'{group} · {description}')
 
 
-def input_bindings(palette=False):
+def input_bindings(palette=False, recent=False):
     bindings = KeyBindings()
+
+    if recent:
+        from prompt_toolkit.application.current import get_app
+
+        @bindings.add('up', filter=Condition(lambda: not get_app().current_buffer.text))
+        def select_recent(event):
+            event.app.exit(result='/recent')
 
     @bindings.add('enter')
     def submit(event):
@@ -112,11 +127,56 @@ class TaskInput:
             }),
         )
 
-    def read(self, status='', *, default=''):
+    def read_running(self, runs, render, draft):
+        app = self.session.app
+        output = deque()
+
+        def write_output():
+            while output:
+                render(*output.popleft())
+
+        async def refresh():
+            while not app.is_done:
+                if not runs.events.empty():
+                    previous = runs.stage, runs.preview
+                    runs.drain(lambda kind, value: output.append((kind, value)), limit=128)
+                    if output:
+                        await run_in_terminal(write_output)
+                    elif previous != (runs.stage, runs.preview):
+                        app.invalidate()
+                if runs.future.done():
+                    if not app.is_done:
+                        app.exit(result=None)
+                    return
+                await asyncio.sleep(.05)
+
+        def prompt():
+            width = max(1, app.output.get_size().columns - 1)
+            rows = []
+            for line in terminal_text(runs.preview).split('\n'):
+                rows.extend(chop_cells(line.expandtabs(), width) or [''])
+            rows = rows[-PREVIEW_ROWS:]
+            rows.extend([''] * (PREVIEW_ROWS - len(rows)))
+            return [('', '\n'.join(rows) + '\n'), ('class:prompt', '› ')]
+
+        app.erase_when_done = True
+        try:
+            result = self.session.prompt(
+                prompt, default=draft, key_bindings=input_bindings(),
+                bottom_toolbar=lambda: f'{runs.stage} · 排队 {len(runs.pending)} · Enter 排队 · /cancel 取消',
+                pre_run=lambda: app.create_background_task(refresh()),
+            )
+        finally:
+            app.erase_when_done = False
+            # Enter or Ctrl+C can close the prompt while a scrollback write is pending.
+            write_output()
+        return result, self.session.default_buffer.text if result is None else ''
+
+    def read(self, status='', *, default='', recent=False):
         return self.session.prompt(
             [('class:prompt', '› ')], default=default,
             prompt_continuation='  ',
-            key_bindings=input_bindings(palette=default == '/'),
+            key_bindings=input_bindings(palette=default == '/', recent=recent),
             bottom_toolbar=lambda: status + '\nEnter 发送 · Alt+Enter 换行 · / 操作 · Ctrl+C 清空或退出',
             pre_run=(lambda: self.session.default_buffer.start_completion()) if default == '/' else None,
         )

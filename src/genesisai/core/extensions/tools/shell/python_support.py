@@ -28,7 +28,7 @@ def _relative_files(root: Path, pattern: str, *, limit: int = 5000) -> list[str]
 
 def _read_pyproject(root: Path) -> tuple[dict, str | None]:
     path = root / "pyproject.toml"
-    if not path.is_file():
+    if not path.resolve().is_relative_to(root) or not path.is_file():
         return {}, None
     try:
         data = tomllib.loads(path.read_text(encoding="utf-8"))
@@ -59,7 +59,10 @@ def _test_framework(root: Path, pyproject: dict, test_files: list[str]) -> tuple
     sample = ""
     for name in test_files[:40]:
         try:
-            sample += (root / name).read_text(encoding="utf-8", errors="replace")[:8000]
+            target = (root / name).resolve()
+            if not target.is_relative_to(root):
+                continue
+            sample += target.read_text(encoding="utf-8", errors="replace")[:8000]
         except OSError:
             continue
     if re.search(r"(^|\n)\s*(?:from\s+pytest\s+import|import\s+pytest\b)", sample):

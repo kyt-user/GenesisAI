@@ -25,7 +25,7 @@ def runtime_for(tmp_path, *, active=()):
     store = Store(state, workspace=workspace)
     store.data.update(grants=[str(workspace)], output=str(output), run_id="run_test")
     store.save()
-    runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=[], confirm_writes=False, confirm_search=False, confirm_shell=False)
+    runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=[], permission_mode="auto")
     return workspace, output, store, runtime
 
 
@@ -51,8 +51,10 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
     assert not conflict["ok"] and conflict["error"]["code"] == "patch_conflict"
     shell = execute(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-c", "print('ok')"], "cwd": ".", "timeout_seconds": 10})
     assert shell["ok"] and shell["data"]["exit_code"] == 0 and "ok" in shell["data"]["stdout"]
+    runtime.set_permission("user")
     blocked = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "commit", "-m", "x"], "cwd": "."}, "blocked_git")
-    assert not blocked["ok"] and blocked["error"]["code"] == "git_write_forbidden"
+    assert blocked["pending"] and blocked["preview"]["command"] == ["git", "commit", "-m", "x"]
+    runtime.set_permission("auto")
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
     status = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": "."}, "git_toplevel")
     assert status["ok"] and "workspace" in status["data"]["stdout"]

@@ -30,12 +30,12 @@ def test_A19_cli_commands_and_multi_turn(tmp_path, monkeypatch):
     assert any(m.content=='First' for m in model.contexts[1])
 
 
-def test_A24_remote_denied_before_model(tmp_path, monkeypatch):
+def test_remote_model_receives_submitted_prompt_in_user_mode(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
-    model=FakeModel()
-    monkeypatch.setattr(cli,'build_model',lambda p:(model,True))
-    assert main(['--workspace',str(tmp_path/'work'),'--prompt','private'])==2
-    assert not model.contexts
+    model = FakeModel(Response(content='received'))
+    monkeypatch.setattr(cli, 'build_model', lambda p: (model, True))
+    assert main(['--workspace', str(tmp_path/'work'), '--permissions', 'user', '--prompt', 'hello']) == 0
+    assert any(message.content == 'hello' for message in model.contexts[0])
 
 
 def test_A11_junction(tmp_path):

@@ -51,7 +51,7 @@ PROVIDERS: tuple[ProviderOption, ...] = (
     ),
     ProviderOption(
         id="qwen",
-        label="通义千问 Qwen",
+        label="阿里云 Qwen · 按量 API",
         description="阿里云 DashScope（OpenAI 兼容）",
         api_key_env="DASHSCOPE_API_KEY",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -63,6 +63,21 @@ PROVIDERS: tuple[ProviderOption, ...] = (
         default_model="qwen-plus",
         key_hint="sk-...",
         docs_url="https://bailian.console.aliyun.com/",
+    ),
+    ProviderOption(
+        id="qwen_token_plan",
+        label="阿里云 Token Plan",
+        description="千问订阅套餐 · 专属密钥与接口（OpenAI 兼容）",
+        api_key_env="QWEN_TOKEN_PLAN",
+        base_url="https://token-plan.maas.qianwenaiapi.com/compatible-mode/v1",
+        models=(
+            ModelOption("qwen3.8-flash", "Qwen 3.8 Flash", "默认模型"),
+            ModelOption("qwen3.8-max", "Qwen 3.8 Max", "通用推理模型"),
+            ModelOption("auto", "Auto", "平台自动选择模型"),
+        ),
+        default_model="qwen3.8-flash",
+        key_hint="sk-sp-...",
+        docs_url="https://platform.qianwenai.com/docs/token-plan/personal/token-plan-personal-quickstart",
     ),
 )
 

@@ -22,9 +22,7 @@ def development_env(tmp_path, *, planned=True):
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
         providers=[],
     )
     return workspace, manager, task, store, runtime
@@ -59,9 +57,7 @@ def test_start_without_active_task_does_not_invent_development_context(tmp_path)
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
         providers=[],
     )
 

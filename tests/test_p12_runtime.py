@@ -7,7 +7,6 @@ import time
 from io import StringIO
 from rich.console import Console
 from genesisai.app.terminal_view import CliView
-from genesisai.core.tools.permissions import PermissionPolicy
 from genesisai.core.research import ResearchController
 
 from test_p11_agent_runtime import runtime_env, FakeModel, tool_call
@@ -37,7 +36,7 @@ def seed_page(runtime, url="https://example.com/product"):
 def test_cached_success_never_crashes_or_requests_approval(runtime_env):
     store, runtime = runtime_env
     url = seed_page(runtime)
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     result = runtime.execute(call("fetch_web_content", {"url": url}, "cached"))
     assert result["ok"] and result["data"]["cached"]
     assert runtime.network.calls == 1
@@ -47,7 +46,7 @@ def test_cached_success_never_crashes_or_requests_approval(runtime_env):
 
 def test_invalid_url_is_rejected_before_approval(runtime_env):
     _, runtime = runtime_env
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     result = runtime.execute(call("fetch_web_content", {"url": "https://example.com/unknown"}, "bad"))
     assert not result.get("pending")
     assert result["error"]["code"] == "candidate_not_registered"
@@ -98,7 +97,7 @@ def query_provider(runtime):
 
 
 def waiting_runner(runtime):
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     provider = query_provider(runtime)
     model = FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'query': 'product A price'}, 'q1')]),
@@ -110,29 +109,25 @@ def waiting_runner(runtime):
     return runner, provider
 
 
-def test_run_grant_executes_pending_once_and_expires(runtime_env):
-    store, runtime = runtime_env
+def test_user_approval_applies_to_one_external_call(runtime_env):
+    _, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
-    runtime.policy.allow_network_run()
-    assert runner.confirm(True)['status'] == 'partial'
-    assert provider.calls == 2
-    assert runtime.policy.network_run_id is None
-    with pytest.raises(ValueError):
-        runner.confirm(True)
-    runner.model = FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'query': 'new question'}, 'q3')]))
-    assert runner.start('再问一个问题')['status'] == 'awaiting_confirmation'
-    assert provider.calls == 2
+    assert provider.calls == 0
+    assert runner.confirm(True)['status'] == 'awaiting_confirmation'
+    assert provider.calls == 1
+    runner.confirm(False)
+    assert provider.calls == 1
 
 
-def test_session_grant_and_revocation_are_independent(runtime_env):
+def test_switching_mode_changes_all_tool_approvals(runtime_env):
     store, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
-    runtime.set_permission('network', 'allow')
+    runtime.set_permission("auto")
     assert runner.confirm(True)['status'] == 'partial'
-    assert not runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
-    assert runtime.policy.requires_confirmation(runtime.registry.get('run_commands').spec)
-    runtime.set_permission('network', 'ask')
-    assert runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
+    assert not runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content'), {})
+    assert not runtime.policy.requires_confirmation(runtime.registry.get('run_commands'), {})
+    runtime.set_permission("user")
+    assert runtime.policy.requires_confirmation(runtime.registry.get('fetch_web_content'), {})
     assert provider.calls == 2
 
 
@@ -156,25 +151,13 @@ def test_expired_approval_is_repreviewed_even_with_session_allow(runtime_env, mo
     _, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
     now += 901
-    runtime.set_permission('network', 'allow')
+    runtime.set_permission("auto")
     result = runner.confirm(True)
     assert result['status'] == 'awaiting_confirmation'
     assert '过期' in result['answer']
     assert provider.calls == 0
     assert runner.confirm(True)['status'] == 'partial'
     assert provider.calls == 2
-
-
-def test_run_grant_does_not_restore_or_override_writes(runtime_env):
-    store, runtime = runtime_env
-    runner, _ = waiting_runner(runtime)
-    runtime.confirm_writes = True
-    runtime.policy.allow_network_run()
-    assert runtime.policy.requires_confirmation(runtime.registry.get('editor').spec)
-    restored = PermissionPolicy(store=store)
-    assert restored.requires_confirmation(runtime.registry.get('fetch_web_content').spec)
-    runner.cancel()
-    assert runtime.policy.network_run_id is None
 
 
 @pytest.mark.parametrize('boundary', ['drive', 'confirmation'])
@@ -263,7 +246,7 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
             return dict(url=url, title='Fixture product A', text=text, truncated=False)
     provider, network = Provider(), Network()
     runtime.providers, runtime.network = [provider], network
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     def answer(text):
         return lambda _: Response(content=text + ' [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
@@ -272,7 +255,7 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
         answer('Product A synthetic specifications'),
     ), runtime, on_event=lambda kind, value: events.append((kind, value)))
     assert runner.start('看看产品 A')['status'] == 'awaiting_confirmation'
-    runtime.set_permission('network', 'allow')
+    runtime.set_permission("auto")
     assert runner.confirm(True)['status'] == 'completed'
     runner.model = FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/buy'}, 'r1bad')]),
@@ -294,7 +277,7 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     assert runner.model.tools == []
 
 
-@pytest.mark.parametrize('approve', ['确认', '同意', '/allow network run', '/allow network'])
+@pytest.mark.parametrize('approve', ['确认', '同意', '/approve'])
 def test_cli_network_approval_paths(tmp_path, monkeypatch, approve):
     import genesisai.app.cli as cli
     from test_acceptance import FakeModel as CliModel
@@ -325,7 +308,7 @@ def test_frozen_parameters_cannot_change_after_approval(runtime_env):
     store, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
     # The request remains frozen even after switching session permission to allow.
-    runtime.set_permission('network', 'allow')
+    runtime.set_permission("auto")
     store.data['pending'][0]['arguments'] = json.dumps({'query': 'changed'})
     result = runner.confirm(True)
     tool_results = [json.loads(m['content']) for m in store.data['messages'] if m.get('tool_call_id') == 'q1']
@@ -335,7 +318,7 @@ def test_frozen_parameters_cannot_change_after_approval(runtime_env):
 
 def test_repeated_bad_url_cannot_issue_network(runtime_env):
     _, runtime = runtime_env
-    runtime.confirm_search = True
+    runtime.set_permission("user")
     for i in range(3):
         result = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/missing'}, f'bad{i}'))
         assert not result.get('pending') and result['error']['code'] == 'candidate_not_registered'
@@ -373,10 +356,10 @@ def test_search_budget_does_not_cancel_fetch_after_second_query(runtime_env):
 
 def test_new_session_resets_startup_preapproval(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
-    model = FakeModel(Response(content='你好'))
+    model = FakeModel(Response(content='你好'), Response(content='你好'))
     monkeypatch.setattr(cli, 'build_model', lambda path: (model, False))
     monkeypatch.setattr(cli, 'Console', lambda **kw: Console(file=StringIO(), force_terminal=False))
-    commands = iter(['/new', '/exit'])
+    commands = iter(['你好', '/new', '你好', '/exit'])
     monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: next(commands))
     captured = []
     original = cli.build_cli_session
@@ -385,9 +368,9 @@ def test_new_session_resets_startup_preapproval(tmp_path, monkeypatch):
         captured.append(state)
         return state
     monkeypatch.setattr(cli, 'build_cli_session', build)
-    assert cli.main(['--workspace', str(tmp_path / 'workspace'), '--yes-search', '--yes-shell', '--yes-writes']) == 0
-    assert not captured[0].runtime.confirm_search
-    assert captured[1].runtime.confirm_search and captured[1].runtime.confirm_writes and captured[1].runtime.confirm_shell
+    assert cli.main(['--workspace', str(tmp_path / 'workspace'), '--permissions', 'auto']) == 0
+    assert captured[0].runtime.permission_mode == 'auto'
+    assert captured[1].runtime.permission_mode == 'user'
 
 
 def test_actual_capabilities_are_in_model_context(runtime_env):

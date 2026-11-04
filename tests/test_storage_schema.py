@@ -76,7 +76,7 @@ def test_broken_or_non_object_json_is_not_overwritten(tmp_path, payload):
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize('field', ['workspace', 'changes', 'permission_modes', 'run_runtime'])
+@pytest.mark.parametrize('field', ['workspace', 'changes', 'run_runtime'])
 def test_missing_current_fields_are_rejected_without_automatic_repair(tmp_path, field):
     root = tmp_path / 'work'
     data = current_session(root)

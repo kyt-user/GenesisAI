@@ -78,7 +78,7 @@ def case_environment(output: Path, identifier: str) -> tuple[Path, Store, ToolRu
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
-        providers=[], confirm_writes=False, confirm_search=False, confirm_shell=False,
+        providers=[], permission_mode="auto",
     )
     return workspace, store, runtime
 

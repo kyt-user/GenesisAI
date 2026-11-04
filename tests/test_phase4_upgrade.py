@@ -43,9 +43,7 @@ def _store_and_runtime(tmp_path, *, active=()):
         store,
         Access([workspace], output, state, workspace_root=workspace),
         providers=[],
-        confirm_writes=False,
-        confirm_search=False,
-        confirm_shell=False,
+        permission_mode="auto",
     )
     return workspace, output, store, runtime
 

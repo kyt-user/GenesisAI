@@ -18,6 +18,7 @@ from genesisai.agent.recovery import RecoveryMixin, SOURCE_REF
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
 from genesisai.shared.budgets import initial_run_runtime, is_recall_request, select_initial_profile
 from genesisai.shared.ids import uid
+from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
 
 
@@ -91,7 +92,6 @@ class Runner(RecoveryMixin):
                 self.store.data['run_runtime']['lifecycle'] = target
         if value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
             self.store.data['run_runtime']['phase'] = 'done'
-            self.runtime.policy.clear_run_grant()
             self.store.data['last_run_outcome'] = {
                 'run_id': self.store.data['run_id'], 'status': value,
                 'stop_reason': self.store.data['run_runtime'].get('stop_reason'),
@@ -114,15 +114,18 @@ class Runner(RecoveryMixin):
         
         return dict(status=value, answer=self.store.data.get('answer', ''), pending=self.store.data['pending'])
 
-    def ensure_available(self):
+    @staticmethod
+    def check_available(d):
         """检查是否可以开始新运行；存在未完成运行时抛出异常。"""
-        d = self.store.data
         if d['status'] in {'running', 'awaiting_confirmation', 'interrupted'}:
             raise ValueError('先 /resume、处理确认或 /cancel，再提交新输入')
         if any(call.get('state') in {'started', 'unknown'} and not call.get('acknowledged') for call in d['calls'].values()):
             raise ValueError('存在执行结果不确定的调用；请检查输出并 /cancel，禁止开始新一轮')
 
-    def start(self, text):
+    def ensure_available(self):
+        self.check_available(self.store.data)
+
+    def start(self, text, *, on_registered=None):
         """根据用户输入初始化并启动一轮新运行。"""
         d = self.store.data
         input_id = self.run_logger.record('user_input', text=text, previous_run_id=d.get('run_id'))
@@ -130,6 +133,9 @@ class Runner(RecoveryMixin):
         if not text.strip() or len(text) > 16000:
             raise ValueError('输入不能为空或超过16000字符')
         self.store.verify_sources()
+        # Stage the new turn until its first atomic session save succeeds.
+        previous_data = d.copy()
+        d = dict(d, history=list(d['history']), messages=list(d['messages']))
         previous_runtime = d.get('run_runtime') or {}
         previous_answer = d.get('answer', '')
         previous_status = d.get('status')
@@ -182,7 +188,6 @@ class Runner(RecoveryMixin):
                 if key in previous_runtime:
                     d['run_runtime'][key] = json.loads(json.dumps(previous_runtime[key], ensure_ascii=False))
             d['run_runtime']['reuse_evidence'] = True
-        self.runtime.policy.clear_run_grant()
         d['run_runtime']['execution_seconds_limit'] = self.seconds
         d['run_runtime']['request_timeout_seconds'] = self.request_timeout
         d['run_runtime']['objective'] = active_task['title'] if continuation else text
@@ -194,28 +199,44 @@ class Runner(RecoveryMixin):
         d.update(run_id=uid('run'), status='running', rounds=0, tool_count=0, failures=0,
                  deadline=time.time() + self.seconds, pending=[], answer='', usage={},
                  limits=dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
-        if 'coding' in d['run_runtime']['protocols'] and project_manager is not None:
-            try:
-                task = project_manager.begin_task(d['run_runtime']['objective'], run_id=d['run_id'])
-                d['run_runtime']['project_task_id'] = task['id']
-                d['run_runtime']['project_task_status'] = task['status']
-            except Exception as exc:
-                d['run_runtime']['agent_docs_error'] = f'{type(exc).__name__}: {exc}'
         d['messages'].append(dict(role='user', content=text))
-        self.cancel_requested = False
-        self.machine.restart()
-        self.machine.transition('execute', 'prepared')
-        self.research.register_user_urls(text)
-        self.store.save()
-        self.store.event('run_start', profile=profile, phase='explore')
-        self.run_logger.record('run_start', input_event_id=input_id, text=text)
-        if is_recall_request(text) and previous_answer and self._can_reuse_answer(text, previous_answer):
-            # 纯文本追问不应让随机模型修改已通过来源和价格校验的事实。
-            d['messages'].append(dict(role='assistant', content=previous_answer, tool_calls=None))
-            recall_status = 'completed' if previous_status == 'completed' else 'partial'
-            d['run_runtime']['stop_reason'] = 'model_answer' if recall_status == 'completed' else 'evidence_gap'
+        self.store.data.update(d)
+        d = self.store.data
+        try:
             self.store.save()
-            return self.status(recall_status, previous_answer)
+        except BaseException:
+            d.update(previous_data)
+            raise
+        try:
+            if on_registered:
+                on_registered(d['run_id'])
+            self.machine.restart()
+            self.machine.transition('execute', 'prepared')
+            self.cancel_requested = False
+            if 'coding' in d['run_runtime']['protocols'] and project_manager is not None:
+                try:
+                    task = project_manager.begin_task(d['run_runtime']['objective'], run_id=d['run_id'])
+                    d['run_runtime']['project_task_id'] = task['id']
+                    d['run_runtime']['project_task_status'] = task['status']
+                except Exception as exc:
+                    d['run_runtime']['agent_docs_error'] = f'{type(exc).__name__}: {exc}'
+            self.research.register_user_urls(text)
+            self.store.save()
+            self.store.event('run_start', profile=profile, phase='explore')
+            self.run_logger.record('run_start', input_event_id=input_id, text=text)
+            if cancellation_requested():
+                return self.cancel()
+            if is_recall_request(text) and previous_answer and self._can_reuse_answer(text, previous_answer):
+                # 纯文本追问不应让随机模型修改已通过来源和价格校验的事实。
+                d['messages'].append(dict(role='assistant', content=previous_answer, tool_calls=None))
+                recall_status = 'completed' if previous_status == 'completed' else 'partial'
+                d['run_runtime']['stop_reason'] = 'model_answer' if recall_status == 'completed' else 'evidence_gap'
+                self.store.save()
+                return self.status(recall_status, previous_answer)
+        except KeyboardInterrupt:
+            return self.cancel()
+        except Exception as exc:
+            return self.fail(exc)
         return self.drive()
 
     def context(self, *, recovery=False, final=False):
@@ -232,10 +253,14 @@ class Runner(RecoveryMixin):
         """记录工具执行结果到会话消息和工具活动日志。"""
         d = self.store.data
         self.run_logger.record('tool_result_delivery', call=call, result=result)
+        entry = d['calls'].get(call['id'], {})
+        executed = entry.get('executed')
+        if executed is None and entry.get('state') not in {'unknown', 'started'}:
+            executed = False
         d['run_runtime'].setdefault('tool_activity', []).append({
             'call_id': call['id'], 'tool': call['name'], 'ok': result.get('ok'),
             'code': (result.get('error') or {}).get('code'),
-            'executed': d['calls'].get(call['id'], {}).get('executed', False),
+            'executed': executed,
         })
         d['messages'].append(dict(role='tool', tool_call_id=call['id'], content=json.dumps(result, ensure_ascii=False)))
         d['failures'] = 0 if result['ok'] else d['failures'] + 1
@@ -259,7 +284,14 @@ class Runner(RecoveryMixin):
         """以指定错误码关闭所有待处理调用。"""
         while self.store.data['pending']:
             call = self.store.data['pending'][0]
-            self.append_result(call, self.runtime.error(call, code, '本次运行已停止，工具未执行；原因：' + code))
+            entry = self.store.data['calls'].get(call['id'], {})
+            result = entry.get('result')
+            if result is None:
+                if entry.get('state') in {'started', 'unknown'}:
+                    result = self.runtime.error(call, 'unknown_execution', '工具执行结果不确定，可能已产生修改，请检查输出。')
+                else:
+                    result = self.runtime.error(call, code, '本次运行已停止，工具未执行；原因：' + code)
+            self.append_result(call, result)
 
     def stop(self, status, message, reason=None):
         """以指定状态和消息终止当前运行。"""
@@ -305,6 +337,9 @@ class Runner(RecoveryMixin):
         self.store.verify_sources()
         if d['status'] == 'awaiting_confirmation':
             return self.status('awaiting_confirmation')
+        if self.machine.state == 'ready':
+            # The host can stop just after the first durable user-message checkpoint.
+            self.machine.restart()
         self.machine.transition('execute', 'resume')
         return self.drive()
 
@@ -334,19 +369,13 @@ class Runner(RecoveryMixin):
         call = d['pending'][0]
         if time.time() >= d['deadline']:
             return self.stop('limit_reached', '运行已超时；确认没有执行', 'deadline')
+        if cancellation_requested():
+            return self.cancel()
         if approve:
             prior = d['calls'].get(call['id'], {})
             if prior.get('expires', 0) < time.time():
                 # 重建预览，但绝不用过期的确认执行。
-                d['calls'].pop(call['id'], None)
-                policy = self.runtime.policy
-                modes = policy.confirm_search, policy.confirm_writes, policy.confirm_shell
-                policy.clear_run_grant()
-                policy.confirm_search = policy.confirm_writes = policy.confirm_shell = True
-                try:
-                    result = self.runtime.execute(call)
-                finally:
-                    policy.confirm_search, policy.confirm_writes, policy.confirm_shell = modes
+                result = self.runtime.execute(call)
                 if result.get('pending'):
                     return self.status('awaiting_confirmation', '确认已过期；目标已重新预览，请再次确认。')
                 self.append_result(call, result)
@@ -357,6 +386,8 @@ class Runner(RecoveryMixin):
             result = self.research.after_execute(call, self.runtime.reject(call))
         self.machine.transition('execute', 'confirmation_resolved')
         if result.get('error') and result['error']['code'] == 'unknown_execution':
+            if cancellation_requested():
+                return self.cancel()
             return self.status('interrupted', result['error']['message'])
         self.append_result(call, result)
         if not approve:
@@ -374,7 +405,7 @@ class Runner(RecoveryMixin):
         self.status('running')
         try:
             while True:
-                if self.cancel_requested: return self.cancel()
+                if self.cancel_requested or cancellation_requested(): return self.cancel()
                 state = d['run_runtime']
                 limits = d.get('limits', dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
                 if time.time() >= d['deadline']:
@@ -400,6 +431,7 @@ class Runner(RecoveryMixin):
                 context = self.context(recovery=recovery, final=final)
                 tool_definitions = [] if final or recovery else self.runtime.definitions()
                 response = self._call_model(context, tool_definitions)
+                if cancellation_requested(): return self.cancel()
                 if isinstance(response, dict): return response
                 calls = [asdict(call) for call in response.tool_calls or []]
                 if not calls and re.search(r'<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)', response.content or '', re.I):
@@ -490,10 +522,17 @@ class Runner(RecoveryMixin):
         elapsed_ms = round((time.monotonic() - started) * 1000)
         
         if result.get('pending'):
+            if cancellation_requested():
+                return self.cancel()
             return self.status('awaiting_confirmation', self.runtime.confirmation_message(call['name']))
         self.store.event('tool_end', tool_call_id=call['id'], tool=call['name'], ok=result.get('ok'), code=(result.get('error') or {}).get('code'), elapsed_ms=elapsed_ms, profile=d['run_runtime']['profile'], phase=d['run_runtime']['phase'])
-        if result.get('error') and result['error']['code'] == 'unknown_execution': return self.status('interrupted', result['error']['message'])
+        if result.get('error') and result['error']['code'] == 'unknown_execution':
+            if cancellation_requested():
+                return self.cancel()
+            return self.status('interrupted', result['error']['message'])
         self.append_result(call, result)
+        if cancellation_requested():
+            return self.cancel()
         if call['name'] == 'attempt_completion' and result.get('ok'):
             answer = (result.get('data') or {}).get('result')
             if answer:

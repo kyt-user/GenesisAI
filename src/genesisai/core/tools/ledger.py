@@ -43,10 +43,12 @@ class CallLedger:
         )
 
     def unknown(self, call: dict, result: dict) -> None:
+        executed = self.store.data['calls'].get(call['id'], {}).get('executed')
         self.store.data["calls"][call["id"]] = {
             "call": call,
             "state": "unknown",
             "result": result,
+            "executed": executed,
         }
         self.store.save()
 

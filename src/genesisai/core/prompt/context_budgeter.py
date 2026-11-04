@@ -66,13 +66,17 @@ class ContextBudgeter:
             "agent_docs": 0,
         }
         workspace = str(Path(self.store.data["workspace"]).resolve())
+        mode = self.store.data.get("permission_mode", "user")
+        access_note = ("自动审批。内置文件工具可用绝对路径读写工作区外的宿主文件。" if mode == "auto" else
+                       "用户审批。本地只读直接执行，写入、对外调用和运行命令逐次审批，内置文件工具限于授权路径。")
         addition = (
             "\n\n## 当前工作区（可信运行时状态）\n"
             f"工作区绝对路径：`{workspace}`\n"
             f"项目工作记忆：`{Path(workspace) / 'agent_docs'}`\n"
             "所有相对文件路径均以该工作区为基准。回答工作区位置时直接使用这里的路径，"
-            "不要调用 Shell、pwd 或其他工具重新探测。不得读写工作区之外的项目文件。"
+            "不要调用 Shell、pwd 或其他工具重新探测。"
         )
+        addition += "\n当前权限：" + access_note
         system_text += addition
         system_sections["workspace"] = len(addition)
         self.store.refresh_local_files()
