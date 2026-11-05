@@ -27,8 +27,8 @@ class ToolExecutor:
         descriptor = None
         execution_started = False
         try:
-            state = self.context.store.data
-            if state.get('status') == 'running' and state.get('deadline') and time.time() >= state['deadline']:
+            state = self.context.store.record
+            if getattr(state, 'status') == 'running' and getattr(state, 'deadline') and (time.time() >= state.deadline):
                 raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
             self._validate_call(call)
             prior = self.ledger.prior(call)
@@ -68,7 +68,7 @@ class ToolExecutor:
             if cancellation_requested():
                 raise ToolError('user_cancelled', '任务已取消')
             self.ledger.start(call)
-            self.ledger.store.data['calls'][call['id']]['executed'] = True
+            self.ledger.store.record.calls[call['id']]['executed'] = True
             execution_started = True
             payload = implementation.execute(self.context, args)
             if not isinstance(payload, dict):
@@ -82,10 +82,15 @@ class ToolExecutor:
                 "artifact_refs": payload.get("artifact_refs", []),
                 "truncated": bool(payload.get("truncated", False)),
             }
+            observer = getattr(implementation, 'observe', None)
+            registry = self.context.runtime.observations
+            if observer is not None and descriptor.name not in registry.adapters:
+                registry.register(descriptor.name, observer)
+            result['observations'] = registry.extract(descriptor.name, args, result)
         except Exception as exc:
             self.context.runtime.logger.error('tool_error', exc, call=call)
             call_id = call.get("id", "") if isinstance(call, dict) else ""
-            current = self.ledger.store.data["calls"].get(call_id, {})
+            current = self.ledger.store.record.calls.get(call_id, {})
             target = preview.get("target") if isinstance(preview, dict) else None
             if (
                 current.get("state") == "started"
@@ -126,14 +131,14 @@ class ToolExecutor:
                         "unknown_execution",
                         "操作已经执行但最终状态无法保存；禁止自动重放",
                     )
-                    self.ledger.store.data["calls"][call["id"]] = {
+                    self.ledger.store.record.calls[call['id']] = {
                         "call": call,
                         "state": "unknown",
                         "result": result,
                         "executed": True,
                     }
                     try:
-                        self.ledger.store.save()
+                        self.ledger.store.commit()
                     except Exception:
                         pass
                     return result

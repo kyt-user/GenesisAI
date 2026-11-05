@@ -1,4 +1,4 @@
-"""MCP 桥接缝：读取 ``.genesis/mcp.json``，连接 MCP server 并动态注册工具。
+"""MCP 桥接缝：读取 ``projects/<project_id>/mcp.json``，连接 MCP server 并动态注册工具。
 
 MCP 工具以 ``category="mcp"`` 注册进同一 :class:`ToolRegistry`，与内置工具
 走同一条 executor/permissions/ledger 管线。服务启动和外部调用分别授权。
@@ -17,7 +17,7 @@ from genesisai.core.tools.base import ToolDescriptor, ToolSpec, object_schema
 from genesisai.shared.security import ToolError, digest
 
 
-MCP_CONFIG = Path(".genesis") / "mcp.json"
+MCP_CONFIG = Path("mcp.json")
 PROTOCOL_VERSION = "2024-11-05"
 CLIENT_INFO = {"name": "genesisai", "version": "0.1.0"}
 _ALLOWED_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
@@ -38,7 +38,7 @@ class McpServerSpec:
 
 
 def load_servers(workspace) -> list[McpServerSpec]:
-    """读取工作区 ``.genesis/mcp.json``；缺失时返回空列表。"""
+    """读取应用管理的项目目录 ``projects/<project_id>/mcp.json``；缺失时返回空列表。"""
     path = Path(workspace).resolve() / MCP_CONFIG
     if not path.is_file():
         return []

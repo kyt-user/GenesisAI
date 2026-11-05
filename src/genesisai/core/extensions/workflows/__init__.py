@@ -1,4 +1,4 @@
-"""Workflows 缝：``.genesis/workflows/*.md`` 定义可复用工作流。
+"""Workflows 缝：``projects/<project_id>/workflows/*.md`` 定义可复用工作流。
 
 与 Rules 同为"文本承载"，但不进系统提示，由 ``/workflow <name>`` 按需展开
 为一段提示后送入运行循环。
@@ -23,7 +23,7 @@ class WorkflowRegistry:
 
     def __init__(self, workspace):
         self.workspace = Path(workspace).resolve()
-        self.root = self.workspace / ".genesis" / "workflows"
+        self.root = self.workspace / "workflows"
         self.items, self.diagnostics = self._scan()
 
     def _scan(self) -> tuple[dict, list]:

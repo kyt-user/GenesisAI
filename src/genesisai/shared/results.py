@@ -27,4 +27,5 @@ def error_result(call: dict, code: str, message: str, retryable: bool = False) -
         "source_refs": [],
         "artifact_refs": [],
         "truncated": False,
+        "observations": [],
     }

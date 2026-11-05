@@ -8,7 +8,7 @@ import pytest
 from genesisai.shared.messages import Response
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from test_acceptance import FakeModel, call, response
 
@@ -18,10 +18,10 @@ def make_runtime(tmp_path, **kwargs):
     inputs.mkdir(exist_ok=True)
     (inputs / "note.md").write_text("RUNTIME_LOCAL", encoding="utf-8")
     work = tmp_path / "work"
-    store = Store(work)
+    store = Session(work)
     output = tmp_path / "output"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([inputs], output, work),
@@ -48,8 +48,8 @@ def test_file_agent_gets_full_tool_set_and_reads(tmp_path):
     assert result["status"] == "completed"
     offered = names(model.tool_definitions[0])
     assert {"read_files", "editor", "fetch_web_content"}.issubset(offered)
-    assert store.data["calls"]["read"]["state"] == "succeeded"
-    assert any(value["kind"] == "file" for value in store.data["sources"].values())
+    assert store.record.calls['read']['state'] == 'succeeded'
+    assert any((value['kind'] == 'file' for value in store.record.sources.values()))
 
 
 def test_web_agent_searches_fetches_and_registers_source(tmp_path):
@@ -76,7 +76,7 @@ def test_web_agent_searches_fetches_and_registers_source(tmp_path):
     assert result["status"] == "completed"
     assert {"fetch_web_content"}.issubset(names(model.tool_definitions[0]))
     assert len(model.contexts) == 3
-    assert any(value["kind"] == "web" for value in store.data["sources"].values())
+    assert any((value['kind'] == 'web' for value in store.record.sources.values()))
 
 
 def test_followup_reuses_previous_answer_and_web_tools(tmp_path):
@@ -143,8 +143,8 @@ def test_followup_reads_next_section_with_file_tool(tmp_path):
 
     assert result["status"] == "completed"
     assert "read_files" in names(followup.tool_definitions[0])
-    assert store.data["calls"]["second_read"]["state"] == "succeeded"
-    assert "第二部分" in store.data["calls"]["second_read"]["result"]["data"]["files"][0]["text"]
+    assert store.record.calls['second_read']['state'] == 'succeeded'
+    assert '第二部分' in store.record.calls['second_read']['result']['data']['files'][0]['text']
     assert [message.tool_call_id for message in followup.contexts[0] if message.role == "tool"][-1] == "first_read"
 
 
@@ -157,30 +157,28 @@ def test_three_followups_keep_session_context_and_reset_run_budget(tmp_path):
         model = FakeModel(Response(content=answer, usage={"total_tokens": 1}))
         result = Runner(model, runtime, max_rounds=2, max_tools=3).start(prompt)
         assert result["status"] == "completed"
-        assert store.data["rounds"] == 1
-        assert store.data["tool_count"] == 0
+        assert store.record.rounds == 1
+        assert store.record.tool_count == 0
 
-    assert [message["content"] for message in store.data["messages"] if message["role"] != "tool"] == [
-        value for pair in zip(prompts, answers) for value in pair
-    ]
-    assert len(store.data["history"]) == 3
+    assert [message['content'] for message in store.record.messages if message['role'] != 'tool'] == [value for pair in zip(prompts, answers) for value in pair]
+    assert len(store.record.history) == 3
 
 
 def test_followup_compacts_long_previous_turn_and_continues(tmp_path):
     _, _, store, runtime = make_runtime(tmp_path)
-    store.data["messages"] = [
+    store.record.messages = [
         {"role": "user", "content": "旧问题"},
         {"role": "assistant", "content": "x" * 81000, "tool_calls": None},
     ]
-    store.data["status"] = "completed"
-    store.save()
+    store.record.status = "completed"
+    store.commit()
 
     model = FakeModel(Response(content='继续完成'))
     model.context_config = {'max_input_tokens': 20000, 'strategy': 'basic'}
     result = Runner(model, runtime).start("基于上一轮继续")
     assert result['status'] == 'completed'
-    assert store.data['context_checkpoint']
-    assert len(store.data['messages'][1]['content']) == 81000
+    assert store.record.context_checkpoint
+    assert len(store.record.messages[1]['content']) == 81000
 
 
 def test_network_confirmation_uses_network_message(tmp_path):
@@ -207,7 +205,7 @@ def test_session_restore_keeps_messages_for_followup(tmp_path):
     _, _, store, runtime = make_runtime(tmp_path)
     assert Runner(FakeModel(Response(content="原回答")), runtime).start("原问题")["status"] == "completed"
 
-    loaded = Store(store.root, store.id)
+    loaded = Session(store.root, store.id)
     restored = ToolRuntime(loaded, runtime.access, providers=[])
     model = FakeModel(response(call("read_files", {"path": "note.md"}, "restored_read")), Response(content="追问回答"))
     result = Runner(model, restored).start("继续解释它")
@@ -226,7 +224,7 @@ def test_permission_matrix_and_session_restore(tmp_path, mode):
     for name in ("editor", "fetch_web_content", "run_commands"):
         assert runtime.policy.requires_confirmation(runtime.registry.get(name), {}) == (mode == "user")
     assert not runtime.policy.requires_confirmation(runtime.registry.get("read_files"), {})
-    restored = ToolRuntime(Store(store.root, store.id), runtime.access)
+    restored = ToolRuntime(Session(store.root, store.id), runtime.access)
     assert restored.permission_mode == mode
     with pytest.raises(ValueError, match="权限模式"):
         restored.set_permission("sometimes")
@@ -276,7 +274,7 @@ def test_permission_switch_does_not_unfreeze_prepared_call(tmp_path):
 
     assert result["status"] == "completed"
     assert not (output / "copy.md").exists()
-    assert store.data["calls"]["frozen_copy"]["result"]["error"]["code"] == "confirmation_invalid"
+    assert store.record.calls['frozen_copy']['result']['error']['code'] == 'confirmation_invalid'
 
 
 def test_unknown_tool_is_unavailable_and_not_offered(tmp_path):
@@ -295,7 +293,7 @@ def test_confirmation_restart_restores_write(tmp_path):
     runner = Runner(model, runtime)
     assert runner.start("创建文件")["status"] == "awaiting_confirmation"
 
-    loaded = Store(store.root, store.id)
+    loaded = Session(store.root, store.id)
     restored = ToolRuntime(loaded, runtime.access, providers=[], permission_mode="user")
 
     result = Runner(FakeModel(Response(content="done")), restored).confirm(True)
@@ -323,7 +321,7 @@ def test_disabled_tool_cannot_execute_after_confirmation(tmp_path, monkeypatch):
 
     assert result["status"] == "completed"
     assert not (output / "blocked.md").exists()
-    assert store.data["calls"]["write_disabled"]["result"]["error"]["code"] == "tool_unavailable"
+    assert store.record.calls['write_disabled']['result']['error']['code'] == 'tool_unavailable'
 
 
 def test_final_ledger_failure_marks_completed_write_unknown(tmp_path, monkeypatch):
@@ -339,7 +337,7 @@ def test_final_ledger_failure_marks_completed_write_unknown(tmp_path, monkeypatc
 
     assert result["error"]["code"] == "unknown_execution"
     assert (output / "unknown.md").exists()
-    assert store.data["calls"]["unknown_write"]["state"] == "unknown"
+    assert store.record.calls['unknown_write']['state'] == 'unknown'
     with pytest.raises(ValueError, match="不确定"):
         Runner(FakeModel(Response(content="unsafe")), runtime).start("新任务")
 
@@ -347,29 +345,28 @@ def test_final_ledger_failure_marks_completed_write_unknown(tmp_path, monkeypatc
 def test_cancel_acknowledges_unknown_without_replaying_it(tmp_path):
     _, _, store, runtime = make_runtime(tmp_path)
     uncertain = call("editor", {"operation": "create", "path": "unknown.md", "content": "x", "source_refs": []}, "unknown")
-    store.data["calls"]["unknown"] = {
+    store.record.calls['unknown'] = {
         "call": uncertain,
         "state": "unknown",
         "result": runtime.error(uncertain, "unknown_execution", "结果不确定"),
     }
-    store.data["status"] = "interrupted"
-    store.data["pending"] = [uncertain]
-    store.data['messages'].extend([dict(role='user', content='创建文件'),
-                                   dict(role='assistant', content=None, tool_calls=[uncertain])])
-    store.save()
+    store.record.status = "interrupted"
+    store.record.pending = [uncertain]
+    store.record.messages.extend([dict(role='user', content='创建文件'), dict(role='assistant', content=None, tool_calls=[uncertain])])
+    store.commit()
     runner = Runner(FakeModel(Response(content="继续完成")), runtime)
 
     with pytest.raises(ValueError, match="处理确认或 /cancel"):
         runner.start("直接继续")
 
     assert runner.cancel()["status"] == "cancelled"
-    delivered = json.loads(store.data['messages'][-1]['content'])
+    delivered = json.loads(store.record.messages[-1]['content'])
     assert delivered['error']['code'] == 'unknown_execution'
     assert '未执行' not in delivered['error']['message']
-    assert store.data['last_run_outcome']['tool_activity'][-1]['executed'] is None
+    assert store.record.last_run_outcome['tool_activity'][-1]['executed'] is None
     assert runner.start("确认后继续")["status"] == "completed"
-    assert store.data["calls"]["unknown"]["state"] == "unknown"
-    assert store.data["calls"]["unknown"]["acknowledged"] is True
+    assert store.record.calls['unknown']['state'] == 'unknown'
+    assert store.record.calls['unknown']['acknowledged'] is True
 
 
 @pytest.mark.parametrize(
@@ -383,13 +380,14 @@ def test_cancel_acknowledges_unknown_without_replaying_it(tmp_path):
     ],
 )
 def test_invalid_session_tool_runtime_is_rejected_without_rewrite(tmp_path, tool_runtime):
-    store = Store(tmp_path / "work")
-    data = dict(store.data)
+    store = Session(tmp_path / "work")
+    data = store.record.snapshot()
     data["tool_runtime"] = tool_runtime
-    store.path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    before = store.path.read_bytes()
+    with store.database.transaction() as db:
+        db.execute('UPDATE sessions SET state=? WHERE id=?', (json.dumps(data, ensure_ascii=False),store.id))
+    before = store.database.path.read_bytes()
 
     with pytest.raises(ValueError, match="tool_runtime|active_skills"):
-        Store(store.root, store.id)
+        Session(store.root, store.id)
 
-    assert store.path.read_bytes() == before
+    assert store.database.path.read_bytes() == before

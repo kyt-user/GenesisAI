@@ -10,8 +10,8 @@ from pathlib import Path
 
 from genesisai.agent.loop import Runner
 from genesisai.app.cli import load_environment
-from genesisai.core.project_docs import AgentDocsManager
-from genesisai.core.state.store import Store, atomic_json
+from genesisai.core.persistence.files import atomic_json
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.model.config import build_model
 from genesisai.shared.security import Access
@@ -72,27 +72,20 @@ def main():
         return {'exit_code': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
     report['baseline'] = tests()
     report['checks']['baseline_fails'] = report['baseline']['exit_code'] != 0
-    AgentDocsManager(workspace, create=True)
-    store = Store(root / '.genesis', workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace),
-                      deadline=time.time() + 600)
+    store = Session(root / '.genesis', workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 600)
     runtime = ToolRuntime(store, Access([workspace], workspace, store.root, workspace_root=workspace),
                           permission_mode="auto", providers=[])
     # Actual read-only tool executions produce the seeded transcript; no fabricated success results.
-    store.data['messages'].append({'role': 'user', 'content':
-        'This is generated historical context for a compaction test. Read the fixture repeatedly. '
-        'Preserve this constraint for the next task: do not delete files and do not weaken existing tests.'})
+    store.record.messages.append({'role': 'user', 'content': 'This is generated historical context for a compaction test. Read the fixture repeatedly. Preserve this constraint for the next task: do not delete files and do not weaken existing tests.'})
     for i in range(18):
         call = {'id': f'seed_read_{i}', 'name': 'read_files',
                 'arguments': json.dumps({'paths': ['history_fixture.txt'], 'limit': 10000})}
         result = runtime.execute(call)
         assert result['ok'], result.get('error')
-        store.data['messages'].extend([
-            {'role': 'assistant', 'content': None, 'tool_calls': [call]},
-            {'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(result, ensure_ascii=False)},
-        ])
-    store.save()
-    report['seeded_message_count'] = len(store.data['messages'])
+        store.record.messages.extend([{'role': 'assistant', 'content': None, 'tool_calls': [call]}, {'role': 'tool', 'tool_call_id': call['id'], 'content': json.dumps(result, ensure_ascii=False)}])
+    store.commit()
+    report['seeded_message_count'] = len(store.record.messages)
     model, remote = build_model()
     report['model'] = model.model
     report['context_config'] = model.context_config
@@ -116,19 +109,12 @@ def main():
             'history_fixture.txt 只是本轮压缩测试的历史填充，不需要再读取。'
         )
         report['outcome'] = outcome
-        report['run_usage'] = dict(store.data['usage'])
-        report['run_state'] = {k: store.data['run_runtime'].get(k) for k in
-                               ('stop_reason', 'project_changed', 'verification_succeeded', 'verification_required')}
+        report['run_usage'] = dict(store.record.usage)
+        report['run_state'] = {k: store.record.run_runtime.get(k) for k in ('stop_reason', 'project_changed', 'verification_succeeded', 'verification_required')}
         report['independent_tests'] = tests()
-        report['checks'].update(
-            completed=outcome['status'] == 'completed',
-            source_changed=source.read_text(encoding='utf-8') != SOURCE,
-            independent_tests_pass=report['independent_tests']['exit_code'] == 0,
-            verified=store.data['run_runtime'].get('verification_succeeded') is True,
-            checkpoint_saved=bool(store.data.get('context_checkpoint')),
-        )
+        report['checks'].update(completed=outcome['status'] == 'completed', source_changed=source.read_text(encoding='utf-8') != SOURCE, independent_tests_pass=report['independent_tests']['exit_code'] == 0, verified=store.record.run_runtime.get('verification_succeeded') is True, checkpoint_saved=bool(getattr(store.record, 'context_checkpoint')))
         if outcome['status'] in {'completed', 'partial', 'failed', 'limit_reached'}:
-            restored = Store(root / '.genesis', store.id, workspace=workspace)
+            restored = Session(root / '.genesis', store.id, workspace=workspace)
             restored_runtime = ToolRuntime(restored, Access([workspace], workspace, restored.root, workspace_root=workspace),
                                            permission_mode="auto", providers=[])
             report['followup'] = Runner(model, restored_runtime, max_rounds=4, seconds=120, on_event=progress).start(

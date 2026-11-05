@@ -1,3 +1,4 @@
+from session_helpers import persisted_sessions
 from multiprocessing import Pipe, active_children
 from threading import Event
 import sys
@@ -7,7 +8,8 @@ import pytest
 from genesisai.app import cli
 from genesisai.app.desktop_pet import DesktopPet
 from genesisai.shared.messages import Response
-from genesisai.core.state.store import application_state_root
+from genesisai.shared.paths import application_home
+
 from test_acceptance import FakeModel, call, response
 
 
@@ -20,10 +22,10 @@ def test_pet_tracks_confirmation_restore_and_cancel(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, 'build_model', lambda _: (model, False))
     assert cli.main(['--workspace', str(tmp_path), '--prompt', 'create file']) == 2
     assert not states
-    session, = (application_state_root() / 'sessions').glob('*.json')
+    session, = persisted_sessions()
     commands = iter(['/pet', '/cancel', '/pet', '/new', '/pet', '/exit'])
     monkeypatch.setattr(cli.CliView, 'prompt', lambda self: next(commands))
-    assert cli.main(['--session', session.stem]) == 0
+    assert cli.main(['--session', session['id']]) == 0
     assert states == ['awaiting_confirmation', 'cancelled', 'idle']
     assert not (tmp_path / 'approval.txt').exists()
 
@@ -74,7 +76,7 @@ def test_pet_command_during_run(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.CliView, '_get_input', lambda view: None)
     monkeypatch.setattr(cli.CliView, 'prompt_running', busy)
     monkeypatch.setattr(DesktopPet, 'show', show)
-    assert cli.main(['--workspace', str(tmp_path), '--no-agent-docs']) == 0
+    assert cli.main(['--workspace', str(tmp_path)]) == 0
     assert states == ['running']
 
 

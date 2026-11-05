@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
 import yaml
 
@@ -31,13 +32,13 @@ class SkillDescriptor:
 
 
 class SkillRegistry:
-    def __init__(self, workspace: Path, tool_registry=None, *, builtin: Path | None = None, user: Path | None = None):
+    def __init__(self, workspace: Path, tool_registry=None, *, builtin: Path | None = None, user: Path | None = None, project_root: Path | None = None):
         self.workspace = Path(workspace).resolve()
         self.tool_registry = tool_registry
         self.roots = [
             ("builtin", Path(builtin or files("genesisai").joinpath("core/extensions/skills/builtin"))),
-            ("user", Path(user or Path.home() / ".genesisai" / "skills")),
-            ("project", self.workspace / ".genesis" / "skills"),
+            ("user", Path(user or application_home() / "skills")),
+            *([("project", Path(project_root) / "skills")] if project_root else []),
         ]
         self.items, self.diagnostics = self._scan()
 

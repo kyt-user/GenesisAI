@@ -6,10 +6,11 @@ generation:
 
 # 应用保守默认值，并非供应商模型规格；按实际模型容量修改。
 context:
-  max_input_tokens: 32768
-  context_window: 65536
+  max_input_tokens: 400000
+  context_window: 400000
   output_reserve_tokens: 4096
   safety_margin_tokens: 1024
+  history_tokens: 32000
   preserve_recent_tokens: 20000
   summary_max_tokens: 2048
   strategy: agentic

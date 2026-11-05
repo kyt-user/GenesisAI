@@ -5,7 +5,7 @@ import sys
 import pytest
 
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.registry import ToolRegistry
 from genesisai.core.tools.tool_runtime import ToolRuntime
 
@@ -19,10 +19,10 @@ def runtime(tmp_path):
     inputs = tmp_path / "input"
     inputs.mkdir()
     (inputs / "note.md").write_text("catalog", encoding="utf-8")
-    store = Store(tmp_path / "work")
+    store = Session(tmp_path / "work")
     output = tmp_path / "output"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     return ToolRuntime(store, Access([inputs], output, store.root), providers=[], permission_mode="auto")
 
 
@@ -59,10 +59,10 @@ def test_disabled_tool_is_listed_and_cannot_execute(tmp_path, monkeypatch):
     registry._items["read_files"] = dataclasses.replace(registry.get("read_files"), enabled=False)
     inputs = tmp_path / "input"
     inputs.mkdir()
-    store = Store(tmp_path / "work")
+    store = Session(tmp_path / "work")
     output = tmp_path / "out"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     runtime = ToolRuntime(store, Access([inputs], output, store.root), registry=registry, providers=[])
     monkeypatch.setattr(registry, "refresh", lambda: None)
 
@@ -80,10 +80,10 @@ def test_unsupported_platform_tool_is_disabled(tmp_path, monkeypatch):
     registry._items["read_files"] = dataclasses.replace(descriptor, spec=unsupported_spec)
     inputs = tmp_path / "input"
     inputs.mkdir()
-    store = Store(tmp_path / "work")
+    store = Session(tmp_path / "work")
     output = tmp_path / "out"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     runtime = ToolRuntime(store, Access([inputs], output, store.root), registry=registry, providers=[])
     monkeypatch.setattr(registry, "refresh", lambda: None)
 
@@ -111,5 +111,5 @@ def test_on_demand_loading_meta_tools_are_gone(runtime):
 
     assert meta.isdisjoint(set(runtime.registry._items))
     assert meta.isdisjoint(definition_names(runtime))
-    assert "active_tools" not in runtime.store.data.get("tool_runtime", {})
+    assert 'active_tools' not in getattr(runtime.store.record, 'tool_runtime', {})
     assert not hasattr(runtime, "load_tools") and not hasattr(runtime, "reset_task")

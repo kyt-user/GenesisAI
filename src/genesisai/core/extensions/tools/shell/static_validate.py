@@ -8,7 +8,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 
-IGNORED_PARTS = frozenset({".git", ".genesis", "agent_docs", "node_modules"})
+IGNORED_PARTS = frozenset({".git", ".genesis", "node_modules"})
 VOID_TAGS = frozenset({
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
     "meta", "param", "source", "track", "wbr",

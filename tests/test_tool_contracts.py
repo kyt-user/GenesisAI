@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 import genesisai.core.tools.executor as executor_module
 
@@ -20,7 +20,7 @@ BUSINESS = [
     "attempt_completion",
     "use_skill",
 ]
-RESULT_FIELDS = {"call_id", "ok", "data", "error", "source_refs", "artifact_refs", "truncated"}
+RESULT_FIELDS = {"call_id", "ok", "data", "error", "source_refs", "artifact_refs", "truncated", "observations"}
 
 
 def tool_call(name, args, call_id):
@@ -33,10 +33,10 @@ def runtime(tmp_path):
     inputs.mkdir()
     (inputs / "note.md").write_text("needle", encoding="utf-8")
     (inputs / "needle.bin").write_bytes(b"\x00\x01")
-    store = Store(tmp_path / "work")
+    store = Session(tmp_path / "work")
     output = tmp_path / "output"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     runtime = ToolRuntime(store, Access([inputs], output, store.root), providers=[], permission_mode="auto")
     return inputs, output, store, runtime
 
@@ -49,7 +49,7 @@ def test_business_specs_are_the_single_model_schema_source(runtime):
         "editor": "write",
         "run_commands": "shell",
         "fetch_web_content": "network",
-        "plan": "write",
+        "plan": "core",
         "attempt_completion": "core",
         "use_skill": "core",
     }

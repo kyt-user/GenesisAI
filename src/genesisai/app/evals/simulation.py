@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
 import yaml
 
@@ -21,7 +22,8 @@ from genesisai.model.config import build_model
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills.registry import SkillRegistry
-from genesisai.core.state.store import Store, atomic_json
+from genesisai.core.persistence.session import Session
+from genesisai.core.persistence.files import atomic_json
 from genesisai.core.tools.tool_runtime import ToolRuntime
 
 
@@ -66,17 +68,20 @@ class FixtureNetwork:
         return {**self.data["page"], "truncated": False}
 
 
-def make_runtime(workspace, run_root, *, providers=None, network=None):
+def make_runtime(workspace, run_root, *, providers=None, network=None, project_config=None):
     state = run_root / "state"; output = run_root / "outputs"; output.mkdir(parents=True, exist_ok=True)
-    store = Store(state, workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(output), run_id="run_simulation")
-    store.save()
+    store = Session(state, workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(output), run_id='run_simulation')
+    store.commit()
+    if project_config is not None and project_config.is_dir():
+        from genesisai.core.paths import ApplicationPaths
+        shutil.copytree(project_config, ApplicationPaths(store.root).project(store.record.project_id))
     runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=providers, network=network, permission_mode="auto")
     return store, runtime, output
 
 
 def call(runtime, name, args, suffix=""):
-    ident = f"sim_{name}_{len(runtime.store.data['calls'])}{suffix}"
+    ident = f'sim_{name}_{len(runtime.store.record.calls)}{suffix}'
     return runtime.execute({"id": ident, "name": name, "arguments": json.dumps(args, ensure_ascii=False)})
 
 
@@ -88,35 +93,14 @@ def require_ok(result):
 
 def runtime_report(store, runtime):
     """返回不含 Prompt 正文、工具参数和密钥的运行摘要。"""
-    data = store.data
-    run = data.get("run_runtime", {})
-    return {
-        "session_id": store.id,
-        "run_id": data.get("run_id"),
-        "runner_state": data.get("status"),
-        "lifecycle": run.get("lifecycle"),
-        "stop_reason": run.get("stop_reason"),
-        "rounds": data.get("rounds", 0),
-        "model_calls": (run.get("usage") or {}).get("model_calls", 0),
-        "tool_calls": len(data.get("calls", {})),
-        "tokens": (data.get("usage") or {}).get("total_tokens", 0),
-        "prompt_hashes": run.get("prompt_hashes", {}),
-        "active_skills": list(data.get("tool_runtime", {}).get("active_skills", [])),
-        "permissions": runtime.permission_mode,
-        "recovery_counts": run.get("recovery_counts", {}),
-        "calls": [
-            {"id": identifier, "name": item.get("call", {}).get("name"), "state": item.get("state")}
-            for identifier, item in data.get("calls", {}).items()
-        ],
-        "changes": data.get("changes", []),
-        "artifacts": list(data.get("artifacts", {})),
-        "sources": list(data.get("sources", {})),
-    }
+    data = store.record
+    run = getattr(data, 'run_runtime', {})
+    return {'session_id': store.id, 'run_id': getattr(data, 'run_id'), 'runner_state': getattr(data, 'status'), 'lifecycle': run.get('lifecycle'), 'stop_reason': run.get('stop_reason'), 'rounds': getattr(data, 'rounds', 0), 'model_calls': (run.get('usage') or {}).get('model_calls', 0), 'tool_calls': len(getattr(data, 'calls', {})), 'tokens': (getattr(data, 'usage') or {}).get('total_tokens', 0), 'prompt_hashes': run.get('prompt_hashes', {}), 'active_skills': list(getattr(data, 'tool_runtime', {}).get('active_skills', [])), 'permissions': runtime.permission_mode, 'recovery_counts': run.get('recovery_counts', {}), 'calls': [{'id': identifier, 'name': item.get('call', {}).get('name'), 'state': item.get('state')} for identifier, item in getattr(data, 'calls', {}).items()], 'changes': getattr(data, 'changes', []), 'artifacts': list(getattr(data, 'artifacts', {})), 'sources': list(getattr(data, 'sources', {}))}
 
 
-def run_offline_case(case, workspace, run_root):
+def run_offline_case(case, workspace, run_root, project_config=None):
     identifier = case["id"]
-    store, runtime, output = make_runtime(workspace, run_root)
+    store, runtime, output = make_runtime(workspace, run_root, project_config=project_config)
     checks = {}
     if identifier == "case_01_code_fix":
         subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
@@ -144,10 +128,10 @@ def run_offline_case(case, workspace, run_root):
         store, runtime, output = make_runtime(workspace, run_root / "web", providers=[FixtureProvider(data)], network=FixtureNetwork(data))
         query = require_ok(call(runtime, "fetch_web_content", {"query": "Apple event today"}))
         fetched = require_ok(call(runtime, "fetch_web_content", {"url": query["hits"][0]["url"]}))
-        state = store.data["run_runtime"]
+        state = store.record.run_runtime
         checks = {"candidate": state["candidate_count"] == 1, "fetched": state["fetched_count"] == 1, "evidence": bool(state["evidence_refs"]), "source": bool(fetched["source_refs"]), "session_allow": runtime.permission_mode == "auto"}
     elif identifier == "case_04_skill":
-        skill = SkillRegistry(workspace, runtime.registry).describe("project_check", include_content=True)
+        skill = runtime.skills.describe("project_check", include_content=True)
         test = require_ok(call(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))
         checks = {"project_skill": skill["source"] == "project", "test_passed": test["exit_code"] == 0}
     elif identifier == "case_05_office_files":
@@ -202,11 +186,7 @@ def run_deepseek_case(case, workspace, run_root):
     checks = {"runner_completed": result["status"] == "completed"}
     if case["id"] == "case_01_code_fix":
         tested = subprocess.run([sys.executable, "-m", "pytest", "-q"], cwd=workspace, capture_output=True, timeout=60)
-        checks.update(
-            tests_pass=tested.returncode == 0,
-            tests_unchanged=all((workspace / name).read_bytes() == payload for name, payload in original_tests.items()),
-            bug_fix_skill="bug_fix" in store.data["tool_runtime"].get("active_skills", []),
-        )
+        checks.update(tests_pass=tested.returncode == 0, tests_unchanged=all(((workspace / name).read_bytes() == payload for name, payload in original_tests.items())), bug_fix_skill='bug_fix' in store.record.tool_runtime.get('active_skills', []))
     elif case["id"] == "case_02_file_management":
         windows = workspace / "windows.txt"
         payload = windows.read_bytes() if windows.is_file() else b""
@@ -216,15 +196,13 @@ def run_deepseek_case(case, workspace, run_root):
             file_organized=(workspace / "organized" / "notes.md").is_file(),
         )
     elif case["id"] == "case_03_web_research":
-        checks.update(sources_fetched=bool(store.data.get("sources")), follow_up_completed=result["status"] == "completed")
+        checks.update(sources_fetched=bool(getattr(store.record, 'sources')), follow_up_completed=result['status'] == 'completed')
     elif case["id"] == "case_04_skill":
-        reloaded_store = Store(run_root / "state", store.id, workspace=workspace)
-        checks.update(
-            skill_used="project_check" in reloaded_store.data["tool_runtime"].get("active_skills", []),
-        )
+        reloaded_store = Session(run_root / "state", store.id, workspace=workspace)
+        checks.update(skill_used='project_check' in reloaded_store.record.tool_runtime.get('active_skills', []))
     elif case["id"] == "case_05_office_files":
-        suffixes = {Path(item["path"]).suffix.casefold() for item in store.data.get("artifacts", {}).values()}
-        called = {item.get("call", {}).get("name") for item in store.data.get("calls", {}).values()}
+        suffixes = {Path(item['path']).suffix.casefold() for item in getattr(store.record, 'artifacts', {}).values()}
+        called = {item.get('call', {}).get('name') for item in getattr(store.record, 'calls', {}).values()}
         checks.update(
             formats_created={".docx", ".xlsx", ".pptx", ".pdf"}.issubset(suffixes),
             limited_edits={"docx_edit", "xlsx_edit"}.issubset(called),
@@ -251,7 +229,7 @@ def run_all(dataset, output, *, mode="offline", selected=None):
             shutil.rmtree(case_root, onexc=remove_readonly)
         shutil.copytree(fixture, workspace)
         try:
-            detail = run_offline_case(case, workspace, case_root) if mode == "offline" else run_deepseek_case(case, workspace, case_root)
+            detail = run_offline_case(case, workspace, case_root, fixture.parent / "project_config") if mode == "offline" else run_deepseek_case(case, workspace, case_root)
         except Exception as exc:
             detail = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
         detail.update(
@@ -271,7 +249,7 @@ def run_all(dataset, output, *, mode="offline", selected=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="GenesisAI P7 产品仿真")
     parser.add_argument("--dataset", type=Path, default=Path(__file__).resolve().parents[4] / "tests" / "product_acceptance_dataset")
-    parser.add_argument("--output", type=Path, default=Path.cwd() / ".genesis" / "simulation")
+    parser.add_argument("--output", type=Path, default=application_home() / "evaluations" / "simulation")
     parser.add_argument("--mode", choices=["offline", "deepseek"], default="offline")
     parser.add_argument("--case", action="append", dest="cases")
     args = parser.parse_args(argv)

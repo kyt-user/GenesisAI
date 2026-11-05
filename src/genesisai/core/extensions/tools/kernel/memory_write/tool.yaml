@@ -1,0 +1,4 @@
+name: memory_write
+enabled: true
+category: kernel
+description: 保存或修正有来源的项目知识；默认未验证，修改必须携带读取到的版本号

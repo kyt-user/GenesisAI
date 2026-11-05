@@ -21,7 +21,7 @@ from genesisai.app.terminal_view import CliView
 from genesisai.core.prompt.context_budgeter import ContextBudgeter
 from genesisai.shared.budgets import select_initial_profile
 from genesisai.core.prompt.composer import PromptComposer
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.shared.security import Access
 from genesisai.core.tools.tool_runtime import ToolRuntime
 
@@ -35,10 +35,10 @@ def _store_and_runtime(tmp_path, *, active=()):
     workspace.mkdir(exist_ok=True)
     state = tmp_path / "state"
     output = tmp_path / "output"
-    store = Store(state, workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(output), run_id="run_test")
-    store.data.setdefault("run_runtime", {})
-    store.save()
+    store = Session(state, workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(output), run_id='run_test')
+    store.record.run_runtime
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], output, state, workspace_root=workspace),
@@ -139,11 +139,11 @@ class TestCreativeProfile:
 class TestProfileAwareCompact:
     def test_compact_includes_coding_context_for_local_files(self, tmp_path):
         workspace, output, store, runtime = _store_and_runtime(tmp_path)
-        store.data["workspace"] = str(workspace)
-        store.data["run_runtime"]["profile"] = "local_files"
-        store.data["run_runtime"]["protocols"] = ["coding"]
+        store.record.workspace = str(workspace)
+        store.record.run_runtime['profile'] = "local_files"
+        store.record.run_runtime['protocols'] = ["coding"]
         # Add messages with tool results — need 4+ groups so older groups contain both tool messages.
-        store.data["messages"] = [
+        store.record.messages = [
             {"role": "user", "content": "修复 bug"},
             {"role": "assistant", "content": "修改文件", "tool_calls": [{"id": "c1", "name": "file_patch", "arguments": "{}"}]},
             {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"ok": True, "data": {"tool": "file_patch", "written": True}})},
@@ -160,7 +160,7 @@ class TestProfileAwareCompact:
         summary = budgeter.compact(force=True)
 
         assert summary["mode"] == "manual"
-        assert len(store.data["messages"]) == 9
+        assert len(store.record.messages) == 9
         assert summary["tokens_after"] > 0
 
 
@@ -307,8 +307,8 @@ class TestSelfVerification:
         from genesisai.shared.messages import Response
 
         workspace, output, store, runtime = _store_and_runtime(tmp_path, active=("file_read",))
-        store.data["run_runtime"]["profile"] = "local_files"
-        store.data["run_runtime"]["protocols"] = ["coding"]
+        store.record.run_runtime['profile'] = "local_files"
+        store.record.run_runtime['protocols'] = ["coding"]
 
         class MinimalModel:
             def chat(self, messages, tools=None, **kwargs):

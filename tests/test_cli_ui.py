@@ -1,6 +1,8 @@
+from session_helpers import persisted_sessions
 """CLI 展示层及预留命令的行为验证。"""
 
-from genesisai.core.state.store import application_state_root
+from genesisai.shared.paths import application_home
+
 
 from io import StringIO
 import json
@@ -11,7 +13,7 @@ from rich.console import Console
 from genesisai.app.cli import main
 from genesisai.app.terminal_view import CliSnapshot, CliView
 from genesisai.shared.messages import Response
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from test_acceptance import FakeModel, call, response
 
 
@@ -128,9 +130,9 @@ def test_new_command_creates_fresh_session_and_preserves_old_one(tmp_path, monke
 
     assert main(["--workspace", str(work)]) == 0
 
-    sessions = sorted((application_state_root() / "sessions").glob("*.json"))
+    sessions = persisted_sessions()
     assert len(sessions) == 2
-    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in sessions]
+    payloads = sessions
     old = next(item for item in payloads if any(message.get("content") == "old question" for message in item["messages"]))
     new = next(item for item in payloads if any(message.get("content") == "new question" for message in item["messages"]))
     assert any(message.get("content") == "old answer" for message in old["messages"])
@@ -139,9 +141,9 @@ def test_new_command_creates_fresh_session_and_preserves_old_one(tmp_path, monke
     assert old["id"] != new["id"]
     assert old["output"] == new["output"] == str(work.resolve())
 
-    restored = Store(application_state_root(), old["id"], workspace=work)
-    assert any(message.get("content") == "old answer" for message in restored.data["messages"])
-    assert restored.data["id"] == old["id"]
+    restored = Session(application_home(), old["id"], workspace=work)
+    assert any((message.get('content') == 'old answer' for message in restored.record.messages))
+    assert restored.record.id == old['id']
 
 
 def test_permissions_command_switches_session_mode(tmp_path, monkeypatch):
@@ -203,7 +205,7 @@ def test_plain_reject_alias_rejects_only_pending_call(tmp_path, monkeypatch, rej
 
     assert main(["--workspace", str(work)]) == 0
     assert not (work / "reject.md").exists()
-    session = json.loads(next((application_state_root() / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+    session = persisted_sessions()[0]
     assert session["calls"]["write_reject"]["state"] == "failed"
     assert session["calls"]["write_reject"]["result"]["error"]["code"] == "confirmation_rejected"
 
@@ -223,7 +225,7 @@ def test_new_command_is_blocked_while_confirmation_is_pending(tmp_path, monkeypa
 
     assert main(["--workspace", str(work)]) == 0
 
-    assert len(list((application_state_root() / "sessions").glob("*.json"))) == 1
+    assert len(persisted_sessions()) == 1
     assert "处理确认" in stream.getvalue()
 
 
@@ -242,7 +244,7 @@ def test_new_session_keeps_grants_resets_runtime_permission_and_refreshes_ui(tmp
 
     assert main(["--workspace", str(work), "--input", str(inputs)]) == 0
 
-    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in (application_state_root() / "sessions").glob("*.json")]
+    payloads = persisted_sessions()
     assert len(payloads) == 1
     assert all(item["grants"] == [str(inputs.resolve())] for item in payloads)
     assert stream.getvalue().splitlines().count("GenesisAI") == 2
@@ -266,7 +268,7 @@ def test_new_session_resets_session_and_dispatches_full_tool_set(tmp_path, monke
     tool_names = lambda definitions: [item["function"]["name"] for item in definitions]
     assert "read_files" in tool_names(model.tool_definitions[0])
     assert tool_names(model.tool_definitions[0]) == tool_names(model.tool_definitions[1])
-    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in (application_state_root() / "sessions").glob("*.json")]
+    payloads = persisted_sessions()
     new = next(item for item in payloads if any(message.get("content") == "new task" for message in item["messages"]))
     assert new["tool_runtime"] == {"active_skills": []}
 
@@ -306,7 +308,7 @@ def test_auto_mode_allows_output_creation(tmp_path, monkeypatch):
     assert main(["--workspace", str(work), "--permissions", "auto"]) == 0
 
     assert (work / "allowed.md").read_text(encoding="utf-8") == "ok"
-    session = json.loads(next((application_state_root() / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+    session = persisted_sessions()[0]
     assert session["status"] == "completed"
 
 
@@ -335,7 +337,7 @@ def test_auto_mode_allows_public_search(tmp_path, monkeypatch):
 
     assert main(["--workspace", str(work), "--permissions", "auto"]) == 0
 
-    session = json.loads(next((application_state_root() / "sessions").glob("*.json")).read_text(encoding="utf-8"))
+    session = persisted_sessions()[0]
     assert session["status"] == "completed"
     assert session["calls"]["yes_search"]["state"] == "succeeded"
 
@@ -362,8 +364,7 @@ def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monke
     assert main([
         "--workspace", str(work), "--prompt", "research"
     ]) == 2
-    sessions = [json.loads(path.read_text(encoding="utf-8"))
-                for path in (application_state_root() / "sessions").glob("*.json")]
+    sessions = persisted_sessions()
     session = next(item for item in sessions if item['workspace'] == str(work.resolve()))
     assert session["status"] == "awaiting_confirmation"
     assert session["calls"]["remote_search"]["state"] == "prepared"

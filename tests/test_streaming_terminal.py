@@ -10,7 +10,7 @@ from genesisai.model.providers.deepseek import DeepSeekClient
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 
 
 def test_reasoning_is_hidden_and_html_stream_is_markup_safe():
@@ -57,9 +57,9 @@ def test_stream_no_tools_disables_deepseek_thinking_and_keeps_override():
 def test_runner_passes_final_stream_token_limit(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = Store(workspace / ".genesis", workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
-    store.save()
+    store = Session(workspace / ".genesis", workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
@@ -104,10 +104,10 @@ def test_ordinary_cli_answer_is_visible_before_final_chunk(tmp_path):
 
     with view.working():
         result = Runner(Model(), runtime, on_event=view.render_progress).start('推荐一首古诗')
-    view.render_result(result, store.data)
+    view.render_result(result, store.snapshot())
     assert result['status'] == 'completed'
     assert sink.getvalue().count('王维的《鹿柴》。') == 1
-    assert store.data['messages'][-1]['content'] == '王维的《鹿柴》。'
+    assert store.record.messages[-1]['content'] == '王维的《鹿柴》。'
 
 
 def test_stream_assembles_fragmented_call_alongside_reasoning_and_usage():

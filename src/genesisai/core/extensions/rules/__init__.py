@@ -2,14 +2,16 @@
 
 只读、只注入文本；不执行脚本、不扩大权限。项目级规则来自工作区根目录
 ``AGENTS.md``，用户级规则来自 ``~/.genesisai/AGENTS.md``。为与既有密钥
-脱敏保持一致，正文复用 ``core.project_docs`` 的 ``SECRET`` 正则。
+脱敏保持一致，正文复用 ``core.state.io_journal`` 的 ``SECRET`` 正则。
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
-from genesisai.core.project_docs.manager import SECRET
+
+from genesisai.core.state.io_journal import _ASSIGNMENT as SECRET
 
 
 MAX_RULE_CHARS = 8000
@@ -18,29 +20,36 @@ MAX_RULE_CHARS = 8000
 class RulesLoader:
     """读取项目级与用户级 AGENTS.md，脱敏并限长后供系统提示注入。"""
 
-    def __init__(self, workspace, *, home: Path | None = None):
+    def __init__(self, workspace, *, home: Path | None = None, application_root: Path | None = None):
         self.workspace = Path(workspace).resolve()
         self.home = Path(home) if home is not None else Path.home()
         self.sources = (
-            ("user", self.home / ".genesisai" / "AGENTS.md"),
+            ("user", (Path(application_root) if application_root else (self.home / ".genesisai" if home else application_home())) / "AGENTS.md"),
             ("project", self.workspace / "AGENTS.md"),
         )
 
     @staticmethod
     def _clean(value) -> str:
-        text = SECRET.sub(lambda match: f"{match.group(1)}=[REDACTED]", str(value)).strip()
-        return text[:MAX_RULE_CHARS]
+        text = SECRET.sub(lambda match: f"{match.group(1)}[REDACTED]", str(value)).strip()
+        if len(text) > MAX_RULE_CHARS:
+            raise ValueError('AGENTS.md 超过规则预算，请缩短或提高配置预算')
+        return text
 
     def load(self) -> list[dict]:
         """返回已脱敏、限长的规则条目；缺失或不合法文件被跳过。"""
         blocks = []
         for source, path in self.sources:
             try:
+                if path.is_symlink() or path.resolve() != path:
+                    raise ValueError(f"AGENTS.md 不能通过链接读取：{path}")
                 if not path.is_file():
                     continue
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeError):
-                continue
+                with path.open(encoding="utf-8") as stream:
+                    text = stream.read(MAX_RULE_CHARS + 1)
+                if len(text) > MAX_RULE_CHARS:
+                    raise ValueError("AGENTS.md 超过规则预算，请缩短规则")
+            except (OSError, UnicodeError) as exc:
+                raise ValueError(f"无法读取 AGENTS.md：{path}") from exc
             cleaned = self._clean(text)
             if cleaned:
                 blocks.append({"source": source, "path": str(path), "text": cleaned})

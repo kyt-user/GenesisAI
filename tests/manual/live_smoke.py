@@ -9,7 +9,9 @@ from genesisai.app.cli import load_environment
 from genesisai.model.config import build_model
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
-from genesisai.core.state.store import HostLock, Store, atomic_json
+from genesisai.core.persistence.locking import HostLock
+from genesisai.core.persistence.files import atomic_json
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.core.extensions.tools.web.network import Network
 from genesisai.core.extensions.tools.web.providers.duckduckgo import DuckDuckGoSearchProvider
@@ -54,26 +56,26 @@ def main():
                 if remote and not args.allow_remote_fixtures:
                     raise ValueError('Remote fixtures require --allow-remote-fixtures')
                 with HostLock(work):
-                    store=Store(work); output=work/'outputs'
-                    store.data.update(grants=[str(inputs)],output=str(output));store.save()
+                    store=Session(work); output=work/'outputs'
+                    store.record.apply(grants=[str(inputs)], output=str(output));store.commit()
                     runtime=ToolRuntime(store,Access([inputs],output,work),permission_mode="auto")
                     outcome=Runner(model,runtime,seconds=600,max_rounds=20).start(prompt)
                     status=outcome['status']
                     checks={}
-                    calls=[item['call']['name'] for item in store.data['calls'].values()]
+                    calls=[item['call']['name'] for item in store.record.calls.values()]
                     if number==1:
                         copied=output/'sorted/notes.md'; index=output/'index.md'
                         checks=dict(used_file_copy='file_copy' in calls,
                                     exact_copy=copied.is_file() and hashlib.sha256(copied.read_bytes()).digest()==hashlib.sha256((inputs/'notes.md').read_bytes()).digest(),
                                     index_exists=index.is_file())
                     elif number==2:
-                        checks=dict(report_exists=(output/'web.md').is_file(),web_source=any(v['kind']=='web' for v in store.data['sources'].values()))
+                        checks=dict(report_exists=(output / 'web.md').is_file(), web_source=any((v['kind'] == 'web' for v in store.record.sources.values())))
                     else:
-                        kinds={v['kind'] for v in store.data['sources'].values()}
+                        kinds={v['kind'] for v in store.record.sources.values()}
                         checks=dict(report_exists=(output/'fusion.md').is_file(),local_and_web={'file','web'}.issubset(kinds))
                     if status=='completed' and not all(checks.values()):
                         status='failed_acceptance'
-                    report['model'].append(dict(case=number,status=status,runner_status=outcome['status'],checks=checks,answer=outcome['answer'],calls=calls,artifacts=store.data['artifacts'],sources=store.data['sources']))
+                    report['model'].append(dict(case=number, status=status, runner_status=outcome['status'], checks=checks, answer=outcome['answer'], calls=calls, artifacts=store.record.artifacts, sources=store.record.sources))
             except Exception as exc:
                 report['model'].append(dict(case=number,status='failed',error=type(exc).__name__,message=str(exc)[:200]))
             atomic_json(root/'report.json',report)

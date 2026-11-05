@@ -59,16 +59,7 @@ class IOJournal:
         return self.clean(str(value))
 
     def write(self, event, *, round_num=None, event_run_id=..., **payload):
-        record = self.clean({
-            "schema_version": 1,
-            "event_id": uuid4().hex,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "session_id": self.store.id,
-            "run_id": self.store.data.get("run_id") if event_run_id is ... else event_run_id,
-            "round_num": self.store.data.get("rounds", 0) if round_num is None else round_num,
-            "event": event,
-            "payload": payload,
-        })
+        record = self.clean({'schema_version': 1, 'event_id': uuid4().hex, 'timestamp': datetime.now(timezone.utc).isoformat(), 'session_id': self.store.id, 'run_id': getattr(self.store.record, 'run_id') if event_run_id is ... else event_run_id, 'round_num': getattr(self.store.record, 'rounds', 0) if round_num is None else round_num, 'event': event, 'payload': payload})
         line = json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
         with self._lock, self.path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(line)

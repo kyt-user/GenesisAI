@@ -1,44 +1,57 @@
-"""Read-only history inventory for the terminal session picker."""
+"""Read-only history inventory; listing never recovers or mutates sessions."""
+
 import json
+import os
 from datetime import datetime
 from pathlib import Path
-
 from genesisai.app.select import select
-from genesisai.core.state.store import validate_session
+from genesisai.core.paths import ApplicationPaths
+from genesisai.core.persistence.database import Database
 from genesisai.shared.messages import content_text
 
 
 def session_entries(console, root, *, current_id=None, workspace=None):
+    if not ApplicationPaths(Path(root)).database.exists():
+        return []
+    database = Database(root)
+    where = " WHERE s.id != ?"
+    args = [current_id or ""]
+    if workspace is not None:
+        where += " AND w.path=?"
+        args.append(os.path.normcase(str(Path(workspace).resolve())))
+    rows = database.rows(
+        "SELECT s.id,s.updated,w.path FROM sessions s JOIN workspaces w ON w.id=s.workspace_id"
+        + where
+        + " ORDER BY s.updated DESC",
+        args,
+    )
     entries = []
-    skipped = 0
-    for path in (root / 'sessions').glob('session_*.json'):
-        if path.stem == current_id:
-            continue
-        try:
-            data = json.loads(path.read_text(encoding='utf-8'))
-            validate_session(data, path.stem)
-            modified = path.stat().st_mtime
-            if workspace is not None and Path(data['workspace']) != workspace:
-                continue
-            title = next((content_text(m.get('content'), images=True) for m in data['messages']
-                          if m.get('role') == 'user' and content_text(m.get('content'), images=True).strip()), None)
-            if not title:
-                continue
-            entries.append((modified, data['id'], ' '.join(title.split())[:80], data['workspace']))
-        except (OSError, ValueError, TypeError, AttributeError):
-            skipped += 1
-    if skipped:
-        console.print(f'有 {skipped} 个会话文件无法读取，已跳过。')
-    entries.sort(key=lambda entry: entry[0], reverse=True)
-    return [(session_id, title, f"{datetime.fromtimestamp(modified):%m-%d %H:%M} · {folder}")
-            for modified, session_id, title, folder in entries]
+    for row in rows:
+        title = None
+        for event in database.rows(
+            "SELECT payload FROM events WHERE session_id=? AND kind='message' ORDER BY seq",
+            (row["id"],),
+        ):
+            message = json.loads(event["payload"])
+            if message["role"] == "user":
+                title = content_text(message.get("content"), images=True).strip()
+                if title:
+                    break
+        if title:
+            detail = (
+                f"{datetime.fromtimestamp(row['updated']):%m-%d %H:%M} · {row['path']}"
+            )
+            entries.append((row["id"], " ".join(title.split())[:80], detail))
+    return entries
 
 
 def choose_session(console, root, current_id):
     entries = session_entries(console, root, current_id=current_id)
     if not entries:
-        console.print('没有其他可选择的历史会话。')
+        console.print("没有其他可选择的历史会话。")
         return None
-    options = [(title, detail + ' · ' + session_id) for session_id, title, detail in entries]
-    index = select(console, '选择历史会话', options, searchable=True)
+    options = [
+        (title, detail + " · " + identity) for identity, title, detail in entries
+    ]
+    index = select(console, "选择历史会话", options, searchable=True)
     return entries[index][0] if index is not None else None

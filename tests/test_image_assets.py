@@ -1,3 +1,4 @@
+import json
 """Use the supplied pet sheet to exercise actual decoding and persisted pixels."""
 import base64
 from dataclasses import replace
@@ -9,7 +10,7 @@ from PIL import Image
 import pytest
 
 from genesisai.core.media.images import prepare_image, prepare_path
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.context_config import ContextConfig
 from genesisai.shared.security import Access, ToolError
@@ -21,10 +22,10 @@ SPRITE = Path(__file__).resolve().parents[1] / 'src/genesisai/app/assets/pet/spr
 def image_runtime(tmp_path):
     workspace = tmp_path / 'workspace'
     workspace.mkdir()
-    store = Store(tmp_path / 'state', workspace=workspace)
+    store = Session(tmp_path / 'state', workspace=workspace)
     roots = [workspace, SPRITE]
-    store.data.update(grants=[str(p) for p in roots], output=str(workspace))
-    store.save()
+    store.record.apply(grants=[str(p) for p in roots], output=str(workspace))
+    store.commit()
     runtime = ToolRuntime(store, Access(roots, workspace, store.root, workspace_root=workspace), providers=[], permission_mode='user')
     return store, runtime
 
@@ -39,12 +40,12 @@ def test_supplied_webp_is_bounded_and_restores_without_original(tmp_path):
     payload = base64.b64decode(url.split(',', 1)[1])
     with Image.open(io.BytesIO(payload)) as decoded:
         assert decoded.format == 'PNG' and decoded.size == (1260, 1536)
-    store.data['messages'] = [{'role': 'user', 'content': [part]}]
-    store.save()
-    restored = Store(store.root, store.id)
+    store.record.messages = [{'role': 'user', 'content': [part]}]
+    store.commit()
+    restored = Session(store.root, store.id)
     from genesisai.core.media.images import ImageStore
     assert ImageStore(restored, runtime.access).data_url(part) == url
-    assert 'base64' not in store.path.read_text(encoding='utf8')
+    assert 'base64' not in json.dumps(store.snapshot())
     assert hashlib.sha256(SPRITE.read_bytes()).hexdigest() == original
 
 
@@ -91,6 +92,6 @@ def test_path_permission_and_forged_metadata(tmp_path):
     part = runtime.images.read(path=SPRITE)['images'][0]
     with pytest.raises(ValueError, match='元数据'):
         runtime.images.data_url({**part, 'width': 1})
-    store.data['messages'] = [{'role': 'user', 'content': [{**part, 'byte_size': 1}]}]
+    store.record.messages = [{'role': 'user', 'content': [{**part, 'byte_size': 1}]}]
     with pytest.raises(ValueError, match='元数据'):
-        store.save()
+        store.commit()

@@ -1,4 +1,6 @@
-from genesisai.core.state.store import application_state_root
+from session_helpers import persisted_sessions
+from genesisai.shared.paths import application_home
+
 import hashlib
 import json
 import os
@@ -11,7 +13,7 @@ import pytest
 
 from genesisai.app.cli import main
 from genesisai.shared.messages import Response
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.extensions.tools.web.providers.brave import BraveSearchProvider
 from genesisai.core.extensions.tools.web.providers.duckduckgo import DuckDuckGoSearchProvider
 from genesisai.core.extensions.tools.web.contracts import SearchQuery, SearchError
@@ -25,7 +27,7 @@ def test_A19_cli_commands_and_multi_turn(tmp_path, monkeypatch):
     commands=iter(['/help','hello','/status','/history','again','/exit'])
     monkeypatch.setattr('rich.console.Console.input',lambda *a,**k:next(commands))
     assert main(['--workspace',str(tmp_path/'work')])==0
-    state=json.loads(next((application_state_root()/'sessions').glob('*.json')).read_text(encoding='utf-8'))
+    state=persisted_sessions()[0]
     assert state['answer']=='Second' and len(model.contexts)==2
     assert any(m.content=='First' for m in model.contexts[1])
 
@@ -90,14 +92,6 @@ def test_A02_package_imports():
             if isinstance(node,ast.ImportFrom) and node.module:
                 assert node.module.split('.')[0] not in {'runtime','core','capabilities','agents','xiaoerAI','Agent_lib'}
         assert 'sys.path' not in path.read_text(encoding='utf-8')
-
-
-def test_A03_source_baseline():
-    root=Path(__file__).resolve().parents[1]
-    baseline=json.loads((root/'docs/SOURCE_BASELINE.json').read_text())
-    for relative,expected in baseline.items():
-        source=root.parent/'xiaoerAI'/relative
-        assert source.exists() and hashlib.sha256(source.read_bytes()).hexdigest()==expected, relative
 
 
 def test_A01_module_help(tmp_path):

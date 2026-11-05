@@ -27,6 +27,13 @@ def _looks_like_test(command) -> bool:
 
 
 class Implementation:
+    @staticmethod
+    def observe(args, payload):
+        from genesisai.core.tools.observations import Observation
+        if 'summary' in payload and type(payload.get('passed')) is bool:
+            return [Observation('verification', passed=payload['passed'], detail=str(payload.get('command', '')))]
+        return []
+
     def _root(self, context, args, *, must_exist=True):
         root = context.access.workspace_path(args.get("cwd", "."), must_exist=must_exist, allow_directory=True)
         if not root.is_dir():

@@ -1,0 +1,4 @@
+name: memory_read
+enabled: true
+category: kernel
+description: 按引用分页读取历史原文或知识；旧代码快照不代表当前文件

@@ -8,7 +8,8 @@ import zipfile
 
 from genesisai.shared.filetypes import detect_file_type
 from genesisai.shared.security import ToolError
-from genesisai.core.state.store import sha
+from genesisai.shared.ids import sha
+
 
 
 def require(module, extra="office"):
@@ -50,8 +51,8 @@ def artifact(context, path, kind, *, limitations=None):
     if actual != kind:
         raise ToolError("artifact_invalid", f"产物验证失败：期望 {kind}，实际 {actual}")
     ref = context.store.artifact(path)
-    context.store.data["artifacts"][ref].update(format=kind, size=path.stat().st_size, verified=True, verification="structural_reopen", rendering="not_available", limitations=limitations or [])
-    context.store.save()
+    context.store.record.artifacts[ref].update(format=kind, size=path.stat().st_size, verified=True, verification='structural_reopen', rendering='not_available', limitations=limitations or [])
+    context.store.commit()
     return {"path": str(path), "artifact_refs": [ref], "format": kind, "sha256": sha(path), "verified": True, "verification": "structural_reopen", "rendering": "not_available", "limitations": limitations or []}
 
 

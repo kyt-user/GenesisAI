@@ -11,6 +11,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
 
 CONFIG_DIR_ENV = "GENESISAI_CONFIG_DIR"
@@ -23,7 +24,7 @@ def default_config_dir() -> Path:
     override = os.environ.get(CONFIG_DIR_ENV, "").strip()
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".genesisai"
+    return application_home()
 
 
 def settings_path(directory=None) -> Path:

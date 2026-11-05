@@ -1,3 +1,4 @@
+from session_helpers import persisted_sessions
 import json
 import os
 import socket
@@ -13,7 +14,8 @@ import pytest
 
 from genesisai.app import cli
 from genesisai.core.extensions.tools.shell.process import _capture
-from genesisai.core.state.store import application_state_root
+from genesisai.shared.paths import application_home
+
 from genesisai.model.providers.qwen import QwenClient
 from genesisai.shared.messages import Response
 from genesisai.shared.run_control import RunControl, current_run
@@ -37,16 +39,16 @@ def test_cli_dispatches_fifo_after_persisted_outcome(tmp_path, monkeypatch, outc
         return Response(content='[[PARTIAL]]first' if outcome == 'partial' else 'first')
 
     if outcome in {'registration_failed', 'after_registration_failed'}:
-        original = cli.Store.save
+        original = cli.Session.commit
         saves = []
         def save(store):
-            if store.data['messages'][-1:] and store.data['messages'][-1]['content'] == 'message two':
+            if store.record.messages[-1:] and store.record.messages[-1]['content'] == 'message two':
                 saves.append(1)
                 fail_at = 1 if outcome == 'registration_failed' else 2
                 if len(saves) == fail_at:
                     raise OSError('fixture session write failure')
             return original(store)
-        monkeypatch.setattr(cli.Store, 'save', save)
+        monkeypatch.setattr(cli.Session, 'commit', save)
     responses = [first]
     if outcome == 'approval':
         responses.append(Response(content='approved result'))
@@ -65,8 +67,8 @@ def test_cli_dispatches_fifo_after_persisted_outcome(tmp_path, monkeypatch, outc
     work = tmp_path / 'work'
 
     def saved():
-        path, = (application_state_root() / 'sessions').glob('*.json')
-        return json.loads(path.read_text(encoding='utf8'))
+        data, = persisted_sessions()
+        return data
 
     def idle(view):
         cmd = next(idle_commands)
@@ -96,12 +98,12 @@ def test_cli_dispatches_fifo_after_persisted_outcome(tmp_path, monkeypatch, outc
 
     monkeypatch.setattr(cli.CliView, 'prompt', idle)
     monkeypatch.setattr(cli.CliView, '_get_input', lambda self: SimpleNamespace(read_running=busy.__get__(self)))
-    assert cli.main(['--workspace', str(work), '--no-agent-docs']) == 0
+    assert cli.main(['--workspace', str(work)]) == 0
     final = saved()
     assert [m['content'] for m in final['messages'] if m['role'] == 'user'] == ['message one', 'message two', 'message three']
     assert final['status'] == 'completed' and final['answer'] == 'third'
     assert (work / 'approved.txt').exists() == (outcome == 'approval')
-    journal = application_state_root() / 'logs' / (final['id'] + '.jsonl')
+    journal = application_home() / 'logs' / (final['id'] + '.jsonl')
     events = [json.loads(line) for line in journal.read_text(encoding='utf8').splitlines()]
     added = {e['payload']['queue_id']: e['payload']['text'] for e in events if e['event'] == 'queue_add'}
     starts = [e for e in events if e['event'] == 'queue_start']
@@ -134,12 +136,11 @@ def test_cli_exit_recovers_worker_before_closing_session(tmp_path, monkeypatch):
         return next(commands), ''
 
     monkeypatch.setattr(cli.CliView, '_get_input', lambda self: SimpleNamespace(read_running=read_running))
-    assert cli.main(['--workspace', str(tmp_path / 'work'), '--no-agent-docs']) == 0
-    path, = (application_state_root() / 'sessions').glob('*.json')
-    state = json.loads(path.read_text(encoding='utf8'))
+    assert cli.main(['--workspace', str(tmp_path / 'work')]) == 0
+    state, = persisted_sessions()
     assert state['status'] == 'cancelled'
     assert [m['content'] for m in state['messages'] if m['role'] == 'user'] == ['start']
-    events = [json.loads(line) for line in (application_state_root() / 'logs' / (path.stem + '.jsonl')).read_text(
+    events = [json.loads(line) for line in (application_home() / 'logs' / (state['id'] + '.jsonl')).read_text(
         encoding='utf8').splitlines()]
     discarded, = [e for e in events if e['event'] == 'queue_discard']
     assert discarded['payload']['count'] == 1

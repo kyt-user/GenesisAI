@@ -13,7 +13,7 @@ from genesisai.app.session_picker import session_entries
 from genesisai.app.terminal_view import CliView
 from genesisai.core.media.images import prepare_path
 from genesisai.core.prompt.compaction import image_parts, project, project_images, estimate_tokens, execution_facts
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.model.capabilities import ImageCapability
 from genesisai.shared.messages import Response, UserInput, content_text
 from genesisai.shared.security import ToolError
@@ -39,7 +39,7 @@ def test_image_only_turn_followup_restore_history_and_source_citation(tmp_path):
     assert runner.start(UserInput(images=(image,)))['status'] == 'completed'
     assert runner.start('同一张图继续说明')['status'] == 'completed'
     assert any(image_parts(m.content) for m in model.contexts[-1])
-    restored = Store(store.root, store.id)
+    restored = Session(store.root, store.id)
     from genesisai.core.tools.tool_runtime import ToolRuntime
     restored_runtime = ToolRuntime(restored, runtime.access, providers=[])
     again = visual_model(Response(content='restored'))
@@ -49,9 +49,9 @@ def test_image_only_turn_followup_restore_history_and_source_citation(tmp_path):
     console = Console(file=screen)
     entries = session_entries(console, store.root)
     assert len(entries) == 1 and SPRITE.name in entries[0][1]
-    CliView(console).render_history(restored.data)
+    CliView(console).render_history(restored.snapshot())
     assert SPRITE.name in screen.getvalue()
-    assert 'data:image' not in store.path.read_text(encoding='utf8')
+    assert 'data:image' not in json.dumps(store.snapshot())
 
 
 def test_local_tool_pixels_reach_next_model_turn_and_can_reload_after_compaction(tmp_path):
@@ -63,7 +63,7 @@ def test_local_tool_pixels_reach_next_model_turn_and_can_reload_after_compaction
         return Response(content='read ' + part['image_ref'])
     model = visual_model(response(call('read_image', {'path': str(SPRITE)}, 'read')), check)
     assert Runner(model, runtime).start('查看本地图片')['status'] == 'completed'
-    raw = store.data['messages']
+    raw = store.record.messages
     tool = next(m for m in raw if m['role'] == 'tool')
     ref = image_parts(tool['content'])[0]['image_ref']
     assert execution_facts(raw)[0]['ok'] is True
@@ -118,16 +118,16 @@ def test_frozen_attachment_survives_queue_draft_changes_and_registration_failure
     assert draft.request('').images == (second,)
     assert request.images == (first,)
     runner = Runner(visual_model(Response(content='done')), runtime)
-    save = store.save
+    save = store.commit
     def fail_registration():
-        if store.data['messages']:
+        if store.record.messages:
             raise OSError('registration fixture')
         save()
-    monkeypatch.setattr(store, 'save', fail_registration)
+    monkeypatch.setattr(store, 'commit', fail_registration)
     with pytest.raises(OSError):
         runner.start(request)
-    assert not store.data['messages']
-    monkeypatch.setattr(store, 'save', save)
+    assert not store.record.messages
+    monkeypatch.setattr(store, 'commit', save)
     assert runner.start(request)['status'] == 'completed'
 
 
@@ -136,7 +136,7 @@ def test_unsupported_model_retains_input_and_does_not_register_turn(tmp_path):
     request = UserInput(images=(prepare_path(SPRITE, runtime.access, runtime.images.config),))
     with pytest.raises(ValueError, match='未确认'):
         Runner(FakeModel(), runtime).start(request)
-    assert not store.data['messages'] and not store.data['sources']
+    assert not store.record.messages and (not store.record.sources)
 
 
 def test_public_input_rejects_mutable_or_untyped_attachment_collection():

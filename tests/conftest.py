@@ -13,6 +13,7 @@ def no_network(monkeypatch):
 def _isolated_home(tmp_path, monkeypatch):
     """Exercise real path resolution without touching the user's history."""
     from pathlib import Path as _Path
+    monkeypatch.delenv("GENESISAI_HOME", raising=False)
     monkeypatch.setattr(_Path, 'home', classmethod(lambda cls: tmp_path / 'home'))
 
 

@@ -37,5 +37,4 @@ class RunLogger:
                     outcome=outcome, **details)
 
     def log_round_summary(self, round_num, status, answer=None):
-        self.record('run_summary', round_num=round_num, status=status, answer=answer,
-                    answer_length=len(answer or ''), usage=self.store.data.get('usage', {}))
+        self.record('run_summary', round_num=round_num, status=status, answer=answer, answer_length=len(answer or ''), usage=getattr(self.store.record, 'usage', {}))

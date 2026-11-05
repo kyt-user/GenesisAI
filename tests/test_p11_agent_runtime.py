@@ -12,7 +12,7 @@ from genesisai.core.prompt.composer import PromptComposer
 from genesisai.core.research import ResearchController
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 
 
@@ -48,9 +48,9 @@ def tool_call(name, arguments, call_id="call_1"):
 def runtime_env(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "outputs"
-    store = Store(workspace)
-    store.data.update(output=str(output), deadline=time.time() + 300)
-    store.save()
+    store = Session(workspace)
+    store.record.apply(output=str(output), deadline=time.time() + 300)
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([], output, workspace),
@@ -84,8 +84,8 @@ def test_p11_prompt_composer_is_modular_and_hashed():
 
 def test_p11_unregistered_and_search_pages_are_rejected(runtime_env):
     store, runtime = runtime_env
-    store.data["run_runtime"] = ResearchController.empty_state("web_quick")
-    store.save()
+    store.record.run_runtime = ResearchController.empty_state("web_quick")
+    store.commit()
     missing = runtime.execute({"id": "f1", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://example.com/a"})})
     search_page = runtime.execute({"id": "f2", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://www.google.com/search?q=x"})})
     assert missing["error"]["code"] == "candidate_not_registered"
@@ -108,13 +108,13 @@ def test_p11_query_registers_candidates_and_fetch_creates_evidence(runtime_env):
 
     runtime.providers = [Provider()]
     runtime.network = Network()
-    store.data["run_runtime"] = ResearchController.empty_state("web_quick")
-    store.save()
+    store.record.run_runtime = ResearchController.empty_state("web_quick")
+    store.commit()
     query = runtime.execute({"id": "q1", "name": "fetch_web_content", "arguments": json.dumps({"query": "Apple event"})})
     fetch = runtime.execute({"id": "f1", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://apple.example/news"})})
-    assert query["ok"] and store.data["run_runtime"]["candidate_count"] == 1
+    assert query['ok'] and store.record.run_runtime['candidate_count'] == 1
     assert fetch["ok"] and len(fetch["data"]["text"]) <= 4000
-    assert fetch["source_refs"] == store.data["run_runtime"]["evidence_refs"]
+    assert fetch['source_refs'] == store.record.run_runtime['evidence_refs']
     evidence = EvidenceBundle(store).items()[0]
     assert evidence["canonical_url"] == "https://apple.example/news"
     assert evidence["content_hash"] and evidence["status"] == "ready"
@@ -128,7 +128,7 @@ def test_p11_direct_answer_dispatches_full_tool_set(runtime_env):
     assert len(model.contexts) == 1
     offered = {item["function"]["name"] for item in model.tools[0]}
     assert {"read_files", "editor", "fetch_web_content"}.issubset(offered)
-    assert store.data["run_runtime"]["profile"] == "direct_answer"
+    assert store.record.run_runtime['profile'] == 'direct_answer'
 
 
 def test_p11_length_recovers_once_without_tools(runtime_env):
@@ -140,8 +140,8 @@ def test_p11_length_recovers_once_without_tools(runtime_env):
     result = Runner(model, runtime).start("解释这个概念")
     assert result["status"] == "completed" and result["answer"] == "完整答案"
     assert model.tools[1] == []
-    assert store.data["run_runtime"]["partial_response"] == "已有部分答案"
-    assert store.data["run_runtime"]["recovery_counts"]["length"] == 1
+    assert store.record.run_runtime['partial_response'] == '已有部分答案'
+    assert store.record.run_runtime['recovery_counts']['length'] == 1
 
 
 def test_p11_second_length_delivers_partial(runtime_env):
@@ -157,7 +157,7 @@ def test_p11_second_length_delivers_partial(runtime_env):
 
 def test_p11_context_compacts_old_tool_bodies_and_keeps_previous_answer(runtime_env):
     store, _ = runtime_env
-    store.data["messages"] = [
+    store.record.messages = [
         {"role": "user", "content": "old"},
         {"role": "assistant", "content": None, "tool_calls": [{"id": "x", "name": "search_fetch", "arguments": "{}"}]},
         {"role": "tool", "tool_call_id": "x", "content": json.dumps({"data": {"text": "X" * 20000}, "source_refs": ["src_1"]})},

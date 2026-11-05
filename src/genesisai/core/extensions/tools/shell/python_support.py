@@ -11,7 +11,7 @@ import tomllib
 
 IGNORED_PARTS = frozenset({
     ".git", ".genesis", ".mypy_cache", ".pytest_cache", ".ruff_cache",
-    ".tox", ".venv", "agent_docs", "__pycache__", "build", "dist", "venv",
+    ".tox", ".venv", "__pycache__", "build", "dist", "venv",
 })
 
 

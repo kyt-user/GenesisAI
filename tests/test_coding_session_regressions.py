@@ -7,7 +7,8 @@ from rich.console import Console
 
 from genesisai.agent.loop import Runner
 from genesisai.app.terminal_view import CliView
-from genesisai.core.state.store import Store, sha
+from genesisai.shared.ids import sha
+from genesisai.core.persistence.session import Session
 from genesisai.shared.messages import Response
 from test_acceptance import FakeModel, call
 from test_development_completion_gate import tool_response
@@ -20,7 +21,7 @@ def test_approved_code_change_and_tests_finish_then_allow_followup(tmp_path):
     source.write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
     runtime.set_permission("user")
     model = FakeModel(
-        tool_response('read_files', {'paths': ['calc.py', 'agent_docs/index.json']}, 'read'),
+        tool_response('read_files', {'paths': ['calc.py']}, 'read'),
         tool_response('editor', {'operation': 'patch', 'path': 'calc.py',
             'expected_sha256': sha(source),
             'patch': '--- a/calc.py\n+++ b/calc.py\n@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b\n'}, 'patch'),
@@ -35,18 +36,18 @@ def test_approved_code_change_and_tests_finish_then_allow_followup(tmp_path):
     result = runner.start('开始')
     assert result['status'] == 'awaiting_confirmation'
     result = runner.confirm(True)
-    assert store.data['run_runtime']['project_changed'] is True
+    assert store.record.run_runtime['project_changed'] is True
     while result['status'] == 'awaiting_confirmation':
         result = runner.confirm(True)
     assert result['status'] == 'completed'
-    assert store.data['run_runtime']['verification_succeeded'] is True
-    assert store.data['run_runtime']['recovery_counts'].get('tool_required', 0) == 0
-    assert store.data['calls']['test_run']['result']['data']['exit_code'] == 0
+    assert store.record.run_runtime['verification_succeeded'] is True
+    assert store.record.run_runtime['recovery_counts'].get('tool_required', 0) == 0
+    assert store.record.calls['test_run']['result']['data']['exit_code'] == 0
     assert 'return a + b' in source.read_text()
-    old_ref = next(ref for ref, data in store.data['sources'].items() if data['path'] == str(source))
-    assert store.data['sources'][old_ref]['stale'] is True
+    old_ref = next((ref for ref, data in store.record.sources.items() if data['path'] == str(source)))
+    assert store.record.sources[old_ref]['stale'] is True
     assert runner.start('请总结上一轮操作')['status'] == 'completed'
-    assert '历史文件快照已失效' in model.contexts[-1][0].content
+    assert 'stale_files' in '\n'.join(str(m.content) for m in model.contexts[-1])
 
 
 @pytest.mark.parametrize('deleted', [False, True])
@@ -61,12 +62,13 @@ def test_changed_files_keep_history_and_require_fresh_evidence(tmp_path, deleted
         path.unlink()
     else:
         path.write_text('new', encoding='utf-8')
-    restored = Store(store.root, store.id, workspace=workspace)
+    restored = Session(store.root, store.id, workspace=workspace)
     restored.verify_sources()
-    assert restored.data['sources'][ref]['sha256'] == original_hash
-    assert restored.data['sources'][ref]['stale'] is True
-    assert restored.data['artifacts'][artifact]['stale'] is True
-    runtime.store = restored
+    assert restored.record.sources[ref]['sha256'] == original_hash
+    assert restored.record.sources[ref]['stale'] is True
+    assert restored.record.artifacts[artifact]['stale'] is True
+    from genesisai.core.tools.tool_runtime import ToolRuntime
+    runtime = ToolRuntime(restored, runtime.access, providers=[], permission_mode="auto")
     runner = Runner(FakeModel(), runtime)
     assert not runner._answer_refs_valid(f'[{ref}]')
     if not deleted:

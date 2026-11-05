@@ -7,7 +7,8 @@ from pathlib import Path
 
 from genesisai.shared.changes import atomic_write_bytes, backup_file, current_sha, record_change
 from genesisai.shared.security import ToolError
-from genesisai.core.state.store import sha
+from genesisai.shared.ids import sha
+
 from genesisai.core.extensions.tools.filesystem.patching import apply_unified_patch
 from genesisai.core.extensions.tools.filesystem.shared import MAX_BYTES, encode_text_document, read_text_document
 from genesisai.core.extensions.tools.shell.static_validate import validate_html_text
@@ -34,6 +35,19 @@ def _require(args, key):
 
 
 class Implementation:
+    @staticmethod
+    def observe(args, payload):
+        from genesisai.core.tools.observations import Observation
+        from pathlib import Path
+        from genesisai.shared.ids import sha
+        paths = [payload.get('path'), payload.get('source'), payload.get('destination')]
+        observations = [Observation('resource_changed', path=str(Path(p).resolve()),
+                        sha256=sha(Path(p)) if Path(p).is_file() else None) for p in dict.fromkeys(paths) if p]
+        validation = payload.get('validation')
+        if isinstance(validation, dict) and type(validation.get('passed')) is bool:
+            observations.append(Observation('verification', passed=validation['passed'], detail='static validation'))
+        return observations
+
     def prepare(self, context, args):
         operation = args.get("operation")
         if operation not in OPERATIONS:
@@ -52,8 +66,7 @@ class Implementation:
         target = context.access.write(args["path"]) if scope == "output" else context.access.workspace_path(args["path"])
         if target.exists():
             raise ToolError("target_exists", "目标已存在；请使用补丁修改")
-        return {"name": "editor", "operation": "create", "args": args, "target": str(target),
-                "grants": context.store.data["grants"], "output": context.store.data["output"]}
+        return {'name': 'editor', 'operation': 'create', 'args': args, 'target': str(target), 'grants': context.store.record.grants, 'output': context.store.record.output}
 
     def _execute_create(self, context, args):
         refs = args.get("source_refs", [])
@@ -65,7 +78,7 @@ class Implementation:
             raise ToolError("invalid_source", "源码文件不能附加报告来源；请将 source_refs 设为空数组")
         if not is_source:
             embedded = set(re.findall(r"\b(src_[0-9a-f]{16})\b", args.get("content", "")))
-            if not embedded.issubset(refs) or any(ref not in context.store.data["sources"] for ref in refs):
+            if not embedded.issubset(refs) or any((ref not in context.store.record.sources for ref in refs)):
                 raise ToolError("invalid_source", "报告含未登记或未声明的来源")
         body = args.get("content", "")
         if refs:
@@ -74,7 +87,7 @@ class Implementation:
                 raise ToolError("invalid_source", "带来源报告请使用 Markdown 或 TXT")
             body += "\n\n## 来源\n"
             for ref in dict.fromkeys(refs):
-                source = context.store.data["sources"][ref]
+                source = context.store.record.sources[ref]
                 body += f"- [{ref}] {source['title']} — {source.get('url', source.get('path'))}\n"
         payload = body.encode("utf-8")
         scope = args.get("scope", "output")
@@ -180,9 +193,7 @@ class Implementation:
 
     def _prepare_copy(self, context, args):
         target, source = self._copy_values(context, args)
-        return {"name": "editor", "operation": "copy", "args": args, "target": str(target),
-                "grants": context.store.data["grants"], "output": context.store.data["output"],
-                "source_sha256": sha(source)}
+        return {'name': 'editor', 'operation': 'copy', 'args': args, 'target': str(target), 'grants': context.store.record.grants, 'output': context.store.record.output, 'source_sha256': sha(source)}
 
     def _execute_copy(self, context, args):
         target, source = self._copy_values(context, args)

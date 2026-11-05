@@ -15,3 +15,4 @@ workspace/
 htmlcov/
 .genesis
 temp/
+!tests/product_acceptance_dataset/*/workspace/

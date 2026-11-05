@@ -16,7 +16,11 @@ from genesisai.agent.completion import CompletionValidator
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.agent.recovery import RecoveryMixin, SOURCE_REF
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
-from genesisai.shared.budgets import initial_run_runtime, is_recall_request, select_initial_profile
+from genesisai.shared.budgets import (
+    initial_run_runtime,
+    is_recall_request,
+    select_initial_profile,
+)
 from genesisai.shared.ids import uid
 from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
@@ -35,11 +39,27 @@ class Runner(RecoveryMixin):
     工具调用通过 ToolRuntime 执行，结果写回会话存储。
     """
 
-    def __init__(self, model, runtime, *, max_rounds=20, max_tools=40, max_failures=3, seconds=DEFAULT_TASK_SECONDS, request_timeout=DEFAULT_REQUEST_TIMEOUT, on_event=None):
+    def __init__(
+        self,
+        model,
+        runtime,
+        *,
+        max_rounds=20,
+        max_tools=40,
+        max_failures=3,
+        seconds=DEFAULT_TASK_SECONDS,
+        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        on_event=None,
+    ):
         self.model, self.runtime, self.store = model, runtime, runtime.store
-        self.max_rounds, self.max_tools, self.max_failures, self.seconds = max_rounds, max_tools, max_failures, seconds
+        self.max_rounds, self.max_tools, self.max_failures, self.seconds = (
+            max_rounds,
+            max_tools,
+            max_failures,
+            seconds,
+        )
         if seconds <= 0 or request_timeout <= 0:
-            raise ValueError('任务时限和请求超时必须为正数')
+            raise ValueError("任务时限和请求超时必须为正数")
         self.request_timeout = request_timeout
         self.on_event = on_event or (lambda *args: None)
         self.cancel_requested = False
@@ -49,7 +69,7 @@ class Runner(RecoveryMixin):
         self.completion = CompletionValidator()
         self.trace = runtime.trace
         self.machine = RunStateMachine(self.store)
-        self.docs = runtime.docs
+        self.tasks = runtime.tasks
         self.run_logger = runtime.logger
         self.set_model(model)
 
@@ -57,13 +77,16 @@ class Runner(RecoveryMixin):
         self.model = model
         if self.context_budgeter is not None:
             self.context_budgeter.configure(
-                getattr(model, 'context_config', None),
-                output_tokens=getattr(model, 'generation', {}).get('max_tokens'),
-                summarize=self._summarize_context, tools=self.runtime.definitions,
-                estimation_key=f'{type(model).__name__}:{getattr(model, "model", "")}',
+                getattr(model, "context_config", None),
+                output_tokens=getattr(model, "generation", {}).get("max_tokens"),
+                summarize=self._summarize_context,
+                tools=self.runtime.definitions,
+                estimation_key=f"{type(model).__name__}:{getattr(model, 'model', '')}",
             )
-        self.runtime.supports_images = getattr(getattr(model, 'image_capability', None), 'supported', None) is True
-        if getattr(self.runtime, 'images', None) is not None:
+        self.runtime.supports_images = (
+            getattr(getattr(model, "image_capability", None), "supported", None) is True
+        )
+        if getattr(self.runtime, "images", None) is not None:
             self.runtime.images.config = self.context_budgeter.config
             if model is not None:
                 model.image_resolver = self.runtime.images.data_url
@@ -84,174 +107,261 @@ class Runner(RecoveryMixin):
 
     def status(self, value, answer=None):
         """更新并持久化运行状态，同时同步状态机转换。"""
-        self.store.data['status'] = value
+        self.store.record.status = value
         if answer is not None:
-            self.store.data['answer'] = answer
+            self.store.record.answer = answer
         target = {
-            'completed': 'complete', 'partial': 'partial', 'limit_reached': 'partial',
-            'failed': 'failed', 'cancelled': 'cancelled',
-            'awaiting_confirmation': 'await_confirmation', 'interrupted': 'interrupted',
+            "completed": "complete",
+            "partial": "partial",
+            "limit_reached": "partial",
+            "failed": "failed",
+            "cancelled": "cancelled",
+            "awaiting_confirmation": "await_confirmation",
+            "interrupted": "interrupted",
         }.get(value)
         if target and self.machine.state != target:
             try:
-                self.machine.transition(target, 'status_' + value, save=False)
+                self.machine.transition(target, "status_" + value, save=False)
             except StateTransitionError:
-                self.store.data['run_runtime']['lifecycle'] = target
-        if value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
-            self.store.data['run_runtime']['phase'] = 'done'
-            self.store.data['last_run_outcome'] = {
-                'run_id': self.store.data['run_id'], 'status': value,
-                'stop_reason': self.store.data['run_runtime'].get('stop_reason'),
-                'diagnostic': self.store.data['run_runtime'].get('last_failure'),
-                'tool_activity': self.store.data['run_runtime'].get('tool_activity', []),
+                self.store.record.run_runtime["lifecycle"] = target
+        if value in {"completed", "partial", "limit_reached", "failed", "cancelled"}:
+            self.store.record.run_runtime["phase"] = "done"
+            self.store.record.last_run_outcome = {
+                "run_id": self.store.record.run_id,
+                "status": value,
+                "stop_reason": self.store.record.run_runtime.get("stop_reason"),
+                "diagnostic": self.store.record.run_runtime.get("last_failure"),
+                "tool_activity": self.store.record.run_runtime.get("tool_activity", []),
             }
-            self.docs.finish(value, answer or '')
-        if value == 'awaiting_confirmation':
-            self.store.data['run_runtime'].setdefault('confirmation_paused_at', None)
-            if self.store.data['run_runtime']['confirmation_paused_at'] is None:
-                self.store.data['run_runtime']['confirmation_paused_at'] = time.time()
-        self.store.save()
-        state = self.store.data['run_runtime']
-        self.run_logger.record('run_status', status=value, answer=answer, pending=self.store.data['pending'])
-        self.store.event('status', status=value, profile=state['profile'], phase=state['phase'], stop_reason=state.get('stop_reason'), evidence_count=len(state['evidence_refs']))
-        
+            self.tasks.finish(value, answer or "")
+        if value == "awaiting_confirmation":
+            self.store.record.run_runtime.setdefault("confirmation_paused_at", None)
+            if self.store.record.run_runtime["confirmation_paused_at"] is None:
+                self.store.record.run_runtime["confirmation_paused_at"] = time.time()
+        self.store.commit()
+        state = self.store.record.run_runtime
+        self.run_logger.record(
+            "run_status", status=value, answer=answer, pending=self.store.record.pending
+        )
+        self.store.event(
+            "status",
+            status=value,
+            profile=state["profile"],
+            phase=state["phase"],
+            stop_reason=state.get("stop_reason"),
+            evidence_count=len(state["evidence_refs"]),
+        )
+
         # 记录运行摘要日志
-        if value in {'completed', 'partial', 'limit_reached', 'failed', 'cancelled'}:
-            self.run_logger.log_round_summary(self.store.data.get('rounds', 0), value, answer)
-        
-        return dict(status=value, answer=self.store.data.get('answer', ''), pending=self.store.data['pending'])
+        if value in {"completed", "partial", "limit_reached", "failed", "cancelled"}:
+            self.run_logger.log_round_summary(
+                getattr(self.store.record, "rounds", 0), value, answer
+            )
+
+        return dict(
+            status=value,
+            answer=getattr(self.store.record, "answer", ""),
+            pending=self.store.record.pending,
+        )
 
     @staticmethod
     def check_available(d):
         """检查是否可以开始新运行；存在未完成运行时抛出异常。"""
-        if d['status'] in {'running', 'awaiting_confirmation', 'interrupted'}:
-            raise ValueError('先 /resume、处理确认或 /cancel，再提交新输入')
-        if any(call.get('state') in {'started', 'unknown'} and not call.get('acknowledged') for call in d['calls'].values()):
-            raise ValueError('存在执行结果不确定的调用；请检查输出并 /cancel，禁止开始新一轮')
+        if d.status in {"running", "awaiting_confirmation", "interrupted"}:
+            raise ValueError("先 /resume、处理确认或 /cancel，再提交新输入")
+        if any(
+            (
+                call.get("state") in {"started", "unknown"}
+                and (not call.get("acknowledged"))
+                for call in d.calls.values()
+            )
+        ):
+            raise ValueError(
+                "存在执行结果不确定的调用；请检查输出并 /cancel，禁止开始新一轮"
+            )
 
     def ensure_available(self):
-        self.check_available(self.store.data)
+        self.check_available(self.store.record)
 
     def start(self, text, *, on_registered=None):
         """根据用户输入初始化并启动一轮新运行。"""
-        d = self.store.data
-        input_id = self.run_logger.record('user_input', text=text, previous_run_id=d.get('run_id'))
+        d = self.store.record
+        input_id = self.run_logger.record(
+            "user_input", text=text, previous_run_id=getattr(d, "run_id")
+        )
         self.ensure_available()
         request = UserInput(text) if isinstance(text, str) else text
         if not isinstance(request, UserInput) or not isinstance(request.text, str):
-            raise ValueError('输入必须为文字或 UserInput')
+            raise ValueError("输入必须为文字或 UserInput")
         text = request.text
-        if (not text.strip() and not request.images) or len(text) > 16000:
-            raise ValueError('输入不能为空或超过16000字符')
+        if not text.strip() and not request.images:
+            raise ValueError("输入不能为空")
+        if len(text) > 3 * self.context_budgeter.config.input_limit:
+            raise ValueError("当前输入已超过配置的上下文预算")
         content = text
         if request.images:
             if not self.runtime.supports_images:
-                raise ValueError('当前模型尚未确认支持图片；请通过 /model 选择图片模型，附件已保留')
+                raise ValueError(
+                    "当前模型尚未确认支持图片；请通过 /model 选择图片模型，附件已保留"
+                )
             config = self.context_budgeter.config
-            if len(request.images) > config.max_images or sum(len(p.data) for p in request.images) > config.max_request_image_bytes:
-                raise ValueError('图片数量或总大小超过限制')
+            if (
+                len(request.images) > config.max_images
+                or sum(len(p.data) for p in request.images)
+                > config.max_request_image_bytes
+            ):
+                raise ValueError("图片数量或总大小超过限制")
             parts = [self.runtime.images.import_image(p) for p in request.images]
-            content = ([{'type': 'text', 'text': text}] if text else []) + parts
+            content = ([{"type": "text", "text": text}] if text else []) + parts
         self.store.verify_sources()
         # Stage the new turn until its first atomic session save succeeds.
-        previous_data = d.copy()
-        d = dict(d, history=list(d['history']), messages=list(d['messages']))
-        previous_runtime = d.get('run_runtime') or {}
-        previous_answer = d.get('answer', '')
-        previous_status = d.get('status')
-        if d['run_id']:
-            d['history'].append({
-                'run_id': d['run_id'], 'status': d['status'], 'answer': d.get('answer', ''),
-                'evidence_refs': list(previous_runtime.get('evidence_refs', [])),
-                'rounds': d.get('rounds', 0), 'tool_count': d.get('tool_count', 0),
-                'usage': json.loads(json.dumps(d.get('usage', {}))),
-                'runtime_usage': json.loads(json.dumps(previous_runtime.get('usage', {}))),
-                'stop_reason': previous_runtime.get('stop_reason'),
-                'tool_activity': json.loads(json.dumps(previous_runtime.get('tool_activity', []))),
-                'context_report': json.loads(json.dumps(previous_runtime.get('context_report', {}))),
-            })
-        project_manager = None
-        active_task = None
-        if self.docs.exists():
-            try:
-                project_manager = self.docs.manager()
-                active_task = project_manager.active_task()
-            except Exception:
-                project_manager = None
-                active_task = None
+        previous_data = d
+        d = d.evolve(history=list(d.history), messages=list(d.messages))
+        previous_runtime = getattr(d, "run_runtime") or {}
+        previous_answer = getattr(d, "answer", "")
+        previous_status = getattr(d, "status")
+        if d.run_id:
+            d.history.append(
+                {
+                    "run_id": d.run_id,
+                    "status": d.status,
+                    "answer": getattr(d, "answer", ""),
+                    "evidence_refs": list(previous_runtime.get("evidence_refs", [])),
+                    "rounds": getattr(d, "rounds", 0),
+                    "tool_count": getattr(d, "tool_count", 0),
+                    "usage": json.loads(json.dumps(getattr(d, "usage", {}))),
+                    "runtime_usage": json.loads(
+                        json.dumps(previous_runtime.get("usage", {}))
+                    ),
+                    "stop_reason": previous_runtime.get("stop_reason"),
+                    "tool_activity": json.loads(
+                        json.dumps(previous_runtime.get("tool_activity", []))
+                    ),
+                    "context_report": json.loads(
+                        json.dumps(previous_runtime.get("context_report", {}))
+                    ),
+                }
+            )
+        project_manager = self.tasks
+        active_task = self.tasks.active_task()
+        try:
+            self.runtime.prepare_turn()
+        except (OSError, ValueError) as exc:
+            self.run_logger.error("project_index_failed", exc)
         continuation = self.prompt.is_development_continuation(text, active_task)
-        profile = 'local_files' if continuation else select_initial_profile(text)
-        d['run_runtime'] = initial_run_runtime(profile)
+        profile = "local_files" if continuation else select_initial_profile(text)
+        d.run_runtime = initial_run_runtime(profile)
         protocols = self.prompt.protocols_for(text)
         if continuation:
-            inherited = previous_runtime.get('protocols') or []
-            protocols = list(dict.fromkeys([*inherited, *protocols, 'coding']))
-            d['run_runtime']['pending_intent'] = {
-                'kind': 'continue_development',
-                'task_id': active_task['id'],
-                'objective': active_task['title'],
-                'task_status': active_task['status'],
-                'current_phase': active_task['status'],
-                'default_plan_confirmed': self.prompt.accepts_default_plan(text),
-                'next_action': (
-                    'write_plan_and_implement'
-                    if not active_task.get('plan_ready')
-                    else ('verify_changes' if active_task['status'] == 'needs_verification' else 'implement_next_step')
+            inherited = previous_runtime.get("protocols") or []
+            protocols = list(dict.fromkeys([*inherited, *protocols, "coding"]))
+            d.run_runtime["pending_intent"] = {
+                "kind": "continue_development",
+                "task_id": active_task["id"],
+                "objective": active_task["title"],
+                "task_status": active_task["status"],
+                "current_phase": active_task["status"],
+                "default_plan_confirmed": self.prompt.accepts_default_plan(text),
+                "next_action": (
+                    "write_plan_and_implement"
+                    if not active_task.get("plan_ready")
+                    else (
+                        "verify_changes"
+                        if active_task["status"] == "needs_verification"
+                        else "implement_next_step"
+                    )
                 ),
-                'awaiting_confirmation': False,
-                'instruction': text.strip(),
+                "awaiting_confirmation": False,
+                "instruction": text.strip(),
             }
-        d['run_runtime']['protocols'] = protocols
-        if previous_runtime.get('evidence_refs'):
+        d.run_runtime["protocols"] = protocols
+        if previous_runtime.get("evidence_refs"):
             # 普通追问建立新 Run，但从上一 Run 搬运不可变候选、来源和证据索引。
-            for key in ('candidates', 'candidate_count', 'content_hashes', 'evidence', 'evidence_refs'):
+            for key in (
+                "candidates",
+                "candidate_count",
+                "content_hashes",
+                "evidence",
+                "evidence_refs",
+            ):
                 if key in previous_runtime:
-                    d['run_runtime'][key] = json.loads(json.dumps(previous_runtime[key], ensure_ascii=False))
-            d['run_runtime']['reuse_evidence'] = True
-        d['run_runtime']['execution_seconds_limit'] = self.seconds
-        d['run_runtime']['request_timeout_seconds'] = self.request_timeout
-        d['run_runtime']['objective'] = active_task['title'] if continuation else (text or content_text(content, images=True))
-        d['run_runtime']['execution_requested'] = continuation or self.prompt.requests_development_execution(text, protocols)
-        d['run_runtime']['project_changed'] = False
-        d['run_runtime']['verification_succeeded'] = False
+                    d.run_runtime[key] = json.loads(
+                        json.dumps(previous_runtime[key], ensure_ascii=False)
+                    )
+            d.run_runtime["reuse_evidence"] = True
+        d.run_runtime["execution_seconds_limit"] = self.seconds
+        d.run_runtime["request_timeout_seconds"] = self.request_timeout
+        d.run_runtime["objective"] = (
+            active_task["title"]
+            if continuation
+            else (text or content_text(content, images=True))
+        )
+        d.run_runtime["execution_requested"] = (
+            continuation or self.prompt.requests_development_execution(text, protocols)
+        )
+        d.run_runtime["project_changed"] = False
+        d.run_runtime["verification_succeeded"] = False
         if is_recall_request(text):
-            d['run_runtime']['phase'] = 'answer'
-        d.update(run_id=uid('run'), status='running', rounds=0, tool_count=0, failures=0,
-                 deadline=time.time() + self.seconds, pending=[], answer='', usage={},
-                 limits=dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
-        d['messages'].append(dict(role='user', content=content))
-        self.store.data.update(d)
-        d = self.store.data
+            d.run_runtime["history_lookup"] = True
+        d.apply(
+            run_id=uid("run"),
+            status="running",
+            rounds=0,
+            tool_count=0,
+            failures=0,
+            deadline=time.time() + self.seconds,
+            pending=[],
+            answer="",
+            usage={},
+            limits=dict(
+                rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures
+            ),
+        )
+        d.messages.append(dict(role="user", content=content))
+        self.store.record = d
+        d = self.store.record
         try:
-            self.store.save()
+            self.store.commit()
         except BaseException:
-            d.update(previous_data)
+            self.store.record = previous_data
             raise
         try:
             if on_registered:
-                on_registered(d['run_id'])
+                on_registered(d.run_id)
             self.machine.restart()
-            self.machine.transition('execute', 'prepared')
+            self.machine.transition("execute", "prepared")
             self.cancel_requested = False
-            if 'coding' in d['run_runtime']['protocols'] and project_manager is not None:
+            if "coding" in d.run_runtime["protocols"] and project_manager is not None:
                 try:
-                    task = project_manager.begin_task(d['run_runtime']['objective'], run_id=d['run_id'])
-                    d['run_runtime']['project_task_id'] = task['id']
-                    d['run_runtime']['project_task_status'] = task['status']
+                    task = project_manager.begin_task(
+                        d.run_runtime["objective"], run_id=d.run_id
+                    )
+                    d.run_runtime["project_task_id"] = task["id"]
+                    d.run_runtime["project_task_status"] = task["status"]
                 except Exception as exc:
-                    d['run_runtime']['agent_docs_error'] = f'{type(exc).__name__}: {exc}'
+                    d.run_runtime["memory_error"] = f"{type(exc).__name__}: {exc}"
             self.research.register_user_urls(text)
-            self.store.save()
-            self.store.event('run_start', profile=profile, phase='explore')
-            self.run_logger.record('run_start', input_event_id=input_id, text=text)
+            self.store.commit()
+            self.store.event("run_start", profile=profile, phase="explore")
+            self.run_logger.record("run_start", input_event_id=input_id, text=text)
             if cancellation_requested():
                 return self.cancel()
-            if is_recall_request(text) and previous_answer and self._can_reuse_answer(text, previous_answer):
+            if (
+                is_recall_request(text)
+                and previous_answer
+                and self._can_reuse_answer(text, previous_answer)
+            ):
                 # 纯文本追问不应让随机模型修改已通过来源和价格校验的事实。
-                d['messages'].append(dict(role='assistant', content=previous_answer, tool_calls=None))
-                recall_status = 'completed' if previous_status == 'completed' else 'partial'
-                d['run_runtime']['stop_reason'] = 'model_answer' if recall_status == 'completed' else 'evidence_gap'
-                self.store.save()
+                d.messages.append(
+                    dict(role="assistant", content=previous_answer, tool_calls=None)
+                )
+                recall_status = (
+                    "completed" if previous_status == "completed" else "partial"
+                )
+                d.run_runtime["stop_reason"] = (
+                    "model_answer" if recall_status == "completed" else "evidence_gap"
+                )
+                self.store.commit()
                 return self.status(recall_status, previous_answer)
         except KeyboardInterrupt:
             return self.cancel()
@@ -262,113 +372,149 @@ class Runner(RecoveryMixin):
     def context(self, *, recovery=False, final=False):
         """构建当前轮次的模型上下文。"""
         try:
-            self.store.data['run_runtime']['capabilities'] = {
-                'enabled': [item['function']['name'] for item in self.runtime.definitions()],
+            self.store.record.run_runtime["capabilities"] = {
+                "enabled": [
+                    item["function"]["name"] for item in self.runtime.definitions()
+                ],
             }
-            return self.context_budgeter.build(self.store.data['run_runtime']['profile'], recovery=recovery, final=final)
+            return self.context_budgeter.build(
+                self.store.record.run_runtime["profile"], recovery=recovery, final=final
+            )
         except ValueError as exc:
             raise ContextLimitError(str(exc)) from exc
 
     def append_result(self, call, result):
         """记录工具执行结果到会话消息和工具活动日志。"""
-        d = self.store.data
-        self.run_logger.record('tool_result_delivery', call=call, result=result)
-        entry = d['calls'].get(call['id'], {})
-        executed = entry.get('executed')
-        if executed is None and entry.get('state') not in {'unknown', 'started'}:
+        d = self.store.record
+        self.run_logger.record("tool_result_delivery", call=call, result=result)
+        entry = d.calls.get(call["id"], {})
+        executed = entry.get("executed")
+        if executed is None and entry.get("state") not in {"unknown", "started"}:
             executed = False
-        d['run_runtime'].setdefault('tool_activity', []).append({
-            'call_id': call['id'], 'tool': call['name'], 'ok': result.get('ok'),
-            'code': (result.get('error') or {}).get('code'),
-            'executed': executed,
-        })
-        d['messages'].append(dict(role='tool', tool_call_id=call['id'], content=result_content(result)))
-        d['failures'] = 0 if result['ok'] else d['failures'] + 1
-        d['pending'].pop(0)
-        if self.docs.exists():
-            try:
-                arguments = json.loads(call.get('arguments') or '{}')
-                manager = self.docs.manager()
-                manager.record_tool(call['name'], result, arguments if isinstance(arguments, dict) else {})
-                task = manager.active_task()
-                if task:
-                    d['run_runtime']['project_task_id'] = task['id']
-                    d['run_runtime']['project_task_status'] = task['status']
-            except Exception as exc:
-                d['run_runtime']['agent_docs_error'] = f'{type(exc).__name__}: {exc}'
+        d.run_runtime.setdefault("tool_activity", []).append(
+            {
+                "call_id": call["id"],
+                "tool": call["name"],
+                "ok": result.get("ok"),
+                "code": (result.get("error") or {}).get("code"),
+                "executed": executed,
+            }
+        )
+        d.messages.append(
+            dict(role="tool", tool_call_id=call["id"], content=result_content(result))
+        )
+        d.failures = 0 if result["ok"] else d.failures + 1
+        d.pending.pop(0)
+        self.runtime.deliver_observations(
+            result.get("observations", []), call_id=call["id"]
+        )
         self._update_development_state(call, result)
-        self.store.save()
-        self.on_event('tool_result', result)
+        self.store.commit()
+        self.on_event("tool_result", result)
 
     def close_pending(self, code):
         """以指定错误码关闭所有待处理调用。"""
-        while self.store.data['pending']:
-            call = self.store.data['pending'][0]
-            entry = self.store.data['calls'].get(call['id'], {})
-            result = entry.get('result')
+        while self.store.record.pending:
+            call = self.store.record.pending[0]
+            entry = self.store.record.calls.get(call["id"], {})
+            result = entry.get("result")
             if result is None:
-                if entry.get('state') in {'started', 'unknown'}:
-                    result = self.runtime.error(call, 'unknown_execution', '工具执行结果不确定，可能已产生修改，请检查输出。')
+                if entry.get("state") in {"started", "unknown"}:
+                    result = self.runtime.error(
+                        call,
+                        "unknown_execution",
+                        "工具执行结果不确定，可能已产生修改，请检查输出。",
+                    )
                 else:
-                    result = self.runtime.error(call, code, '本次运行已停止，工具未执行；原因：' + code)
+                    result = self.runtime.error(
+                        call, code, "本次运行已停止，工具未执行；原因：" + code
+                    )
             self.append_result(call, result)
 
     def stop(self, status, message, reason=None):
         """以指定状态和消息终止当前运行。"""
-        state = self.store.data['run_runtime']
-        state['stop_reason'] = reason or state.get('stop_reason') or status
-        self.close_pending(state['stop_reason'])
+        state = self.store.record.run_runtime
+        state["stop_reason"] = reason or state.get("stop_reason") or status
+        self.close_pending(state["stop_reason"])
         return self.status(status, message)
 
-    def fail(self, exc, *, reason='runtime_error'):
+    def fail(self, exc, *, reason="runtime_error"):
         """记录异常诊断并终止运行。"""
-        self.run_logger.error('run_error', exc, reason=reason)
+        self.run_logger.error("run_error", exc, reason=reason)
         diagnostic = {
-            'id': uid('diagnostic'), 'type': type(exc).__name__,
+            "id": uid("diagnostic"),
+            "type": type(exc).__name__,
             # 不持久化异常参数、局部变量、源码文本或 HTTP 响应体。
-            'message': '模型服务调用失败' if reason == 'model_error' else '运行组件发生内部异常',
-            'frames': [{'file': Path(frame.filename).name, 'function': frame.name, 'line': frame.lineno}
-                       for frame in traceback.extract_tb(exc.__traceback__)[-12:]],
+            "message": "模型服务调用失败"
+            if reason == "model_error"
+            else "运行组件发生内部异常",
+            "frames": [
+                {
+                    "file": Path(frame.filename).name,
+                    "function": frame.name,
+                    "line": frame.lineno,
+                }
+                for frame in traceback.extract_tb(exc.__traceback__)[-12:]
+            ],
         }
-        self.store.data['run_runtime']['last_failure'] = diagnostic
-        pending = self.store.data['pending']
-        self.store.event('failure', code=type(exc).__name__, diagnostic=diagnostic,
-                         tool_call_id=pending[0]['id'] if pending else None)
-        message = self.model_error(exc) + ' 诊断编号：' + diagnostic['id'] + '（/trace 查看）'
-        return self.stop('failed', message, reason)
+        self.store.record.run_runtime["last_failure"] = diagnostic
+        pending = self.store.record.pending
+        self.store.event(
+            "failure",
+            code=type(exc).__name__,
+            diagnostic=diagnostic,
+            tool_call_id=pending[0]["id"] if pending else None,
+        )
+        message = (
+            self.model_error(exc) + " 诊断编号：" + diagnostic["id"] + "（/trace 查看）"
+        )
+        return self.stop("failed", message, reason)
 
     def cancel(self):
         """标记取消请求并终止运行。"""
-        self.run_logger.record('run_cancel')
+        self.run_logger.record("run_cancel")
         self.cancel_requested = True
-        for call in self.store.data['calls'].values():
-            if call.get('state') in {'started', 'unknown'}:
-                call['acknowledged'] = True
-        return self.stop('cancelled', '运行已取消；不确定写操作不会自动重做，请检查输出文件。', 'user_cancelled')
+        for call in self.store.record.calls.values():
+            if call.get("state") in {"started", "unknown"}:
+                call["acknowledged"] = True
+        return self.stop(
+            "cancelled",
+            "运行已取消；不确定写操作不会自动重做，请检查输出文件。",
+            "user_cancelled",
+        )
 
     def resume(self):
         """从中断或确认等待状态恢复运行。"""
-        d = self.store.data
-        self.run_logger.record('run_resume', previous_status=d['status'])
-        if any(c['state'] in {'started', 'unknown'} and not c.get('acknowledged') for c in d['calls'].values()):
-            return self.status('interrupted', '存在不确定调用。请检查输出并 /cancel；不会自动重放。')
-        if d['status'] not in {'interrupted', 'awaiting_confirmation'}:
-            raise ValueError('没有可恢复的运行')
+        d = self.store.record
+        self.run_logger.record("run_resume", previous_status=d.status)
+        if any(
+            (
+                c["state"] in {"started", "unknown"} and (not c.get("acknowledged"))
+                for c in d.calls.values()
+            )
+        ):
+            return self.status(
+                "interrupted", "存在不确定调用。请检查输出并 /cancel；不会自动重放。"
+            )
+        if d.status not in {"interrupted", "awaiting_confirmation"}:
+            raise ValueError("没有可恢复的运行")
         self.store.verify_sources()
-        if d['status'] == 'awaiting_confirmation':
-            return self.status('awaiting_confirmation')
-        if self.machine.state == 'ready':
+        if d.status == "awaiting_confirmation":
+            return self.status("awaiting_confirmation")
+        if self.machine.state == "ready":
             # The host can stop just after the first durable user-message checkpoint.
             self.machine.restart()
-        self.machine.transition('execute', 'resume')
+        self.machine.transition("execute", "resume")
         return self.drive()
 
     def confirm(self, approve):
         """处理用户对待确认调用的批准或拒绝。"""
-        d = self.store.data
-        self.run_logger.record('confirmation_decision', approved=approve, pending=d['pending'])
-        if d['status'] != 'awaiting_confirmation' or not d['pending']:
-            raise ValueError('没有待确认调用')
+        d = self.store.record
+        self.run_logger.record(
+            "confirmation_decision", approved=approve, pending=d.pending
+        )
+        if d.status != "awaiting_confirmation" or not d.pending:
+            raise ValueError("没有待确认调用")
         try:
             return self._confirm(approve)
         except KeyboardInterrupt:
@@ -378,41 +524,44 @@ class Runner(RecoveryMixin):
 
     def _confirm(self, approve):
         """执行确认或拒绝操作，处理过期确认的重新预览。"""
-        d = self.store.data
-        state = d['run_runtime']
-        paused_at = state.get('confirmation_paused_at')
+        d = self.store.record
+        state = d.run_runtime
+        paused_at = state.get("confirmation_paused_at")
         if paused_at is not None:
             duration = max(0, time.time() - paused_at)
-            d['deadline'] += duration
-            state['paused_seconds'] = state.get('paused_seconds', 0) + duration
-            state['confirmation_paused_at'] = None
-        call = d['pending'][0]
-        if time.time() >= d['deadline']:
-            return self.stop('limit_reached', '运行已超时；确认没有执行', 'deadline')
+            d.deadline += duration
+            state["paused_seconds"] = state.get("paused_seconds", 0) + duration
+            state["confirmation_paused_at"] = None
+        call = d.pending[0]
+        if time.time() >= d.deadline:
+            return self.stop("limit_reached", "运行已超时；确认没有执行", "deadline")
         if cancellation_requested():
             return self.cancel()
         if approve:
-            prior = d['calls'].get(call['id'], {})
-            if prior.get('expires', 0) < time.time():
+            prior = d.calls.get(call["id"], {})
+            if prior.get("expires", 0) < time.time():
                 # 重建预览，但绝不用过期的确认执行。
                 result = self.runtime.execute(call)
-                if result.get('pending'):
-                    return self.status('awaiting_confirmation', '确认已过期；目标已重新预览，请再次确认。')
+                if result.get("pending"):
+                    return self.status(
+                        "awaiting_confirmation",
+                        "确认已过期；目标已重新预览，请再次确认。",
+                    )
                 self.append_result(call, result)
-                self.machine.transition('execute', 'confirmation_expired')
+                self.machine.transition("execute", "confirmation_expired")
                 return self.drive()
-            result = self.runtime.execute(call, approved=prior.get('digest', 'invalid'))
+            result = self.runtime.execute(call, approved=prior.get("digest", "invalid"))
         else:
             result = self.research.after_execute(call, self.runtime.reject(call))
-        self.machine.transition('execute', 'confirmation_resolved')
-        if result.get('error') and result['error']['code'] == 'unknown_execution':
+        self.machine.transition("execute", "confirmation_resolved")
+        if result.get("error") and result["error"]["code"] == "unknown_execution":
             if cancellation_requested():
                 return self.cancel()
-            return self.status('interrupted', result['error']['message'])
+            return self.status("interrupted", result["error"]["message"])
         self.append_result(call, result)
         if not approve:
-            self.research.force_answer('user_rejected')
-            self.close_pending('user_rejected')
+            self.research.force_answer("user_rejected")
+            self.close_pending("user_rejected")
         return self.drive()
 
     def drive(self):
@@ -421,161 +570,270 @@ class Runner(RecoveryMixin):
         按 思考→行动→观察 迭代，直到产出最终回答或触发限制。
         返回最终状态字典或回答文本；异常由调用方捕获。
         """
-        d = self.store.data
-        self.status('running')
+        d = self.store.record
+        self.status("running")
         try:
             while True:
-                if self.cancel_requested or cancellation_requested(): return self.cancel()
-                state = d['run_runtime']
-                limits = d.get('limits', dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
-                if time.time() >= d['deadline']:
+                if self.cancel_requested or cancellation_requested():
+                    return self.cancel()
+                state = d.run_runtime
+                limits = getattr(
+                    d,
+                    "limits",
+                    dict(
+                        rounds=self.max_rounds,
+                        tools=self.max_tools,
+                        failures=self.max_failures,
+                    ),
+                )
+                if time.time() >= d.deadline:
                     return self.finish_timeout(task_expired=True)
-                if d['failures'] >= limits['failures']:
-                    if state['evidence_refs']: self.research.force_answer('failure_limit')
-                    else: return self.stop('limit_reached', '达到连续失败上限，且没有取得可用证据', 'failure_limit')
-                if d['pending']:
+                if d.failures >= limits["failures"]:
+                    if state["evidence_refs"]:
+                        self.research.force_answer("failure_limit")
+                    else:
+                        return self.stop(
+                            "limit_reached",
+                            "达到连续失败上限，且没有取得可用证据",
+                            "failure_limit",
+                        )
+                if d.pending:
                     outcome = self._execute_pending(limits)
-                    if outcome is not None: return outcome
+                    if outcome is not None:
+                        return outcome
                     continue
                 decision = self.completion.decide(state)
-                final, recovery = decision == 'answer', decision == 'recover'
-                if final and self.machine.state not in {'verify', 'recover'}:
-                    self.machine.transition('verify', 'answer_ready')
-                if d['rounds'] >= limits['rounds']:
-                    if state['evidence_refs'] or state.get('partial_response'):
-                        return self.status('partial', state.get('partial_response') or '已达到模型轮次上限；已保存来源，请缩小问题后继续。')
-                    return self.stop('limit_reached', '达到模型轮次上限', 'model_budget')
-                if not final and not recovery and state['profile'].startswith('web') and state['usage']['model_calls'] >= max(1, state['budget']['model_calls'] - 1):
-                    self.research.force_answer('model_answer_reserve'); continue
+                final, recovery = decision == "answer", decision == "recover"
+                if final and self.machine.state not in {"verify", "recover"}:
+                    self.machine.transition("verify", "answer_ready")
+                if d.rounds >= limits["rounds"]:
+                    if state["evidence_refs"] or state.get("partial_response"):
+                        return self.status(
+                            "partial",
+                            state.get("partial_response")
+                            or "已达到模型轮次上限；已保存来源，请缩小问题后继续。",
+                        )
+                    return self.stop(
+                        "limit_reached", "达到模型轮次上限", "model_budget"
+                    )
+                if (
+                    not final
+                    and not recovery
+                    and state["profile"].startswith("web")
+                    and state["usage"]["model_calls"]
+                    >= max(1, state["budget"]["model_calls"] - 1)
+                ):
+                    self.research.force_answer("model_answer_reserve")
+                    continue
                 self.research.note_progress_round()
                 context = self.context(recovery=recovery, final=final)
-                tool_definitions = [] if final or recovery else self.runtime.definitions()
+                tool_definitions = (
+                    [] if final or recovery else self.runtime.definitions()
+                )
                 response = self._call_model(context, tool_definitions)
-                if cancellation_requested(): return self.cancel()
-                if isinstance(response, dict): return response
+                if cancellation_requested():
+                    return self.cancel()
+                if isinstance(response, dict):
+                    return response
                 calls = [asdict(call) for call in response.tool_calls or []]
-                if not calls and re.search(r'<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)', response.content or '', re.I):
+                if not calls and re.search(
+                    r"<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)",
+                    response.content or "",
+                    re.I,
+                ):
                     outcome = self._recover_serialized_tool_output()
                     if outcome is not None:
                         return outcome
                     continue
-                if response.finish_reason == 'length':
-                    outcome = self._handle_length(response.content or '')
-                    if outcome is not None: return outcome
+                if response.finish_reason == "length":
+                    outcome = self._handle_length(response.content or "")
+                    if outcome is not None:
+                        return outcome
                     continue
-                if response.finish_reason not in {None, 'stop', 'tool_calls'}:
-                    return self.stop('failed', '模型输出未正常结束：' + str(response.finish_reason))
+                if response.finish_reason not in {None, "stop", "tool_calls"}:
+                    return self.stop(
+                        "failed", "模型输出未正常结束：" + str(response.finish_reason)
+                    )
                 if not response.content and not calls:
                     outcome = self._handle_empty()
-                    if outcome is not None: return outcome
+                    if outcome is not None:
+                        return outcome
                     continue
                 invalid = self._invalid_calls(calls, tool_definitions)
                 if invalid:
                     outcome = self._recover_tool_protocol(invalid)
-                    if outcome is not None: return outcome
+                    if outcome is not None:
+                        return outcome
                     continue
-                if state['phase'] == 'answer' and calls: continue
+                if state["phase"] == "answer" and calls:
+                    continue
                 if calls:
-                    d['messages'].append(dict(role='assistant', content=response.content, tool_calls=[dict(call) for call in calls]))
-                    d['pending'] = [dict(call) for call in calls]
-                    self.store.save()
+                    d.messages.append(
+                        dict(
+                            role="assistant",
+                            content=response.content,
+                            tool_calls=[dict(call) for call in calls],
+                        )
+                    )
+                    d.pending = [dict(call) for call in calls]
+                    self.store.commit()
                     continue
-                if not response.content: continue
+                if not response.content:
+                    continue
                 if self.development.development_change_required(state):
                     outcome = self.development.recover_tool_required(self)
                     if outcome is not None:
                         return outcome
                     continue
                 # 自验证：文件修改后自动运行测试。
-                if (self._needs_verification or state.get('verification_required')) and self.development.should_auto_verify(state):
+                if (
+                    self._needs_verification or state.get("verification_required")
+                ) and self.development.should_auto_verify(state):
                     outcome = self.development.inject_verification_test(self)
-                    if outcome == 'skip':
+                    if outcome == "skip":
                         pass  # run_commands not available; fall through to answer
                     elif outcome is not None:
                         return outcome
                     else:
                         continue
-                if self.machine.state in {'execute', 'recover'}:
-                    self.machine.transition('verify', 'model_answer')
+                if self.machine.state in {"execute", "recover"}:
+                    self.machine.transition("verify", "model_answer")
                 if not self._answer_refs_valid(response.content):
                     outcome = self._recover_bad_refs()
-                    if outcome is not None: return outcome
+                    if outcome is not None:
+                        return outcome
                     continue
                 unsupported_prices = self._unsupported_price_claims(response.content)
                 if unsupported_prices:
                     outcome = self._recover_unsupported_prices(unsupported_prices)
-                    if outcome is not None: return outcome
+                    if outcome is not None:
+                        return outcome
                     continue
-                self.store.verify_artifacts(current_run_only=True); EvidenceBundle(self.store).verify()
-                d['messages'].append(dict(role='assistant', content=response.content, tool_calls=None))
-                self.store.save()
-                partial = response.content.lstrip().startswith('[[PARTIAL]]')
-                answer = response.content.lstrip().removeprefix('[[PARTIAL]]').lstrip() if partial else response.content
-                price_request = bool(re.search(r'价格|售价|多少钱|price|cost', str(state.get('objective') or ''), re.I))
-                verified_price = price_request and bool(self._price_amounts(response.content)) and not unsupported_prices and bool(SOURCE_REF.findall(response.content))
+                self.store.verify_artifacts(current_run_only=True)
+                EvidenceBundle(self.store).verify()
+                d.messages.append(
+                    dict(role="assistant", content=response.content, tool_calls=None)
+                )
+                self.store.commit()
+                partial = response.content.lstrip().startswith("[[PARTIAL]]")
+                answer = (
+                    response.content.lstrip().removeprefix("[[PARTIAL]]").lstrip()
+                    if partial
+                    else response.content
+                )
+                price_request = bool(
+                    re.search(
+                        r"价格|售价|多少钱|price|cost",
+                        str(state.get("objective") or ""),
+                        re.I,
+                    )
+                )
+                verified_price = (
+                    price_request
+                    and bool(self._price_amounts(response.content))
+                    and not unsupported_prices
+                    and bool(SOURCE_REF.findall(response.content))
+                )
                 if verified_price and not partial:
-                    state['stop_reason'] = 'model_answer'
-                verification_incomplete = bool(state.get('verification_required'))
+                    state["stop_reason"] = "model_answer"
+                verification_incomplete = bool(state.get("verification_required"))
                 if verification_incomplete:
-                    state['stop_reason'] = 'verification_failed'
-                forced = state.get('stop_reason') not in {None, 'model_answer', 'finish_reason_length', 'empty_response', 'invalid_source_reference'}
-                state['stop_reason'] = state.get('stop_reason') or ('evidence_gap' if partial else 'model_answer')
-                return self.status('partial' if partial or forced or verification_incomplete else 'completed', answer)
-        except KeyboardInterrupt: return self.cancel()
-        except ContextLimitError as exc: return self.stop('failed', str(exc), 'context_error')
+                    state["stop_reason"] = "verification_failed"
+                forced = state.get("stop_reason") not in {
+                    None,
+                    "model_answer",
+                    "finish_reason_length",
+                    "empty_response",
+                    "invalid_source_reference",
+                }
+                state["stop_reason"] = state.get("stop_reason") or (
+                    "evidence_gap" if partial else "model_answer"
+                )
+                return self.status(
+                    "partial"
+                    if partial or forced or verification_incomplete
+                    else "completed",
+                    answer,
+                )
+        except KeyboardInterrupt:
+            return self.cancel()
+        except ContextLimitError as exc:
+            return self.stop("failed", str(exc), "context_error")
         except Exception as exc:
             return self.fail(exc)
 
     def _execute_pending(self, limits):
         """执行单个待处理工具调用并更新验证状态。"""
-        d = self.store.data; call = d['pending'][0]; prior = d['calls'].get(call['id'])
-        if prior and prior['state'] in {'unknown', 'started'}: return self.status('interrupted', '存在不确定调用，禁止自动重放')
+        d = self.store.record
+        call = d.pending[0]
+        prior = d.calls.get(call["id"])
+        if prior and prior["state"] in {"unknown", "started"}:
+            return self.status("interrupted", "存在不确定调用，禁止自动重放")
         if not prior:
-            if d['tool_count'] >= limits['tools']:
-                if not d['run_runtime']['evidence_refs'] and (d['run_runtime']['profile'] in {'direct_answer', 'local_files'} or d['run_runtime']['usage'].get('search_queries', 0) == 0):
-                    return self.stop('limit_reached', '达到工具调用上限', 'tool_budget')
-                self.research.force_answer('tool_budget'); self.close_pending('budget_exhausted'); return None
-            d['tool_count'] += 1; self.store.save()
-        
-        self.on_event('tool_start', dict(name=call['name'])); started = time.monotonic()
+            if d.tool_count >= limits["tools"]:
+                if not d.run_runtime["evidence_refs"] and (
+                    d.run_runtime["profile"] in {"direct_answer", "local_files"}
+                    or d.run_runtime["usage"].get("search_queries", 0) == 0
+                ):
+                    return self.stop("limit_reached", "达到工具调用上限", "tool_budget")
+                self.research.force_answer("tool_budget")
+                self.close_pending("budget_exhausted")
+                return None
+            d.tool_count += 1
+            self.store.commit()
+
+        self.on_event("tool_start", dict(name=call["name"]))
+        started = time.monotonic()
         result = self.runtime.execute(call)
         elapsed_ms = round((time.monotonic() - started) * 1000)
-        
-        if result.get('pending'):
+
+        if result.get("pending"):
             if cancellation_requested():
                 return self.cancel()
-            return self.status('awaiting_confirmation', self.runtime.confirmation_message(call['name']))
-        self.store.event('tool_end', tool_call_id=call['id'], tool=call['name'], ok=result.get('ok'), code=(result.get('error') or {}).get('code'), elapsed_ms=elapsed_ms, profile=d['run_runtime']['profile'], phase=d['run_runtime']['phase'])
-        if result.get('error') and result['error']['code'] == 'unknown_execution':
+            return self.status(
+                "awaiting_confirmation", self.runtime.confirmation_message(call["name"])
+            )
+        self.store.event(
+            "tool_end",
+            tool_call_id=call["id"],
+            tool=call["name"],
+            ok=result.get("ok"),
+            code=(result.get("error") or {}).get("code"),
+            elapsed_ms=elapsed_ms,
+            profile=d.run_runtime["profile"],
+            phase=d.run_runtime["phase"],
+        )
+        if result.get("error") and result["error"]["code"] == "unknown_execution":
             if cancellation_requested():
                 return self.cancel()
-            return self.status('interrupted', result['error']['message'])
+            return self.status("interrupted", result["error"]["message"])
         self.append_result(call, result)
         if cancellation_requested():
             return self.cancel()
-        if call['name'] == 'attempt_completion' and result.get('ok'):
-            answer = (result.get('data') or {}).get('result')
+        if call["name"] == "attempt_completion" and result.get("ok"):
+            answer = (result.get("data") or {}).get("result")
             if answer:
-                return self.stop('completed', answer, 'attempt_completion')
-        if self.research.should_force_answer(): self.close_pending('research_complete')
+                return self.stop("completed", answer, "attempt_completion")
+        if self.research.should_force_answer():
+            self.close_pending("research_complete")
         return None
 
     def _update_development_state(self, call, result):
-        """统一记录直接执行与批准后执行的开发结果，由 append_result 一并落盘。"""
-        d = self.store.data
-        if call['name'] in self.development.FILE_MODIFY_TOOLS and result.get('ok'):
-            d['run_runtime']['project_changed'] = True
-            validation = ((result.get('data') or {}).get('validation') or {})
-            if validation.get('passed') is True:
-                d['run_runtime']['verification_succeeded'] = True
-                d['run_runtime']['verification_required'] = False
-                self._needs_verification = False
-            if self.development.requires_change_verification(call['name'], result, run_state=d['run_runtime']):
-                self._needs_verification = True
-                d['run_runtime']['verification_required'] = True
-                d['run_runtime']['verification_succeeded'] = False
-        elif call['name'] == 'run_commands' and isinstance((result.get('data') or {}).get('summary'), dict):
-            passed = bool(result.get('ok') and (result.get('data') or {}).get('passed'))
-            self._needs_verification = not passed
-            d['run_runtime']['verification_required'] = not passed
-            d['run_runtime']['verification_succeeded'] = passed
+        """Consume tool-owned facts for both direct and approved executions."""
+        if not result.get("ok"):
+            return
+        state = self.store.record.run_runtime
+        for item in result.get("observations", []):
+            if item["kind"] == "resource_changed":
+                state["project_changed"] = True
+                if self.development.requires_change_verification(
+                    result, run_state=state
+                ):
+                    self._needs_verification = True
+                    state["verification_required"] = True
+                    state["verification_succeeded"] = False
+            elif item["kind"] == "verification":
+                passed = item["passed"]
+                self._needs_verification = not passed
+                state["verification_required"] = not passed
+                state["verification_succeeded"] = passed

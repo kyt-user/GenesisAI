@@ -13,7 +13,8 @@ from genesisai.core.prompt.composer import PromptComposer, PromptFormatError
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills import SkillError, SkillRegistry
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
-from genesisai.core.state.store import Store, sha
+from genesisai.shared.ids import sha
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.registry import ToolRegistry
 from genesisai.core.tools.base import ToolSpec, object_schema
 from genesisai.core.tools.tool_runtime import ToolRuntime
@@ -22,9 +23,9 @@ from genesisai.core.tools.tool_runtime import ToolRuntime
 def runtime_for(tmp_path, *, active=()):
     workspace = tmp_path / "workspace"; workspace.mkdir()
     state = tmp_path / "state"; output = tmp_path / "output"
-    store = Store(state, workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(output), run_id="run_test")
-    store.save()
+    store = Session(state, workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(output), run_id='run_test')
+    store.commit()
     runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=[], permission_mode="auto")
     return workspace, output, store, runtime
 
@@ -46,7 +47,7 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
     digest = entry["sha256"]
     patch = "@@ -1,2 +1,2 @@\n def add(a, b):\n-    return a - b\n+    return a + b"
     changed = execute(runtime, "editor", {"operation": "patch", "path": "calc.py", "patch": patch, "expected_sha256": digest})
-    assert changed["ok"] and target.read_bytes().endswith(b"a + b\r\n") and store.data["changes"]
+    assert changed['ok'] and target.read_bytes().endswith(b'a + b\r\n') and store.record.changes
     conflict = execute(runtime, "editor", {"operation": "patch", "path": "calc.py", "patch": patch, "expected_sha256": digest}, "conflict")
     assert not conflict["ok"] and conflict["error"]["code"] == "patch_conflict"
     shell = execute(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-c", "print('ok')"], "cwd": ".", "timeout_seconds": 10})
@@ -58,7 +59,7 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
     status = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": "."}, "git_toplevel")
     assert status["ok"] and "workspace" in status["data"]["stdout"]
-    machine = RunStateMachine(store); store.data["run_runtime"]["lifecycle"] = "ready"
+    machine = RunStateMachine(store); store.record.run_runtime['lifecycle'] = "ready"
     machine.transition("prepare", "test"); machine.transition("execute", "test")
     with pytest.raises(StateTransitionError): machine.transition("ready", "illegal")
 
@@ -93,10 +94,11 @@ def test_p5_optional_dependency_status_is_visible():
 
 def test_p4_skill_priority_strict_schema_and_core_tools(tmp_path):
     workspace = tmp_path / "workspace"; workspace.mkdir()
-    root = workspace / ".genesis" / "skills" / "bug_fix"; root.mkdir(parents=True)
+    project_root = tmp_path / "app" / "project"
+    root = project_root / "skills" / "bug_fix"; root.mkdir(parents=True)
     (root / "skill.yaml").write_text("name: bug_fix\ndescription: project override\nentry: SKILL.md\ntools: [read_files]\n", encoding="utf-8")
     (root / "SKILL.md").write_text("# Project flow\n", encoding="utf-8")
-    registry = ToolRegistry(); skills = SkillRegistry(workspace, registry)
+    registry = ToolRegistry(); skills = SkillRegistry(workspace, registry, project_root=project_root)
     item = skills.describe("bug_fix", include_content=True)
     assert item["source"] == "project" and "builtin" in item["overridden"] and "Project flow" in item["content"]
     assert skills.load(["bug_fix"]) == ["bug_fix"]
@@ -113,14 +115,14 @@ def test_p5_docx_xlsx_pdf_and_optional_pptx(tmp_path):
     read_book = execute(runtime, "xlsx_read", {"path": str(output / "sample.xlsx")}); assert read_book["ok"] and read_book["data"]["formulas_not_recalculated"]
     pdf = execute(runtime, "pdf_create", {"path": "sample.pdf", "lines": ["GenesisAI report"]}); assert pdf["ok"] and detect_file_type(output / "sample.pdf") == "pdf"
     assert execute(runtime, "pdf_read", {"path": str(output / "sample.pdf")})["ok"]
-    assert all(item.get("verified") for item in store.data["artifacts"].values())
+    assert all((item.get('verified') for item in store.record.artifacts.values()))
 
 
 def test_manual_compact_preserves_file_creation(tmp_path):
     workspace, output, store, runtime = runtime_for(tmp_path)
     for i in range(4):
-        store.data["messages"].extend([{"role": "user", "content": f"goal {i}"}, {"role": "assistant", "content": f"answer {i}"}])
-    store.save()
+        store.record.messages.extend([{'role': 'user', 'content': f'goal {i}'}, {'role': 'assistant', 'content': f'answer {i}'}])
+    store.commit()
     summary = ContextBudgeter(store, PromptComposer()).compact(force=True)
     assert summary["mode"] == "manual" and summary["tokens_after"] > 0
     created = execute(runtime, "editor", {"operation": "create", "path": "new.txt", "content": "hello", "source_refs": [], "scope": "workspace"})

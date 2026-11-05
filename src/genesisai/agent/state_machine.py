@@ -17,7 +17,7 @@ class RunStateMachine:
 
     @property
     def state(self) -> str:
-        return self.store.data["run_runtime"].get("lifecycle", "ready")
+        return self.store.record.run_runtime.get('lifecycle', 'ready')
 
     def transition(self, target: str, reason: str, *, save: bool = True) -> str:
         if target not in RUN_STATES:
@@ -27,7 +27,7 @@ class RunStateMachine:
             return target
         if target not in TRANSITIONS[current]:
             raise StateTransitionError(f"不允许的 Run 状态迁移：{current} → {target}")
-        runtime = self.store.data["run_runtime"]
+        runtime = self.store.record.run_runtime
         runtime["lifecycle"] = target
         runtime.setdefault("state_history", []).append({
             "from": current,
@@ -36,7 +36,7 @@ class RunStateMachine:
             "time": time.time(),
         })
         if save:
-            self.store.save()
+            self.store.commit()
         self.store.event("state", phase=target, code=reason)
         return target
 

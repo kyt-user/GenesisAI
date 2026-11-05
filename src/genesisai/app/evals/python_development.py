@@ -12,15 +12,17 @@ import sys
 import sysconfig
 import time
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
 import yaml
 
 from genesisai.agent.loop import Runner
-from genesisai.core.project_docs import AgentDocsManager
+from genesisai.core.memory import TaskService
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store, atomic_json
+from genesisai.core.persistence.session import Session
+from genesisai.core.persistence.files import atomic_json
 
 
 CASE_FIELDS = frozenset({"id", "name", "expectations"})
@@ -77,13 +79,13 @@ def _tool(identifier: str, name: str, arguments: dict) -> Response:
     )
 
 
-def _runtime(workspace: Path, case_root: Path) -> tuple[Store, ToolRuntime]:
+def _runtime(workspace: Path, case_root: Path) -> tuple[Session, ToolRuntime]:
     state = case_root / "state"
     output = case_root / "outputs"
     output.mkdir(parents=True, exist_ok=True)
-    store = Store(state, workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(output), run_id="run_python_simulation")
-    store.save()
+    store = Session(state, workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(output), run_id='run_python_simulation')
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], output, state, workspace_root=workspace),
@@ -122,7 +124,6 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
     (Path(project_site) / "genesisai_simulation_host.pth").write_text(
         str(Path(sysconfig.get_paths()["purelib"]).resolve()) + "\n", encoding="utf-8",
     )
-    AgentDocsManager(workspace, create=True)
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
     subprocess.run(["git", "add", "."], cwd=workspace, check=True, capture_output=True)
     subprocess.run(
@@ -170,15 +171,11 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
         [sys.executable, "-m", "pytest", "-q"], cwd=workspace,
         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60,
     )
-    manager = AgentDocsManager(workspace)
+    manager = TaskService(store)
     task = manager.active_task()
-    called = [item.get("call", {}).get("name") for item in store.data["calls"].values()]
-    inspection = ((store.data["calls"].get("inspect") or {}).get("result") or {}).get("data") or {}
-    run_calls = [
-        ((item.get("result") or {}).get("data") or {})
-        for item in store.data["calls"].values()
-        if (item.get("call") or {}).get("name") == "run_commands"
-    ]
+    called = [item.get('call', {}).get('name') for item in store.record.calls.values()]
+    inspection = ((store.record.calls.get('inspect') or {}).get('result') or {}).get('data') or {}
+    run_calls = [(item.get('result') or {}).get('data') or {} for item in store.record.calls.values() if (item.get('call') or {}).get('name') == 'run_commands']
     test_commands = [data.get("command", []) for data in run_calls if "summary" in data]
     diff_checked = any((data.get("command") or [""])[:1] == ["git"] for data in run_calls)
     checks = {
@@ -205,17 +202,18 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
 
 
 def _run_resume_and_drift(fixture: Path, output: Path) -> dict:
-    _, workspace, baseline = _prepare_case(fixture, output, "resume_and_drift")
-    first = AgentDocsManager(workspace, create=True)
+    case_root, workspace, baseline = _prepare_case(fixture, output, "resume_and_drift")
+    store, runtime = _runtime(workspace, case_root)
+    first = runtime.tasks
     task = first.begin_task("继续实现 Python 项目", run_id="run_before_restart")
     first.set_plan(steps=["检查实现", "运行测试"], acceptance=["测试通过"])
     target = workspace / "src" / "taskboard" / "service.py"
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
-    first.record_tool("read_files", {"ok": True, "data": {"files": [{"path": "src/taskboard/service.py", "sha256": digest}]}}, {"path": "src/taskboard/service.py"})
-    restarted = AgentDocsManager(workspace)
+    first.observe([{'kind':'resource_read','path':str(target),'sha256':digest}])
+    restarted = TaskService(Session(store.root,store.id))
     before = restarted.begin_task("继续实现 Python 项目", run_id="run_after_restart")
-    restarted.record_tool("run_commands", {"ok": True, "data": {"passed": True, "command": ["python", "-m", "pytest", "-q"], "exit_code": 0, "summary": {"passed": 2}}})
-    restarted.finish_run("completed", "已完成首次验收")
+    restarted.observe([{'kind':'verification','passed':True}])
+    restarted.finish('completed','已完成首次验收')
     with target.open("a", encoding="utf-8") as stream:
         stream.write("\n# external drift\n")
     drifted = restarted.reconcile()
@@ -223,7 +221,7 @@ def _run_resume_and_drift(fixture: Path, output: Path) -> dict:
     checks = {
         "same_task_resumed": before["id"] == task["id"],
         "new_run_recorded": "run_after_restart" in current["run_ids"],
-        "drift_detected": "src/taskboard/service.py" in drifted,
+        "drift_detected": str(target) in drifted,
         "verification_invalidated": current["status"] == "needs_verification" and not current["verification_passed"],
         "fixture_unchanged": inventory(fixture) == baseline,
     }
@@ -232,7 +230,6 @@ def _run_resume_and_drift(fixture: Path, output: Path) -> dict:
 
 def _run_failed_gate(fixture: Path, output: Path) -> dict:
     case_root, workspace, baseline = _prepare_case(fixture, output, "failed_acceptance_gate")
-    AgentDocsManager(workspace, create=True)
     target = workspace / "src" / "taskboard" / "service.py"
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     responses = [
@@ -253,21 +250,10 @@ def _run_failed_gate(fixture: Path, output: Path) -> dict:
     result = Runner(ScriptedModel(responses), runtime, max_rounds=16, seconds=120).start(
         "修复项目 API_KEY=should-not-leak；测试不通过时不得宣称完成。"
     )
-    manager = AgentDocsManager(workspace)
+    manager = TaskService(store)
     task = manager.active_task()
-    contents = "\n".join(path.read_text(encoding="utf-8") for path in manager.root.rglob("*.md"))
-    checks = {
-        "runner_not_completed": result["status"] == "partial",
-        "not_verified": task["status"] == "needs_verification",
-        "verification_retried_with_bound": sum(
-            1 for item in store.data["calls"].values()
-            if (item.get("call") or {}).get("name") == "run_commands"
-            and "summary" in (((item.get("result") or {}).get("data")) or {})
-        ) == 3,
-        "failed_result_recorded": "结果：失败" in contents and "退出码：`1`" in contents,
-        "secret_redacted": "should-not-leak" not in contents and "[REDACTED]" in contents,
-        "fixture_unchanged": inventory(fixture) == baseline,
-    }
+    contents = json.dumps(task, ensure_ascii=False)
+    checks = {'runner_not_completed': result['status'] == 'partial', 'not_verified': task['status'] == 'needs_verification', 'verification_retried_with_bound': sum((1 for item in store.record.calls.values() if (item.get('call') or {}).get('name') == 'run_commands' and 'summary' in ((item.get('result') or {}).get('data') or {}))) == 3, 'failed_result_recorded': any(o['kind']=='verification' and o['passed'] is False for o in task['observations']), 'secret_redacted': 'should-not-leak' not in contents and '[REDACTED]' in contents, 'fixture_unchanged': inventory(fixture) == baseline}
     return {
         "id": "failed_acceptance_gate", "status": "passed" if all(checks.values()) else "failed",
         "checks": checks, "runner_status": result["status"], "task": task,
@@ -305,8 +291,8 @@ def main(argv=None):
     project = Path(__file__).resolve().parents[4]
     parser = argparse.ArgumentParser(description="GenesisAI Python 小项目开发仿真验收")
     parser.add_argument("--dataset", type=Path, default=project / "tests" / "python_development_dataset" / "manifest.yaml")
-    parser.add_argument("--workspace", type=Path, default=project / "agent_tests_workspace")
-    parser.add_argument("--output", type=Path, default=Path.cwd() / ".genesis" / "python-development-simulation")
+    parser.add_argument("--workspace", type=Path, default=project / "tests" / "fixtures" / "python_project")
+    parser.add_argument("--output", type=Path, default=application_home() / "evaluations" / "python-development-simulation")
     args = parser.parse_args(argv)
     report = run_all(args.dataset, args.workspace, args.output)
     print(json.dumps({"status": report["status"], "cases": [{"id": item["id"], "status": item["status"]} for item in report["results"]]}, ensure_ascii=False, indent=2))

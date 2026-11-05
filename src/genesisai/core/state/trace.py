@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from genesisai.core.state.store import uid
+from genesisai.shared.ids import uid
+
 
 
 class TraceRecorder:

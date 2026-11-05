@@ -1,6 +1,6 @@
 # GenesisAI
 
-GenesisAI 是面向 CLI 用户的单 Agent 开发助手。它在一个持续 Session 中完成代码开发、文件管理、公开网络研究、Skills 和基础办公文档处理，并通过 `agent_docs` 维护项目工作记忆。项目不使用数据库或向量库。
+GenesisAI 是面向 CLI 用户的单 Agent 开发助手。它在一个持续 Session 中完成代码开发、文件管理、公开网络研究、Skills 和基础办公文档处理，并通过应用管理的 SQLite 历史库、任务状态与项目知识维持连续工作。无需外部数据库服务。
 
 本项目处于开发阶段，以当前实现和最新决定为准；不维护旧接口和历史会话格式的兼容或迁移。开发约定见 [AGENTS.md](AGENTS.md)。
 
@@ -72,9 +72,9 @@ genesis
 
 普通启动先进入本地首页。直接输入第一条任务开始新会话，空输入框按 ↑ 选择当前工作区最近的五段对话，或用 `/sessions` 浏览所有工作区的历史。打开后按原顺序显示最近三轮，`/history` 显示当前对话全文。仅浏览历史无需模型密钥，也不会创建空会话。
 
-默认工作区是 `~/GenesisAI/workspace`（Windows 为 `%USERPROFILE%\GenesisAI\workspace`），首次启动自动创建，不随应用安装目录或启动位置变化。交互式和 `--prompt` 模式都可直接使用默认值；使用 `--workspace "E:\my-project"` 指定其他任务目录，不存在时自动创建。提交任务时，所选模型会收到本次请求的会话上下文和相关工具结果，首次明确要求开发时可初始化 `agent_docs/` 项目工作记忆；非交互模式使用 `--yes-agent-docs` 初始化或 `--no-agent-docs` 跳过。
+默认工作区是 `~/GenesisAI/workspace`（Windows 为 `%USERPROFILE%\GenesisAI\workspace`），首次启动自动创建，不随应用安装目录或启动位置变化。交互式和 `--prompt` 模式都可直接使用默认值；使用 `--workspace "E:\my-project"` 指定其他任务目录，不存在时自动创建。提交任务时，所选模型会收到本次请求的会话上下文和相关工具结果，任务记录和工程索引由应用维护，不向用户项目创建管理目录。
 
-选择结果会作为可信运行时状态直接提供给 Agent。输入目录和输出目录都不得越过当前任务工作区；普通相对输出写入该工作区根目录。默认工作区同时是应用历史的统一存放地：所有项目的会话、完整输入输出日志、Trace、命令日志、来源缓存及备份均写入 `~/GenesisAI/workspace/.genesis/`。会话保存原工作目录，使用 `/status` 查看任务与历史路径。指定其他工作区不会改变历史存储位置。
+选择结果会作为可信运行时状态直接提供给 Agent。输入目录和输出目录都不得越过当前任务工作区；普通相对输出写入该工作区根目录。所有项目的历史和附件统一保存于 `~/.genesisai/`（可用 `GENESISAI_HOME` 覆盖）。会话事件与执行状态写入 `state/genesis.sqlite3`，图片写入 `assets/images/`，项目扩展配置位于 `projects/<project_id>/`。会话保存原工作目录，使用 `/status` 查看任务与历史路径。指定其他工作区不会改变历史存储位置。
 
 `--session` 只从统一历史目录读取当前格式的会话，不转换历史格式。清理已有用户数据前必须确认范围。模型终端配置保存于 `~/.genesisai/config.json`（可通过 `--config-dir` 指定）。
 
@@ -90,7 +90,7 @@ genesis
 
 ## 连续会话
 
-完整输入输出日志统一写入 `~/GenesisAI/workspace/.genesis/logs/<session_id>.jsonl`，可用 `/logs` 查看路径。记录完整模型请求与响应、工具参数与结果、确认、重试及错误；认证信息脱敏。不再生成重复的截断摘要 `.log`。详见 [日志与可用性检查](docs/日志与可用性检查.md)。
+完整输入输出日志统一写入 `~/.genesisai/logs/<session_id>.jsonl`，可用 `/logs` 查看路径。记录完整模型请求与响应、工具参数与结果、确认、重试及错误；认证信息脱敏。不再生成重复的截断摘要 `.log`。详见 [日志与可用性检查](docs/日志与可用性检查.md)。
 
 `/new` 回到当前工作区首页，`/workspace 路径` 切换工作区；在首页发送任务才建立新会话。进入某个会话后，普通输入均追加到该会话。上一轮用户问题、回答、已读取来源和已加载 Skills 会保留。长会话会压缩早期内容，但保留最近一轮、目标、来源、变更和待办。重启后用 `--session SESSION_ID` 恢复，自动使用会话原工作目录；如同时提供 `--workspace`，必须与原目录一致。原目录已不存在时报告错误，不自动重新创建。
 
@@ -105,7 +105,7 @@ genesis
 | `/pet` | 唤出跟随当前会话的 Windows 桌宠，任务运行中也可使用 |
 | `/skills list\|search\|show\|load\|unload`                | 管理按需 Skill                           |
 | `/logs`                                               | 查看当前会话完整 JSONL 日志路径          |
-| `/project`、`/project init`                         | 查看或初始化 `agent_docs` 项目工作记忆 |
+| `/project`、`/project rebuild`                         | 查看项目任务与知识，重建工程索引 |
 | `/permissions`、`/approve`、`/reject` | 查看或处理权限                           |
 | `/budget`、`/trace`、`/compact`                   | 查看预算、脱敏执行链和压缩上下文         |
 | `/diff` | 查看本次文件变更记录 |
@@ -115,22 +115,28 @@ genesis
 
 交互终端支持输入 `/` 实时选择命令、Tab 补全、Enter 发送、Alt+Enter 换行。`/help` 打开命令选择器，`/sessions` 选择历史会话，操作确认使用方向键和回车。
 
+## 记忆库与上下文
+
+默认上下文窗口统一为 **400K tokens**；预留输出和安全余量后，默认输入预算为 394880。近期历史目标预算单独设为 32000，较早原文通过 `memory_search` / `memory_read` 按需查阅，图片按引用重新加载。视频未接入。
+
+`/memory` 支持 list、search、read、write、delete、export、rebuild、diagnostic、backup。知识修正使用版本号，删除先预览并显式确认。`/budget` 显示窗口、输入用量与图片预算。详见[记忆系统与扩展接口](docs/记忆系统架构.md)。
+
 ## 架构约束
 
 - 模型客户端只由一个 `Runner` 驱动，不创建子 Agent。
 - 模型请求携带所有已启用且满足平台和依赖条件的工具定义；Skills 按需加载。
 - Prompt、Tool 和 Skill 使用严格 YAML 必要字段，均无版本字段。
-- Session、Run、Trace、日志与备份统一保存在默认工作区的 `.genesis/`；项目 Skill 和 Workflow 仍从任务工作区的 `.genesis/` 读取。
-- `agent_docs/` 保存项目策划、实施计划、进度、决策、已验证命令、验收与交接；代码、配置、测试和 Git 始终优先。
+- 历史、任务、索引、附件、日志与备份由应用维护；项目 MCP、Skill、Workflow 位于应用目录的 `projects/<project_id>/`。
+- 项目知识携带来源、状态与版本；源码变化使依赖结论失效，原始历史仍可按引用查阅。用户项目只读取可选的 `AGENTS.md`。
 - Git V1 只读；Shell 直接执行参数数组，不经过命令解释器。
 
 ## Python 小项目开发循环
 
-代码任务按“策划 → 计划 → 执行 → 验收 → 修正”循环运行。Python 项目会识别 `pyproject.toml`、源码布局、项目虚拟环境和测试框架；`run_commands` 可自动选择 pytest、unittest，或在没有测试时执行语法编译检查。文件发生修改后，即使随后读取 Git diff，Runner 仍保留待验证状态并在交付前运行测试。只有最近一次代码修改之后的真实验证通过，`agent_docs` 任务才能标记为 `verified`。
+代码任务按“策划 → 计划 → 执行 → 验收 → 修正”循环运行。Python 项目会识别 `pyproject.toml`、源码布局、项目虚拟环境和测试框架；`run_commands` 可自动选择 pytest、unittest，或在没有测试时执行语法编译检查。文件发生修改后，即使随后读取 Git diff，Runner 仍保留待验证状态并在交付前运行测试。只有最近一次代码修改之后的真实验证通过，应用任务记录才能标记为 `verified`。
 
 从零创建 `.py`、`.java`、`.html` 等源码文件以及开发任务短回复延续的补全方案已纳入主线。
 
-`agent_docs/` 默认适合纳入 Git，目录只保存人类可审查的项目状态；会话、模型中间状态、完整命令日志与备份保存在默认工作区的 `.genesis/`，不进入项目文档。
+项目知识可通过 `/memory export 新文件.md` 导出供人工审阅。应用不会把内部状态写入用户仓库。
 
 ## 文件能力
 

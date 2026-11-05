@@ -9,7 +9,7 @@ from uuid import uuid4
 from genesisai.app.cli import load_environment
 from genesisai.core.media.images import prepare_path
 from genesisai.core.prompt.context_budgeter import ContextBudgeter
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.model.config import build_model
 from genesisai.model.settings import load_settings
@@ -34,8 +34,8 @@ def main():
     root = project / 'temp' / ('live-image-' + uuid4().hex)
     workspace = root / 'workspace'
     workspace.mkdir(parents=True)
-    store = Store(root / 'state', workspace=workspace)
-    store.data.update(grants=[str(workspace), str(image)], output=str(workspace))
+    store = Session(root / 'state', workspace=workspace)
+    store.record.apply(grants=[str(workspace), str(image)], output=str(workspace))
     access = Access([workspace, image], workspace, store.root, workspace_root=workspace)
     runtime = ToolRuntime(store, access, providers=[])
     runtime.supports_images = True
@@ -51,13 +51,13 @@ def main():
         first = model.chat(messages, tools=[], **options)
         report['answers']['direct_image'] = first.content
         report['checks']['direct_image'] = bool(first.content) and first.finish_reason == 'stop'
-        store.data['messages'] = [asdict(messages[0]), {'role': 'assistant', 'content': first.content}]
-        store.save()
-        restored = Store(store.root, store.id)
+        store.record.messages = [asdict(messages[0]), {'role': 'assistant', 'content': first.content}]
+        store.commit()
+        restored = Session(store.root, store.id)
         restored_runtime = ToolRuntime(restored, access, providers=[])
         restored_runtime.images.config = runtime.images.config
         model.image_resolver = restored_runtime.images.data_url
-        history = ContextBudgeter._messages(restored.data['messages']) + [Message('user', '继续看同一张图片：角色有哪些不同姿势或朝向？简短回答。')]
+        history = ContextBudgeter._messages(restored.record.messages) + [Message('user', '继续看同一张图片：角色有哪些不同姿势或朝向？简短回答。')]
         second = list(model.stream_chat(history, tools=[], **options))[-1]
         report['answers']['restored_followup'] = second.content
         report['checks']['restored_followup'] = bool(second.content) and second.finish_reason == 'stop'
@@ -73,7 +73,7 @@ def main():
         report['checks']['tool_image'] = bool(third.content) and third.finish_reason == 'stop'
         report['checks']['original_unchanged'] = original == hashlib.sha256(image.read_bytes()).hexdigest()
         report['checks']['no_inline_media_in_log'] = 'base64,' not in runtime.logger.journal.path.read_text(encoding='utf8')
-        report['checks']['no_inline_media_in_session'] = 'base64,' not in store.path.read_text(encoding='utf8')
+        report['checks']['no_inline_media_in_session'] = 'base64,' not in json.dumps(store.snapshot())
         report['normalized_image'] = part
         print(json.dumps(report, ensure_ascii=False, indent=2))
     finally:

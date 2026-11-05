@@ -1,0 +1,6 @@
+title: Fixture Report
+paragraphs: [Introduction, Replace this paragraph]
+sheets:
+  Data:
+    - [Name, Value]
+    - [Sample, 2]

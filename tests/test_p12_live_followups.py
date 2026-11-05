@@ -35,8 +35,8 @@ def test_provider_reason_is_safe_and_repeated_candidates_are_explicit(runtime_en
     assert second['data']['diagnostics']['repeated_candidates'] is True
     assert second['data']['fallback_errors'][0]['reason'] == 'missing_credentials'
     assert '没有新增候选' in second['data']['guidance']
-    assert 'DO_NOT_LOG_SECRET' not in json.dumps(store.data)
-    assert store.data['run_runtime']['phase'] == 'explore'  # existing candidates may still be useful
+    assert 'DO_NOT_LOG_SECRET' not in json.dumps(store.snapshot())
+    assert store.record.run_runtime['phase'] == 'explore'  # existing candidates may still be useful
 
 
 def test_unknown_provider_reason_cannot_leak_exception_text(runtime_env):
@@ -99,7 +99,7 @@ def test_all_provider_failures_are_persisted_and_traced_without_secrets(runtime_
         Provider('two', 'provider_invalid_response', 'parse_error', False),
     ]
     result = runtime.execute(call('fetch_web_content', {'query': 'fixture'}, 'all_failed'))
-    diagnostics = store.data['run_runtime']['search_diagnostics']
+    diagnostics = store.record.run_runtime['search_diagnostics']
     trace = (store.root / 'traces' / f'{store.id}.jsonl').read_text(encoding='utf-8')
     assert result['error']['code'] == 'search_unavailable'
     assert diagnostics['all_providers_failed'] is True
@@ -108,7 +108,7 @@ def test_all_provider_failures_are_persisted_and_traced_without_secrets(runtime_
         {'provider': 'two', 'code': 'provider_invalid_response', 'retryable': False, 'reason': 'parse_error'},
     ]
     assert 'provider_errors' in trace
-    assert 'DO_NOT_STORE_SECRET' not in json.dumps(store.data) + trace
+    assert 'DO_NOT_STORE_SECRET' not in json.dumps(store.snapshot()) + trace
 
 
 def test_failed_url_cannot_bypass_two_attempt_limit_with_new_call_ids(runtime_env):
@@ -126,11 +126,8 @@ def test_failed_url_cannot_bypass_two_attempt_limit_with_new_call_ids(runtime_en
     assert first['error']['code'] == second['error']['code'] == 'fetch_failed'
     assert third['error']['code'] == 'retry_exhausted'
     assert runtime.network.calls == 2
-    assert store.data['run_runtime']['failed_resources']['https://example.com/unavailable'] == {
-        'code': 'fetch_failed', 'retryable': True, 'attempts': 2,
-        'reason': 'http_status', 'http_status': 503,
-    }
-    assert store.data['run_runtime']['candidates']['https://example.com/unavailable']['status'] == 'failed'
+    assert store.record.run_runtime['failed_resources']['https://example.com/unavailable'] == {'code': 'fetch_failed', 'retryable': True, 'attempts': 2, 'reason': 'http_status', 'http_status': 503}
+    assert store.record.run_runtime['candidates']['https://example.com/unavailable']['status'] == 'failed'
 
 
 def test_failed_candidate_does_not_block_registered_alternative(runtime_env):
@@ -145,7 +142,7 @@ def test_failed_candidate_does_not_block_registered_alternative(runtime_env):
     assert not runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, 'bad'))['ok']
     result = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/price'}, 'good'))
     assert result['ok'] and result['source_refs']
-    assert store.data['run_runtime']['stop_reason'] is None
+    assert store.record.run_runtime['stop_reason'] is None
 
 
 def test_repeated_search_after_exhausted_candidates_forces_external_failure(runtime_env):
@@ -163,7 +160,7 @@ def test_repeated_search_after_exhausted_candidates_forces_external_failure(runt
         assert not runtime.execute(call('fetch_web_content', {'url': 'https://example.com/unavailable'}, f'fetch_{number}'))['ok']
     repeated = runtime.execute(call('fetch_web_content', {'query': 'fixture official price'}, 'query_2'))
     assert repeated['data']['diagnostics']['repeated_candidates'] is True
-    assert store.data['run_runtime']['stop_reason'] == 'external_source_unavailable'
+    assert store.record.run_runtime['stop_reason'] == 'external_source_unavailable'
 
 
 def test_all_search_providers_failing_has_distinct_stop_reason(runtime_env):
@@ -175,7 +172,7 @@ def test_all_search_providers_failing_has_distinct_stop_reason(runtime_env):
     runtime.providers = [Provider()]
     result = runtime.execute(call('fetch_web_content', {'query': 'fixture'}, 'query'))
     assert result['error']['code'] == 'search_unavailable'
-    assert store.data['run_runtime']['stop_reason'] == 'search_service_unavailable'
+    assert store.record.run_runtime['stop_reason'] == 'search_service_unavailable'
 
 
 def test_previous_run_activity_does_not_include_older_failures(runtime_env):
@@ -186,16 +183,17 @@ def test_previous_run_activity_does_not_include_older_failures(runtime_env):
         Response(content='[[PARTIAL]] 尚未取得正文'),
     ), runtime)
     runner.start('查询资料')
-    older_id = store.data['run_id']
+    older_id = store.record.run_id
     runner.model = FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'query': 'price'}, 'new_search')]),
         Response(content='[[PARTIAL]] 尚未取得价格正文'),
     )
     runner.start('价格多少')
-    last_id = store.data['run_id']
+    last_id = store.record.run_id
     runner.model = FakeModel(Response(content='上一轮进行了搜索，未取得价格正文。'))
     runner.start('上一轮做了什么')
-    outcome = json.loads(runner.model.contexts[0][0].content.split('对用户用自然语言概括，不复制状态字段：\n', 1)[1].split('\n\n', 1)[0])
+    block = next(m.content for m in runner.model.contexts[0] if str(m.content).startswith('## 当前工作区与运行状态'))
+    outcome = json.loads(block.splitlines()[-1])['previous_outcome']
     assert outcome['run_id'] == last_id != older_id
     assert [item['call_id'] for item in outcome['tool_activity']] == ['new_search']
     assert outcome['tool_activity'][0]['executed'] is True
@@ -209,8 +207,8 @@ def test_serialized_tool_markup_is_never_executed_or_displayed(runtime_env, repe
     result = runner.start('价格多少')
     assert result['status'] == ('failed' if repeated else 'partial')
     assert 'DSML' not in result['answer']
-    assert store.data['tool_count'] == 0
-    assert not any('DSML' in str(item.get('content')) for item in store.data['messages'])
+    assert store.record.tool_count == 0
+    assert not any(('DSML' in str(item.get('content')) for item in store.record.messages))
     assert len(runner.model.contexts) == 2
     assert runner.model.tools[1] == []
 
@@ -239,10 +237,10 @@ def test_discovered_links_have_provenance_and_still_require_approval(runtime_env
     runtime.network.fetch = lambda url: dict(url=url, title='Fixture', text='Fixture ' + url, truncated=False,
                                            links=[{'url': 'https://example.com/buy', 'title': 'Buy'}, {'url': 'https://evil.example/', 'title': 'Bad'}])
     page = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/'}, 'home'))
-    candidate = store.data['run_runtime']['candidates']['https://example.com/buy']
+    candidate = store.record.run_runtime['candidates']['https://example.com/buy']
     assert candidate['source_type'] == 'page_link'
     assert candidate['parent_source_ref'] == page['source_refs'][0]
-    assert 'https://evil.example/' not in store.data['run_runtime']['candidates']
+    assert 'https://evil.example/' not in store.record.run_runtime['candidates']
     runtime.set_permission("user")
     purchase = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/buy'}, 'buy'))
     assert purchase['pending'] is True
@@ -256,7 +254,7 @@ def test_link_discovery_stops_after_two_hops(runtime_env):
                                            links=[{'url': 'https://example.com/' + str(int(url[-1]) + 1), 'title': 'Next'}])
     for i in range(3):
         assert runtime.execute(call('fetch_web_content', {'url': f'https://example.com/{i}'}, f'f{i}'))['ok']
-    assert 'https://example.com/3' not in store.data['run_runtime']['candidates']
+    assert 'https://example.com/3' not in store.record.run_runtime['candidates']
     cached = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/2'}, 'cached'))
     assert cached['data']['links'] == []
 
@@ -295,14 +293,14 @@ def test_unrelated_followup_resets_usage_without_old_evidence_forcing_answer(run
     runtime.research.register_user_urls('https://example.com/product')
     runtime.network.fetch = lambda url: {'url': url, 'title': 'Product', 'text': 'Product fixture facts', 'truncated': False}
     assert runtime.execute(call('fetch_web_content', {'url': 'https://example.com/product'}, 'product'))['ok']
-    previous_refs = list(store.data['run_runtime']['evidence_refs'])
-    store.data['run_runtime']['usage']['search_queries'] = 2
+    previous_refs = list(store.record.run_runtime['evidence_refs'])
+    store.record.run_runtime['usage']['search_queries'] = 2
     runner = Runner(FakeModel(Response(content='历史事件回答')), runtime)
     assert runner.start('某历史事件发生在什么时候')['status'] == 'completed'
-    assert store.data['run_runtime']['reuse_evidence'] is True
-    assert store.data['run_runtime']['evidence_refs'] == previous_refs
-    assert store.data['run_runtime']['usage']['search_queries'] == 0
-    assert store.data['run_runtime']['stop_reason'] == 'model_answer'
+    assert store.record.run_runtime['reuse_evidence'] is True
+    assert store.record.run_runtime['evidence_refs'] == previous_refs
+    assert store.record.run_runtime['usage']['search_queries'] == 0
+    assert store.record.run_runtime['stop_reason'] == 'model_answer'
 
 
 def test_search_service_failure_explanation_uses_latest_stop_reason(runtime_env):
@@ -317,10 +315,10 @@ def test_search_service_failure_explanation_uses_latest_stop_reason(runtime_env)
         Response(content='[[PARTIAL]] 搜索服务当前不可用，尚未取得资料。'),
     ), runtime)
     assert runner.start('查询当前事实')['status'] == 'partial'
-    failed_run = store.data['run_id']
+    failed_run = store.record.run_id
     runner.model = FakeModel(Response(content='上一轮搜索服务不可用。'))
     assert runner.start('怎么回事')['status'] == 'completed'
-    system = runner.model.contexts[0][0].content
+    system = '\n'.join(str(m.content) for m in runner.model.contexts[0])
     assert failed_run in system and 'search_service_unavailable' in system
     assert 'secret' not in system
 
@@ -341,9 +339,9 @@ def test_two_domains_without_target_field_remain_partial(runtime_env):
         Response(content='[[PARTIAL]] 两个正文均未列出价格。'),
     ), runtime)
     result = runner.start('这个项目的价格是多少')
-    assert result['status'] == 'partial', (result, store.data['run_runtime'])
-    assert len(store.data['run_runtime']['evidence_refs']) == 2
-    assert store.data['run_runtime']['stop_reason'] == 'evidence_gap'
+    assert result['status'] == 'partial', (result, store.record.run_runtime)
+    assert len(store.record.run_runtime['evidence_refs']) == 2
+    assert store.record.run_runtime['stop_reason'] == 'evidence_gap'
 
 
 def test_non_product_research_uses_the_same_evidence_path(runtime_env):
@@ -356,7 +354,7 @@ def test_non_product_research_uses_the_same_evidence_path(runtime_env):
     runtime.providers = [Provider()]
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Historical event', 'text': 'The fixture event occurred on 2001-02-03.', 'truncated': False}
     def final(_):
-        return Response(content='事件发生于 2001-02-03 [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
+        return Response(content='事件发生于 2001-02-03 [' + store.record.run_runtime['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'query': 'fixture historical event date'}, 'query')]),
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
@@ -364,7 +362,7 @@ def test_non_product_research_uses_the_same_evidence_path(runtime_env):
     ), runtime)
     result = runner.start('这个历史事件是哪天发生的')
     assert result['status'] == 'completed' and '2001-02-03' in result['answer']
-    assert store.data['run_runtime']['fetched_count'] == 1
+    assert store.record.run_runtime['fetched_count'] == 1
 
 
 def test_multi_region_price_evidence_is_available_without_cross_combining(runtime_env):
@@ -377,7 +375,7 @@ def test_multi_region_price_evidence_is_available_without_cross_combining(runtim
         'truncated': False,
     }
     def final(_):
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'中国大陆 128GB 起售价 CNY 4999；256GB 为 CNY 5999 [{ref}]')
     runner = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
@@ -397,7 +395,7 @@ def test_loaded_tools_persist_across_capability_followup(runtime_env):
     runner.start('刚才的网络工具还可用吗')
     offered = {item['function']['name'] for item in runner.model.tools[0]}
     assert {'fetch_web_content'} <= offered
-    assert store.data['run_runtime']['tool_activity'] == []
+    assert store.record.run_runtime['tool_activity'] == []
 
 
 def test_unsupported_price_is_discarded_before_recovery(runtime_env):
@@ -408,19 +406,13 @@ def test_unsupported_price_is_discarded_before_recovery(runtime_env):
         'url': value, 'title': 'Price', 'text': 'Mainland China price CNY 4999.', 'truncated': False,
     }
     def unsupported(_):
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'中国大陆起售价 CNY 9999 [{ref}]')
-    runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
-        unsupported,
-        lambda _: Response(
-            content='[[PARTIAL]] 正文仅列出另一个价格，所问价格尚未取得。 [' + store.data['run_runtime']['evidence_refs'][-1] + ']'
-        ),
-    ), runtime)
+    runner = Runner(FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), unsupported, lambda _: Response(content='[[PARTIAL]] 正文仅列出另一个价格，所问价格尚未取得。 [' + store.record.run_runtime['evidence_refs'][-1] + ']')), runtime)
     result = runner.start(url + ' 这个产品起售价是多少')
-    assert result['status'] == 'partial', (result, store.data['run_runtime'])
-    assert store.data['run_runtime']['stop_reason'] == 'unsupported_evidence_claim'
-    assert '9999' not in json.dumps(store.data['messages'], ensure_ascii=False)
+    assert result['status'] == 'partial', (result, store.record.run_runtime)
+    assert store.record.run_runtime['stop_reason'] == 'unsupported_evidence_claim'
+    assert '9999' not in json.dumps(store.record.messages, ensure_ascii=False)
     assert len(runner.model.contexts) == 3
 
 
@@ -432,12 +424,12 @@ def test_supported_price_claim_passes_body_validation(runtime_env):
         'url': value, 'title': 'Price', 'text': 'Mainland China price CNY 4,999.', 'truncated': False,
     }
     def final(_):
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'中国大陆起售价 4999 元 [{ref}]')
     result = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), final,
     ), runtime).start(url + ' 这个产品起售价是多少')
-    assert result['status'] == 'completed' and '4999' in result['answer'], (result, store.data['run_runtime'])
+    assert result['status'] == 'completed' and '4999' in result['answer'], (result, store.record.run_runtime)
 
 
 def test_price_claim_without_source_reference_is_rejected(runtime_env):
@@ -448,7 +440,7 @@ def test_price_claim_without_source_reference_is_rejected(runtime_env):
     ), runtime)
     result = runner.start('当前价格是多少')
     assert result['status'] == 'partial'
-    assert '9999' not in json.dumps(store.data['messages'], ensure_ascii=False)
+    assert '9999' not in json.dumps(store.record.messages, ensure_ascii=False)
 
 
 def test_explicit_web_intent_preloads_builtin_search_tools(runtime_env):
@@ -456,9 +448,9 @@ def test_explicit_web_intent_preloads_builtin_search_tools(runtime_env):
     runner = Runner(FakeModel(Response(content='[[PARTIAL]] 尚未查询正文。')), runtime)
     runner.start('查询官网目前列出的产品')
     offered = {item['function']['name'] for item in runner.model.tools[0]}
-    assert store.data['run_runtime']['profile'] == 'web_quick'
+    assert store.record.run_runtime['profile'] == 'web_quick'
     assert {'fetch_web_content'} <= offered
-    assert store.data['run_runtime']['tool_activity'] == []
+    assert store.record.run_runtime['tool_activity'] == []
 
 
 def test_recall_reuses_validated_answer_without_model_or_tool_call(runtime_env):
@@ -466,7 +458,7 @@ def test_recall_reuses_validated_answer_without_model_or_tool_call(runtime_env):
     url = 'https://example.com/price'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Price', 'text': 'Price: EUR 29.3', 'truncated': False}
     def priced(_):
-        return Response(content='价格为 EUR 29.3 [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
+        return Response(content='价格为 EUR 29.3 [' + store.record.run_runtime['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), priced,
     ), runtime)
@@ -477,21 +469,29 @@ def test_recall_reuses_validated_answer_without_model_or_tool_call(runtime_env):
     assert 'EUR 29.3' in result['answer']
     assert len(runner.model.contexts) == 0
     assert runner.model.tools == []
-    assert store.data['run_runtime']['tool_activity'] == []
+    assert store.record.run_runtime['tool_activity'] == []
 
 
-def test_recall_of_older_named_field_uses_one_tool_free_model_call(runtime_env):
+def test_recall_of_older_named_field_can_read_original_event(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='标题是 HTTP Semantics。')), runtime)
     runner.start('标准标题是什么')
     runner.model = FakeModel(Response(content='它取代了若干早期 RFC。'))
     runner.start('它取代了什么')
-    runner.model = FakeModel(Response(content='标题是 HTTP Semantics。'))
+    original = runtime.memory.search("HTTP Semantics", corpus="history")[0]["ref"]
+    def answer(messages):
+        result = json.loads(messages[-1].content)
+        assert "HTTP Semantics" in result["data"]["text"]
+        return Response(content='标题是 HTTP Semantics。')
+    runner.model = FakeModel(
+        Response(tool_calls=[tool_call("memory_read", {"ref": original}, "recall_title")]),
+        answer,
+    )
     result = runner.start('再说一下刚才查到的标准标题')
     assert result['status'] == 'completed' and 'HTTP Semantics' in result['answer']
-    assert len(runner.model.contexts) == 1
-    assert runner.model.tools == [[]]
-    assert store.data['run_runtime']['tool_activity'] == []
+    assert len(runner.model.contexts) == 2
+    assert {tool["function"]["name"] for tool in runner.model.tools[0]} == {"memory_search", "memory_read", "read_image"}
+    assert [item["tool"] for item in store.record.run_runtime["tool_activity"]] == ["memory_read"]
 
 
 def test_invalid_source_answer_is_not_saved_and_recovery_gets_allowed_refs(runtime_env):
@@ -499,7 +499,7 @@ def test_invalid_source_answer_is_not_saved_and_recovery_gets_allowed_refs(runti
     url = 'https://example.com/facts'
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Facts', 'text': 'Verified fixture fact.', 'truncated': False}
     def recovered(_):
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'已核实事实 [{ref}]')
     runner = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
@@ -508,8 +508,8 @@ def test_invalid_source_answer_is_not_saved_and_recovery_gets_allowed_refs(runti
     ), runtime)
     result = runner.start(url + ' 查询事实')
     assert result['status'] == 'completed'
-    assert 'src_0000000000000000' not in json.dumps(store.data['messages'])
-    assert store.data['run_runtime']['evidence_refs'][0] in runner.model.contexts[-1][0].content
+    assert 'src_0000000000000000' not in json.dumps(store.record.messages)
+    assert store.record.run_runtime['evidence_refs'][0] in '\n'.join(str(m.content) for m in runner.model.contexts[-1])
 
 
 def test_repeated_invalid_sources_end_with_readable_evidence_fallback(runtime_env):
@@ -524,7 +524,7 @@ def test_repeated_invalid_sources_end_with_readable_evidence_fallback(runtime_en
     result = runner.start(url + ' 查询事实')
     assert result['status'] == 'partial'
     assert '无法验证的来源引用' in result['answer']
-    assert store.data['run_runtime']['evidence_refs'][0] in result['answer']
+    assert store.record.run_runtime['evidence_refs'][0] in result['answer']
 
 
 def test_structured_product_price_is_preserved_as_bounded_source_text():
@@ -555,13 +555,13 @@ def test_verified_price_can_complete_after_exploration_reserve(runtime_env):
     runtime.network.fetch = lambda value: {'url': value, 'title': 'Price', 'text': 'Price: EUR 29.3', 'truncated': False}
     def final(_):
         runtime.research.force_answer('exploration_token_reserve')
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'官方价格为 EUR 29.3 [{ref}]')
     result = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), final,
     ), runtime).start(url + ' 的价格是多少')
     assert result['status'] == 'completed'
-    assert store.data['run_runtime']['stop_reason'] == 'model_answer'
+    assert store.record.run_runtime['stop_reason'] == 'model_answer'
 
 
 def test_same_number_in_wrong_currency_fails_price_validation(runtime_env):
@@ -572,15 +572,11 @@ def test_same_number_in_wrong_currency_fails_price_validation(runtime_env):
         'text': 'United States: USD 799. Mainland China: CNY 5999.', 'truncated': False,
     }
     def wrong_currency(_):
-        ref = store.data['run_runtime']['evidence_refs'][-1]
+        ref = store.record.run_runtime['evidence_refs'][-1]
         return Response(content=f'中国大陆价格为 CNY 799 [{ref}]')
-    runner = Runner(FakeModel(
-        Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]),
-        wrong_currency,
-        lambda _: Response(content='[[PARTIAL]] 无法从正文确认所问币种的金额。 [' + store.data['run_runtime']['evidence_refs'][-1] + ']'),
-    ), runtime)
+    runner = Runner(FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'fetch')]), wrong_currency, lambda _: Response(content='[[PARTIAL]] 无法从正文确认所问币种的金额。 [' + store.record.run_runtime['evidence_refs'][-1] + ']')), runtime)
     result = runner.start(url + ' 中国大陆价格是多少')
     assert result['status'] == 'partial'
-    assert 'CNY 799' not in json.dumps(store.data['messages'], ensure_ascii=False)
-    assert store.data['run_runtime']['stop_reason'] == 'unsupported_evidence_claim'
+    assert 'CNY 799' not in json.dumps(store.record.messages, ensure_ascii=False)
+    assert store.record.run_runtime['stop_reason'] == 'unsupported_evidence_claim'
 

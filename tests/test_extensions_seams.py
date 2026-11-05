@@ -5,7 +5,7 @@ import json
 import pytest
 
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.core.extensions.rules import RulesLoader
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
@@ -20,10 +20,10 @@ def build_runtime(workspace):
     inputs = workspace / "input"
     inputs.mkdir(parents=True, exist_ok=True)
     (inputs / "note.md").write_text("hello", encoding="utf-8")
-    store = Store(workspace / "state", workspace=workspace)
+    store = Session(workspace / "state", workspace=workspace)
     output = workspace / "output"
-    store.data.update(grants=[str(inputs)], output=str(output))
-    store.save()
+    store.record.apply(grants=[str(inputs)], output=str(output))
+    store.commit()
     return ToolRuntime(
         store,
         Access([inputs], output, store.root, workspace_root=workspace),
@@ -84,7 +84,7 @@ def test_rules_injected_into_system_prompt(tmp_path):
 
     context = runtime.context_budgeter.build("local_files")
 
-    assert "只读规则：禁止改写密钥" in context[0].content
+    assert any(m.role=="user" and "只读规则：禁止改写密钥" in str(m.content) for m in context)
 
 
 def test_rules_absent_is_noop(tmp_path):
@@ -98,7 +98,7 @@ def test_rules_absent_is_noop(tmp_path):
 
 def test_workflows_scan_and_expand(tmp_path):
     workspace = tmp_path / "ws"
-    root = workspace / ".genesis" / "workflows"
+    root = workspace / "workflows"
     root.mkdir(parents=True)
     (root / "release.md").write_text("发布检查清单", encoding="utf-8")
     (root / "Bad Name.md").write_text("x", encoding="utf-8")
@@ -162,7 +162,7 @@ class FakeTransport:
 
 def write_mcp_config(workspace, *, read_only=True):
     (workspace / ".genesis").mkdir(exist_ok=True)
-    (workspace / ".genesis" / "mcp.json").write_text(
+    (workspace / "mcp.json").write_text(
         json.dumps({"servers": {"fixture": {"command": "noop", "read_only": read_only}}}),
         encoding="utf-8",
     )
@@ -183,7 +183,7 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
     runtime.set_permission("user")
     connect = tool_call("connect_mcp", {"server": "fixture"}, "connect")
     assert runtime.execute(connect)["pending"] and not transports
-    assert runtime.execute(connect, approved=runtime.store.data["calls"]["connect"]["digest"])["ok"]
+    assert runtime.execute(connect, approved=runtime.store.record.calls['connect']['digest'])['ok']
     assert len(transports) == 1
 
     names = {item["function"]["name"] for item in runtime.definitions()}
@@ -194,7 +194,7 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
 
     call = tool_call("mcp_fixture_echo", {"text": "hi"}, "mcp")
     assert runtime.execute(call)["pending"]
-    result = runtime.execute(call, approved=runtime.store.data["calls"]["mcp"]["digest"])
+    result = runtime.execute(call, approved=runtime.store.record.calls['mcp']['digest'])
     assert result["ok"]
     assert result["data"]["text"] == "echo:hi"
 
@@ -202,7 +202,7 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
     assert runtime.execute(pending)["pending"]
     bridge.close()
     assert len(transports) == 1
-    assert runtime.execute(pending, approved=runtime.store.data["calls"]["mcp2"]["digest"])["ok"]
+    assert runtime.execute(pending, approved=runtime.store.record.calls['mcp2']['digest'])['ok']
     assert len(transports) == 2
 
     # refresh（每次下发都会触发）必须保留动态注册。
@@ -228,7 +228,7 @@ def test_mcp_write_server_maps_permission(tmp_path):
 def test_mcp_invalid_config_is_reported(tmp_path):
     runtime = build_runtime(tmp_path)
     (tmp_path / ".genesis").mkdir(exist_ok=True)
-    (tmp_path / ".genesis" / "mcp.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "mcp.json").write_text("{}", encoding="utf-8")
 
     with pytest.raises(McpError):
         load_servers(tmp_path)

@@ -4,11 +4,17 @@
 """
 
 from genesisai.shared.security import ToolError
-from genesisai.core.state.store import sha
+from genesisai.shared.ids import sha
+
 from genesisai.core.extensions.tools.filesystem.shared import extract, read_text_document
 
 
 class Implementation:
+    @staticmethod
+    def observe(args, payload):
+        from genesisai.core.tools.observations import Observation
+        return [Observation('resource_read', path=f['path'], sha256=f['sha256']) for f in payload.get('files', [])]
+
     def prepare(self, context, args):
         return None
 

@@ -40,8 +40,8 @@ def test_cached_success_never_crashes_or_requests_approval(runtime_env):
     result = runtime.execute(call("fetch_web_content", {"url": url}, "cached"))
     assert result["ok"] and result["data"]["cached"]
     assert runtime.network.calls == 1
-    assert store.data["run_runtime"]["usage"]["search_fetches"] == 1
-    assert len(store.data["run_runtime"]["evidence_refs"]) == 1
+    assert store.record.run_runtime['usage']['search_fetches'] == 1
+    assert len(store.record.run_runtime['evidence_refs']) == 1
 
 
 def test_invalid_url_is_rejected_before_approval(runtime_env):
@@ -69,9 +69,9 @@ def test_price_followup_can_search_without_magic_words(runtime_env, prompt):
     runtime.providers = [Provider()]
     runner.model = FakeModel(Response(tool_calls=[tool_call("fetch_web_content", {"query": "Product A price"}, "price")]), Response(content="价格尚未核实"))
     runner.start(prompt)
-    results = [json.loads(m["content"]) for m in store.data["messages"] if m["role"] == "tool" and m["tool_call_id"] == "price"]
+    results = [json.loads(m['content']) for m in store.record.messages if m['role'] == 'tool' and m['tool_call_id'] == 'price']
     assert results[0]["ok"]
-    assert store.data["run_runtime"]["usage"]["search_queries"] == 1
+    assert store.record.run_runtime['usage']['search_queries'] == 1
 
 
 @pytest.mark.parametrize('payload', [None, [], 'oops', {'ok': True, 'error': []}, {'ok': False, 'error': None}, {'ok': False, 'error': 'oops'}])
@@ -137,10 +137,10 @@ def test_wait_does_not_consume_execution_time(runtime_env, monkeypatch):
     monkeypatch.setattr(runner_module.time, 'time', lambda: now)
     store, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
-    deadline = store.data['deadline']
+    deadline = store.record.deadline
     now += 200
     assert runner.confirm(True)['status'] == 'awaiting_confirmation'
-    assert store.data['deadline'] == pytest.approx(deadline + 200)
+    assert store.record.deadline == pytest.approx(deadline + 200)
     assert provider.calls == 1
 
 
@@ -173,22 +173,22 @@ def test_exception_has_safe_diagnostic_and_next_run_recovers(runtime_env, monkey
     else:
         result = runner.confirm(True)
     assert result['status'] == 'failed'
-    assert store.data['run_runtime']['stop_reason'] == 'runtime_error'
-    diagnostic = store.data['run_runtime']['last_failure']
+    assert store.record.run_runtime['stop_reason'] == 'runtime_error'
+    diagnostic = store.record.run_runtime['last_failure']
     assert diagnostic['type'] == 'AttributeError' and diagnostic['frames']
     trace = (store.root / 'traces' / f'{store.id}.jsonl').read_text(encoding='utf-8')
     assert 'SECRET_CANARY' not in trace
-    assert len([m for m in store.data['messages'] if m.get('tool_call_id') == 'q1']) == 1
+    assert len([m for m in store.record.messages if m.get('tool_call_id') == 'q1']) == 1
     monkeypatch.setattr(runtime, 'execute', original)
     runner.model = FakeModel(Response(content='发生内部异常'))
     assert runner.start('怎么回事')['status'] == 'completed'
-    assert 'runtime_error' in runner.model.contexts[0][0].content
-    assert store.data['run_runtime']['stop_reason'] == 'model_answer'
+    assert 'runtime_error' in '\n'.join(str(m.content) for m in runner.model.contexts[0])
+    assert store.record.run_runtime['stop_reason'] == 'model_answer'
 
 
 def test_official_domains_never_force_completion(runtime_env):
     store, runtime = runtime_env
-    store.data['run_runtime']['evidence'] = {'x': {'domain': 'apple.com'}, 'y': {'domain': 'example.com'}}
+    store.record.run_runtime['evidence'] = {'x': {'domain': 'apple.com'}, 'y': {'domain': 'example.com'}}
     assert not runtime.research.should_force_answer()
 
 
@@ -201,7 +201,7 @@ def test_third_same_domain_page_and_cached_offset(runtime_env):
         other = f'https://example.com/page{index}'
         runtime.research.register_user_urls(other)
         assert runtime.execute(call('fetch_web_content', {'url': other}, f'page{index}'))['ok']
-    assert len(store.data['run_runtime']['evidence_refs']) == 3
+    assert len(store.record.run_runtime['evidence_refs']) == 3
     result = runtime.execute(call('fetch_web_content', {'url': url, 'offset': 10, 'limit': 20}, 'offset'))
     assert result['data']['text'] == ('Product A specifications without price. ' * 30)[10:30]
 
@@ -217,10 +217,10 @@ def test_forced_answer_and_explicit_gap_are_partial(runtime_env):
 def test_readable_sources_and_price_table(runtime_env, width):
     store, runtime = runtime_env
     seed_page(runtime)
-    ref = store.data['run_runtime']['evidence_refs'][0]
+    ref = store.record.run_runtime['evidence_refs'][0]
     stream = StringIO()
     view = CliView(Console(file=stream, width=width, force_terminal=False))
-    view.render_result({'status': 'partial', 'answer': f'| 容量 | 售价 |\n| --- | --- |\n| 256GB | CNY 4999 |\n\n[{ref}]'}, store.data)
+    view.render_result({'status': 'partial', 'answer': f'| 容量 | 售价 |\n| --- | --- |\n| 256GB | CNY 4999 |\n\n[{ref}]'}, store.snapshot())
     output = stream.getvalue()
     assert '256GB' in output and '4999' in output and 'CNY' in output
     assert 'Fixture product A' in output and 'src_' not in output
@@ -248,7 +248,7 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     runtime.providers, runtime.network = [provider], network
     runtime.set_permission("user")
     def answer(text):
-        return lambda _: Response(content=text + ' [' + store.data['run_runtime']['evidence_refs'][-1] + ']')
+        return lambda _: Response(content=text + ' [' + store.record.run_runtime['evidence_refs'][-1] + ']')
     runner = Runner(FakeModel(
         Response(tool_calls=[tool_call('fetch_web_content', {'query': 'Product A specifications'}, 'r1q')]),
         Response(tool_calls=[tool_call('fetch_web_content', {'url': 'https://example.com/product'}, 'r1f')]),
@@ -265,15 +265,15 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     )
     result = runner.start('其售价多少')
     assert result['status'] == 'completed' and '4999' in result['answer']
-    assert store.data['calls']['r1bad']['result']['error']['code'] == 'candidate_not_registered'
-    assert not store.data['calls']['r1bad']['executed']
+    assert store.record.calls['r1bad']['result']['error']['code'] == 'candidate_not_registered'
+    assert not store.record.calls['r1bad']['executed']
     runner.model = FakeModel(answer('中国大陆 256GB 起售价 CNY 4999'))
     assert runner.start('再说一下起售价')['status'] == 'completed'
     assert provider.calls == 2
     assert network.urls == ['https://example.com/product', 'https://example.com/buy']
-    assert store.data['tool_count'] == 0
-    assert store.data['run_runtime']['usage']['search_fetches'] == 0
-    assert store.data['run_runtime']['fetched_count'] == 0
+    assert store.record.tool_count == 0
+    assert store.record.run_runtime['usage']['search_fetches'] == 0
+    assert store.record.run_runtime['fetched_count'] == 0
     assert runner.model.tools == []
 
 
@@ -299,7 +299,7 @@ def test_cli_network_approval_paths(tmp_path, monkeypatch, approve):
     commands = iter(['查产品价格', '确认，重新开始搜索', approve, '/exit'])
     monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: next(commands))
     assert cli.main(['--workspace', str(tmp_path / 'workspace')]) == 0
-    assert captured[0].store.data['calls']['q']['state'] == 'succeeded'
+    assert captured[0].store.record.calls['q']['state'] == 'succeeded'
     assert '其他语句不会自动批准' in stream.getvalue()
     assert captured[0].runtime.providers[0].calls == 1
 
@@ -309,9 +309,9 @@ def test_frozen_parameters_cannot_change_after_approval(runtime_env):
     runner, provider = waiting_runner(runtime)
     # The request remains frozen even after switching session permission to allow.
     runtime.set_permission("auto")
-    store.data['pending'][0]['arguments'] = json.dumps({'query': 'changed'})
+    store.record.pending[0]['arguments'] = json.dumps({'query': 'changed'})
     result = runner.confirm(True)
-    tool_results = [json.loads(m['content']) for m in store.data['messages'] if m.get('tool_call_id') == 'q1']
+    tool_results = [json.loads(m['content']) for m in store.record.messages if m.get('tool_call_id') == 'q1']
     assert tool_results[0]['error']['code'] in {'duplicate_call_id', 'confirmation_invalid'}
     assert provider.calls == 1  # only the later, independent q2
 
@@ -334,7 +334,7 @@ def test_forced_stop_reason_is_preserved(runtime_env, reason):
     runner.model = FakeModel(force)
     result = runner.start('查询资料')
     assert result['status'] == 'partial'
-    assert store.data['run_runtime']['stop_reason'] == reason
+    assert store.record.run_runtime['stop_reason'] == reason
 
 
 def test_success_result_optional_fields_are_normalized(runtime_env, monkeypatch):
@@ -349,7 +349,7 @@ def test_search_budget_does_not_cancel_fetch_after_second_query(runtime_env):
     query_provider(runtime)
     for i in range(2):
         assert runtime.execute(call('fetch_web_content', {'query': f'query {i}'}, f'query{i}'))['ok']
-    assert store.data['run_runtime']['phase'] == 'explore'
+    assert store.record.run_runtime['phase'] == 'explore'
     runtime.network.fetch = lambda url: dict(url=url, text='Fixture CNY 4999', title='Fixture', truncated=False)
     assert runtime.execute(call('fetch_web_content', {'url': 'https://example.com/buy'}, 'fetch'))['ok']
 
@@ -377,7 +377,7 @@ def test_actual_capabilities_are_in_model_context(runtime_env):
     _, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='能力取决于工具目录')), runtime)
     runner.start('你能做什么')
-    text = runner.model.contexts[0][0].content
+    text = '\n'.join(str(m.content) for m in runner.model.contexts[0])
     assert '工具能力状态' in text and 'available' in text and 'fetch_web_content' in text
 
 
@@ -396,8 +396,8 @@ def test_failed_public_page_is_bounded_and_partial(runtime_env):
     ), runtime)
     result = runner.start('产品 A 多少钱')
     assert result['status'] == 'partial'
-    assert store.data['calls']['f2']['result']['error']['code'] == 'retry_exhausted'
-    assert store.data['run_runtime']['usage']['search_fetches'] == 1
+    assert store.record.calls['f2']['result']['error']['code'] == 'retry_exhausted'
+    assert store.record.run_runtime['usage']['search_fetches'] == 1
 
 
 def test_rejection_has_distinct_stop_reason_and_never_executes(runtime_env):
@@ -406,25 +406,25 @@ def test_rejection_has_distinct_stop_reason_and_never_executes(runtime_env):
     runner.model = FakeModel(Response(content='已停止查询'))
     result = runner.confirm(False)
     assert result['status'] == 'partial'
-    assert store.data['run_runtime']['stop_reason'] == 'user_rejected'
+    assert store.record.run_runtime['stop_reason'] == 'user_rejected'
     assert provider.calls == 0
 
 
 def test_cached_new_spans_count_as_progress_but_duplicates_do_not(runtime_env):
     store, runtime = runtime_env
     url = seed_page(runtime)
-    before = store.data['run_runtime']['usage']['observations']
+    before = store.record.run_runtime['usage']['observations']
     for i in range(3):
         runtime.execute(call('fetch_web_content', {'url': url, 'offset': 10, 'limit': 20}, f'span{i}'))
-    assert store.data['run_runtime']['usage']['observations'] == before + 1
+    assert store.record.run_runtime['usage']['observations'] == before + 1
 
 
 def test_followup_keeps_full_previous_pages_when_under_capacity(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='之前的答案')), runtime)
     runner.start('产品规格')
-    store.data['messages'].insert(-1, {'role': 'assistant', 'content': None, 'tool_calls': [call('fetch_web_content', {'url': 'https://example.com/fixture'}, 'fixture')]})
-    store.data['messages'].insert(-1, {'role': 'tool', 'tool_call_id': 'fixture', 'content': json.dumps({'ok': True, 'data': {'text': 'Z' * 4000}})})
+    store.record.messages.append({'role': 'assistant', 'content': None, 'tool_calls': [call('fetch_web_content', {'url': 'https://example.com/fixture'}, 'fixture')]})
+    store.record.messages.append({'role': 'tool', 'tool_call_id': 'fixture', 'content': json.dumps({'ok': True, 'data': {'text': 'Z' * 4000}})})
     runner.model = FakeModel(Response(content='继续回答'))
     runner.start('它的价格呢')
     context = runner.model.contexts[0]

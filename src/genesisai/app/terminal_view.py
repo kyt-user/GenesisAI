@@ -36,7 +36,7 @@ class CliSnapshot:
     skill_name: str | None = None
     git_state: str | None = None
     context_percent: int | None = None
-    agent_docs_status: str | None = None
+    memory_status: str | None = None
     history_root: str | None = None
 
 
@@ -77,16 +77,6 @@ class CliView:
     @staticmethod
     def _value(value, pending="未启用") -> str:
         return str(value) if value not in {None, ""} else pending
-
-    def render_agent_docs_consent(self, path: str) -> None:
-        body = Text()
-        body.append("GenesisAI 将创建受管理的项目工作记忆：\n", style="white")
-        body.append(path, style="cyan")
-        body.append("\n\n内容包括项目概览、计划、进度、决策、已验证命令和验收记录。", style="dim")
-        body.append("\n不会写入密钥、完整源码或原始命令日志。", style="dim")
-        if not is_interactive(self.console):
-            body.append("\n\n输入 allow 初始化，回车跳过。之后可用 /project init。", style="yellow")
-        self.console.print(Panel(body, title="初始化 agent_docs", title_align="left", border_style="yellow"))
 
     def render_help(self) -> None:
         table = Table(box=box.SIMPLE, show_header=True)
@@ -258,6 +248,7 @@ class CliView:
             table.add_row(label, f"{used} / {budget.get(key, '—')}（余 {max(0, budget.get(key, 0) - used) if isinstance(budget.get(key), int) else '—'}）")
         table.add_row("累计 Token（用量）", str(usage.get('total_tokens', 0)))
         context = runtime.get('context_report') or {}
+        table.add_row('上下文窗口', str(context.get('context_window', 400000)))
         table.add_row("当前请求（估算 Token）", f"{context.get('tokens_after', '—')} / {context.get('input_limit', '—')}")
         table.add_row('图片（数量 / 估算 Token / 字节）', f"{context.get('image_count', 0)} / {context.get('image_tokens', 0)} / {context.get('image_bytes', 0)}")
         table.add_row("候选 / Evidence", f"{runtime.get('candidate_count', 0)} / {len(runtime.get('evidence_refs', []))}")
@@ -316,12 +307,12 @@ class CliView:
 
     def render_opened(self, store):
         self.console.print(Text(f'已打开历史会话 · {store.id} · {store.workspace}', style='bold'))
-        self.render_history(store.data, recent_turns=3)
+        self.render_history(store.snapshot(), recent_turns=3)
         self.console.print(Text('/auth 切换模型提供商 · /model 切换模型', style='cyan'))
-        if store.data['status'] == 'awaiting_confirmation' and store.data['pending']:
-            call = store.data['pending'][0]
-            self.render_confirmation(call['name'], store.data['calls'][call['id']].get('preview') or {})
-        elif store.data['status'] == 'interrupted':
+        if store.record.status == 'awaiting_confirmation' and store.record.pending:
+            call = store.record.pending[0]
+            self.render_confirmation(call['name'], store.record.calls[call['id']].get('preview') or {})
+        elif store.record.status == 'interrupted':
             self.console.print('上次运行已中断。输入 /resume 继续，或 /cancel 取消。')
 
     def render_data(self, title: str, value) -> None:

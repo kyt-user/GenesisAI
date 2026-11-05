@@ -7,15 +7,17 @@ import json
 import shutil
 import time
 from pathlib import Path
+from genesisai.shared.paths import application_home
 
 import yaml
 
 from genesisai.agent.loop import Runner
-from genesisai.core.project_docs import AgentDocsManager
+from genesisai.core.memory import TaskService
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store, atomic_json
+from genesisai.core.persistence.session import Session
+from genesisai.core.persistence.files import atomic_json
 
 
 CASE_FIELDS = frozenset({"id", "name", "expectations"})
@@ -61,7 +63,7 @@ def load_dataset(path: Path) -> dict:
     return data
 
 
-def case_environment(output: Path, identifier: str) -> tuple[Path, Store, ToolRuntime]:
+def case_environment(output: Path, identifier: str) -> tuple[Path, Session, ToolRuntime]:
     root = (output / identifier).resolve()
     if root.exists():
         if not root.is_relative_to(output.resolve()):
@@ -69,12 +71,12 @@ def case_environment(output: Path, identifier: str) -> tuple[Path, Store, ToolRu
         shutil.rmtree(root)
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
-    manager = AgentDocsManager(workspace, create=True)
+    store = Session(root / "state", workspace=workspace)
+    manager = TaskService(store)
     manager.begin_task(f"源码开发仿真：{identifier}")
     manager.set_plan(steps=["创建项目文件", "执行验证"], acceptance=["产物存在且验证状态真实"])
-    store = Store(workspace / ".genesis", workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
-    store.save()
+    store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
@@ -95,13 +97,8 @@ def html_case(output: Path) -> dict:
         tool("html_create", "editor", {"operation": "create", "path": "index.html", "content": html, "source_refs": []}),
         Response(content="页面已写入并通过静态验收。"),
     ), runtime).start("按你的默认来")
-    task = AgentDocsManager(workspace).active_task()
-    checks = {
-        "runner_completed": result["status"] == "completed",
-        "profile_inherited": store.data["run_runtime"]["profile"] == "local_files",
-        "html_written": (workspace / "index.html").read_text(encoding="utf-8") == html,
-        "verified": bool(task and task["status"] == "verified"),
-    }
+    task = TaskService(store).active_task()
+    checks = {'runner_completed': result['status'] == 'completed', 'profile_inherited': store.record.run_runtime['profile'] == 'local_files', 'html_written': (workspace / 'index.html').read_text(encoding='utf-8') == html, 'verified': bool(task and task['status'] == 'verified')}
     return {"id": "html_continuation", "status": "passed" if all(checks.values()) else "failed", "checks": checks}
 
 
@@ -113,12 +110,7 @@ def python_case(output: Path) -> dict:
         Response(content="源码和测试已写入。"),
         Response(content="Python 测试通过。"),
     ), runtime).start("开始")
-    checks = {
-        "runner_completed": result["status"] == "completed",
-        "source_written": (workspace / "calculator.py").is_file(),
-        "test_written": (workspace / "test_calculator.py").is_file(),
-        "verification_succeeded": store.data["run_runtime"].get("verification_succeeded") is True,
-    }
+    checks = {'runner_completed': result['status'] == 'completed', 'source_written': (workspace / 'calculator.py').is_file(), 'test_written': (workspace / 'test_calculator.py').is_file(), 'verification_succeeded': store.record.run_runtime.get('verification_succeeded') is True}
     return {"id": "python_creation", "status": "passed" if all(checks.values()) else "failed", "checks": checks}
 
 
@@ -131,11 +123,7 @@ def java_case(output: Path) -> dict:
         Response(content="无法完成验证。"),
         Response(content="保留为待验证。"),
     ), runtime, max_rounds=12).start("开始")
-    checks = {
-        "source_written": (workspace / "Main.java").is_file(),
-        "not_completed": result["status"] != "completed",
-        "verification_not_faked": store.data["run_runtime"].get("verification_succeeded") is not True,
-    }
+    checks = {'source_written': (workspace / 'Main.java').is_file(), 'not_completed': result['status'] != 'completed', 'verification_not_faked': store.record.run_runtime.get('verification_succeeded') is not True}
     return {"id": "java_limited_verification", "status": "passed" if all(checks.values()) else "failed", "checks": checks}
 
 
@@ -146,7 +134,7 @@ def binary_case(output: Path) -> dict:
         Response(content="无法写入。"),
         Response(content="任务未产生文件。"),
     ), runtime).start("开始")
-    error = ((store.data["calls"].get("binary_create") or {}).get("result") or {}).get("error") or {}
+    error = ((store.record.calls.get('binary_create') or {}).get('result') or {}).get('error') or {}
     checks = {
         "file_absent": not (workspace / "game.exe").exists(),
         "structured_error": error.get("code") == "unsupported_format",
@@ -184,7 +172,7 @@ def main(argv=None):
     project = Path(__file__).resolve().parents[4]
     parser = argparse.ArgumentParser(description="GenesisAI 源码开发离线仿真验收")
     parser.add_argument("--dataset", type=Path, default=project / "tests" / "source_development_dataset" / "manifest.yaml")
-    parser.add_argument("--output", type=Path, default=project / ".genesis" / "source-development-simulation")
+    parser.add_argument("--output", type=Path, default=application_home() / "evaluations" / "source-development-simulation")
     args = parser.parse_args(argv)
     report = run_all(args.dataset, args.output)
     print(json.dumps({"status": report["status"], "cases": [{"id": item["id"], "status": item["status"]} for item in report["results"]]}, ensure_ascii=False, indent=2))

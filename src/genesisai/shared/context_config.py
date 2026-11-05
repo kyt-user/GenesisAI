@@ -4,10 +4,11 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class ContextConfig:
     # Conservative application defaults, NOT claims about a provider's model capacity.
-    max_input_tokens: int = 32768
-    context_window: int = 65536
+    max_input_tokens: int = 400000
+    context_window: int = 400000
     output_reserve_tokens: int = 4096
     safety_margin_tokens: int = 1024
+    history_tokens: int = 32000
     preserve_recent_tokens: int = 20000
     summary_max_tokens: int = 2048
     strategy: str = 'agentic'

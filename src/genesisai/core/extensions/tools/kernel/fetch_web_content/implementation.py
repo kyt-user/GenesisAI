@@ -4,7 +4,7 @@ import json
 import time
 
 from genesisai.shared.security import ToolError, digest
-from genesisai.core.state.store import atomic_json
+from genesisai.core.persistence.files import atomic_json
 from genesisai.core.extensions.tools.web.contracts import SAFE_PROVIDER_ERROR_CODES, SAFE_PROVIDER_REASONS, SearchQuery
 
 
@@ -16,8 +16,7 @@ class Implementation:
             target = "公开网络请求：" + args["query"]
         else:
             raise ToolError("validation_error", "必须提供 query 或 url")
-        return {"name": "fetch_web_content", "args": args, "target": target,
-                "grants": context.store.data["grants"], "output": context.store.data["output"]}
+        return {'name': 'fetch_web_content', 'args': args, 'target': target, 'grants': context.store.record.grants, 'output': context.store.record.output}
 
     def execute(self, context, args):
         if args.get("url"):
@@ -53,18 +52,14 @@ class Implementation:
             "provider": None, "fallback_errors": errors, "new_candidates": 0,
             "repeated_candidates": False, "all_providers_failed": True,
         }
-        context.store.data["run_runtime"]["search_diagnostics"] = diagnostics
+        context.store.record.run_runtime['search_diagnostics'] = diagnostics
         context.store.event("search_diagnostics", provider="none", new_candidates=0,
                             repeated_candidates=False, provider_errors=errors)
-        context.store.save()
+        context.store.commit()
         raise ToolError("search_unavailable", "搜索不可用或没有结果：" + json.dumps(errors, ensure_ascii=False), True)
 
     def _fetch(self, context, args):
-        cached = next(
-            ((ref, value) for ref, value in context.store.data["sources"].items()
-             if value.get("requested_url") == args["url"]),
-            None,
-        )
+        cached = next(((ref, value) for ref, value in context.store.record.sources.items() if value.get('requested_url') == args['url']), None)
         if cached:
             ref, _ = cached
             page = json.loads((context.store.root / "sources" / f"{ref}.json").read_text(encoding="utf-8"))

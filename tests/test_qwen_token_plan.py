@@ -9,7 +9,7 @@ from rich.console import Console
 
 from genesisai.app import onboarding
 from genesisai.core.state.io_journal import IOJournal
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.model.config import build_model
 from genesisai.model.providers.catalog import get_provider, provider_ids
 from genesisai.model.settings import ProviderSettings, load_settings
@@ -105,7 +105,7 @@ def test_sdk_tool_call_roundtrip(stream):
 
 def test_plan_key_is_redacted_before_model_binding(tmp_path, monkeypatch):
     monkeypatch.setenv('QWEN_TOKEN_PLAN', 'sk-sp-private-env')
-    journal = IOJournal(Store(tmp_path / '.genesis', workspace=tmp_path))
+    journal = IOJournal(Session(tmp_path / '.genesis', workspace=tmp_path))
     assert journal.clean('echo sk-sp-private-env') == 'echo [REDACTED]'
     assert journal.clean({'QWEN_TOKEN_PLAN': 'short'}) == {'QWEN_TOKEN_PLAN': '[REDACTED]'}
     assert journal.clean('QWEN_TOKEN_PLAN=unregistered-key') == 'QWEN_TOKEN_PLAN=[REDACTED]'

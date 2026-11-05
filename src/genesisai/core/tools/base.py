@@ -148,8 +148,13 @@ class ToolSpec:
     max_output_chars: int = 12000
     platforms: tuple[str, ...] = ("win32", "linux", "darwin")
     dependencies: tuple[str, ...] = ()
+    history_lookup: bool = False
 
     def validate(self) -> None:
+        if type(self.history_lookup) is not bool or (
+            self.history_lookup and (self.side_effect or self.network or self.permission not in {"read", "core"})
+        ):
+            raise SchemaConfigError("历史查阅工具必须只读且不访问网络")
         if self.permission not in {"core", "read", "write", "network", "shell"}:
             raise SchemaConfigError("Spec permission 无效")
         if self.path_scope not in {"none", "authorized", "output", "workspace"}:

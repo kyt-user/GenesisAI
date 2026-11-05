@@ -60,7 +60,7 @@ class ImageStore:
 
     @property
     def root(self):
-        return self.store.root / 'images' / self.store.id
+        return self.store.root / 'assets' / 'images'
 
     def import_image(self, image: ImageAttachment) -> dict:
         # Revalidate public input; callers cannot smuggle arbitrary bytes/metadata.
@@ -79,7 +79,18 @@ class ImageStore:
         return self.part(ref)
 
     def part(self, ref):
-        item = self.store.data['sources'].get(ref)
+        item = self.store.record.sources.get(ref)
+        if item is None:
+            # Exact references may be reloaded across sessions in the same workspace.
+            import json
+            rows = self.store.database.rows('SELECT r.payload FROM resources r JOIN sessions s ON r.session_id=s.id WHERE r.id=? AND r.collection=? AND s.project_id=? AND s.workspace_id=? LIMIT 1',
+                (ref, 'sources', self.store.record.project_id, self.store.record.workspace_id))
+            if rows:
+                candidate = json.loads(rows[0]['payload'])
+                if candidate.get('kind') == 'image':
+                    item = candidate
+                    self.store.record.sources[ref] = item
+                    self.store.commit()
         if not item or item.get('kind') != 'image':
             raise ValueError('图片引用不存在于当前会话')
         part = {'type': 'image', 'image_ref': ref, **{k: item[k] for k in ('name', 'mime_type', 'width', 'height', 'byte_size')}}
@@ -94,7 +105,7 @@ class ImageStore:
                 or part['width'] * part['height'] > self.config.max_image_pixels
                 or part['byte_size'] > self.config.max_image_bytes):
             raise ValueError('历史图片超过当前图片限制，请重新附加以按当前配置缩放')
-        item = self.store.data['sources'][part['image_ref']]
+        item = self.store.record.sources[part['image_ref']]
         path = self.root / (item['sha256'] + '.png')
         if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(self.root.resolve()):
             raise ValueError(f"图片快照缺失：{part['name']}；请重新附加原图")

@@ -9,7 +9,8 @@ from contextlib import ExitStack
 from threading import Event, Lock, Thread
 
 from genesisai.shared.security import ToolError
-from genesisai.core.state.store import uid
+from genesisai.shared.ids import uid
+
 from genesisai.shared.run_control import current_run
 from .process_tree import owned_process
 
@@ -101,8 +102,8 @@ def _capture(context, command, cwd, timeout, log_path):
 
 def run_process(context, command, cwd, timeout, *, kind):
     command = validate_command(command)
-    deadline = context.store.data.get('deadline', 0)
-    if context.store.data.get('status') == 'running' and deadline:
+    deadline = getattr(context.store.record, 'deadline', 0)
+    if getattr(context.store.record, 'status') == 'running' and deadline:
         remaining = deadline - time.time()
         if remaining <= 0:
             raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')

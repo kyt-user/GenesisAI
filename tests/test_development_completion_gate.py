@@ -21,7 +21,7 @@ def test_development_answer_without_file_change_is_bounded_partial(tmp_path):
 
     assert result["status"] == "partial"
     assert result["answer"].startswith("开发任务尚未产生项目文件变更")
-    assert store.data["run_runtime"]["recovery_counts"]["tool_required"] == 2
+    assert store.record.run_runtime['recovery_counts']['tool_required'] == 2
     assert not (workspace / "index.html").exists()
 
 
@@ -40,8 +40,8 @@ def test_plan_only_cannot_complete_execution_request(tmp_path):
     result = Runner(model, runtime).start("按你的默认来")
 
     assert result["status"] == "partial"
-    assert store.data["run_runtime"]["project_changed"] is False
-    assert store.data["run_runtime"]["stop_reason"] == "tool_required"
+    assert store.record.run_runtime['project_changed'] is False
+    assert store.record.run_runtime['stop_reason'] == 'tool_required'
 
 
 def test_source_create_and_real_verification_can_complete(tmp_path):
@@ -60,9 +60,9 @@ def test_source_create_and_real_verification_can_complete(tmp_path):
 
     assert result["status"] == "completed"
     assert (workspace / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
-    assert store.data["run_runtime"]["project_changed"] is True
-    assert store.data["run_runtime"]["verification_succeeded"] is True
-    assert manager.__class__(workspace).active_task()["status"] == "verified"
+    assert store.record.run_runtime['project_changed'] is True
+    assert store.record.run_runtime['verification_succeeded'] is True
+    assert manager.__class__(store).active_task()["status"] == "verified"
 
 
 def test_html_source_uses_deterministic_static_verification(tmp_path):
@@ -85,8 +85,8 @@ def test_html_source_uses_deterministic_static_verification(tmp_path):
 
     assert result["status"] == "completed"
     assert (workspace / "index.html").read_text(encoding="utf-8") == html
-    create_result = store.data["calls"]["create_html"]["result"]["data"]
+    create_result = store.record.calls['create_html']['result']['data']
     assert create_result["validation"]["framework"] == "frontend_static"
     assert create_result["validation"]["passed"] is True
-    assert all(item["tool"] != "run_commands" for item in store.data["run_runtime"]["tool_activity"])
-    assert manager.__class__(workspace).active_task()["status"] == "verified"
+    assert all((item['tool'] != 'run_commands' for item in store.record.run_runtime['tool_activity']))
+    assert manager.__class__(store).active_task()["status"] == "verified"

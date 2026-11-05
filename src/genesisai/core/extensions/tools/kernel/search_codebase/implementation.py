@@ -117,7 +117,7 @@ class Implementation:
         excludes = args.get("exclude", [".git", ".venv", "node_modules", "__pycache__"])
         matcher = (lambda value: re.search(query, value) is not None) if args.get("regex") else (lambda value: query.casefold() in value.casefold())
         for index, path in enumerate(walk(context.access, args["path"], cap=1001)):
-            if context.store.data["deadline"] and time.time() >= context.store.data["deadline"]:
+            if context.store.record.deadline and time.time() >= context.store.record.deadline:
                 raise ToolError("timeout", "资料扫描达到运行截止时间")
             if index == 1000:
                 scan_truncated = True

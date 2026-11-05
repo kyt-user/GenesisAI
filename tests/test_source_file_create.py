@@ -5,20 +5,16 @@ import pytest
 
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 
 
 @pytest.fixture
 def source_runtime(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    store = Store(workspace / ".genesis", workspace=workspace)
-    store.data.update(
-        grants=[str(workspace)],
-        output=str(workspace),
-        deadline=time.time() + 300,
-    )
-    store.save()
+    store = Session(workspace / ".genesis", workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
@@ -59,7 +55,7 @@ def test_source_and_config_files_are_created_verbatim_and_recorded(source_runtim
     assert result["data"]["kind"] == "source"
     assert result["data"]["requires_verification"] is True
     assert (workspace / path).read_text(encoding="utf-8") == content
-    assert any(change.get("path") == str((workspace / path).resolve()) for change in store.data["changes"])
+    assert any((change.get('path') == str((workspace / path).resolve()) for change in store.record.changes))
 
 
 @pytest.mark.parametrize("path", ["game.exe", "plugin.dll", "bundle.zip", "image.png", "no_extension"])

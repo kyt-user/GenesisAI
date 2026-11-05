@@ -33,9 +33,9 @@ class Access:
         self.roots = [Path(p).resolve(strict=True) for p in roots]
         self.output = Path(output).resolve()
         self.state_root = Path(state_root).resolve()
-        self._protected_state = self.state_root.name.casefold() == '.genesis'
+        self._protected_state = True
         self.workspace = Path(workspace_root or (self.roots[0] if self.roots and self.roots[0].is_dir() else self.output)).resolve()
-        self._state_roots = (self.state_root, self.workspace / '.genesis') if self._protected_state else ()
+        self._state_roots = (self.state_root,)
         self.output.mkdir(parents=True, exist_ok=True)
         if self.output == self.state_root:
             raise ValueError('输出目录不能等于程序状态目录')

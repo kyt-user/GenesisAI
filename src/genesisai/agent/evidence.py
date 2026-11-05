@@ -15,7 +15,7 @@ class EvidenceBundle:
 
     @property
     def state(self) -> dict:
-        return self.store.data["run_runtime"]
+        return self.store.record.run_runtime
 
     def add(self, *, source_ref: str, canonical_url: str, title: str, snippet: str, published_at=None, content_hash=None) -> dict:
         digest = content_hash or hashlib.sha256(snippet.encode("utf-8")).hexdigest()
@@ -39,7 +39,7 @@ class EvidenceBundle:
             self.state["evidence_refs"].append(source_ref)
         if digest not in self.state["content_hashes"]:
             self.state["content_hashes"].append(digest)
-        self.store.save()
+        self.store.commit()
         return item
 
     def items(self) -> list[dict]:
@@ -50,9 +50,9 @@ class EvidenceBundle:
 
     def verify(self) -> None:
         for item in self.items():
-            source = self.store.data["sources"].get(item["source_ref"])
+            source = self.store.record.sources.get(item['source_ref'])
             if not source or source.get("kind") != "web":
                 raise ValueError("Evidence 指向不存在或未成功读取的来源")
             if source.get("url") != item["canonical_url"]:
-                raise ValueError("Evidence URL 与 Source Store 不一致")
+                raise ValueError("Evidence URL 与 Source Session 不一致")
 

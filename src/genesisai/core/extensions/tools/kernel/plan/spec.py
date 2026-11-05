@@ -8,8 +8,7 @@ SPEC = ToolSpec(
         acceptance={"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500}, "minItems": 1, "maxItems": 30},
         non_goals={"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500}, "maxItems": 20},
     ),
-    permission="write",
-    path_scope="workspace",
+    permission="core",
     side_effect=True,
     max_output_chars=8000,
 )

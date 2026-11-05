@@ -1,6 +1,7 @@
 """完整日志的可用性验收：从真实调用入口验证落盘内容，不调用外部服务。"""
 
-from genesisai.core.state.store import application_state_root
+from genesisai.shared.paths import application_home
+
 
 import json
 from io import StringIO
@@ -14,7 +15,7 @@ from rich.console import Console
 
 from genesisai.agent.loop import Runner
 from genesisai.core.state.logger import RunLogger
-from genesisai.core.state.store import Store
+from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.model.providers.deepseek import DeepSeekClient
 from genesisai.shared.messages import Response
@@ -28,9 +29,9 @@ def runtime_factory(tmp_path):
     def make(name='workspace', **options):
         ws = tmp_path / name
         ws.mkdir()
-        store = Store(ws / '.genesis', workspace=ws)
-        store.data.update(grants=[str(ws)], output=str(ws), deadline=time.time()+300)
-        store.save()
+        store = Session(ws / '.genesis', workspace=ws)
+        store.record.apply(grants=[str(ws)], output=str(ws), deadline=time.time() + 300)
+        store.commit()
         runtime = ToolRuntime(store, Access([ws], ws, store.root, workspace_root=ws), providers=[], **options)
         return ws, runtime
     return make
@@ -115,7 +116,7 @@ def test_confirm_after_restart_keeps_same_journal(runtime_factory):
     runner = Runner(FakeModel(response(call('editor', {'operation':'create','path':'x.md','content':'x'}, 'write'))), rt)
     assert runner.start('hello')['status'] == 'awaiting_confirmation'
     before = len(events(rt))
-    store = Store(rt.store.root, rt.store.id, workspace=ws)
+    store = Session(rt.store.root, rt.store.id, workspace=ws)
     restored = ToolRuntime(store, Access([ws], ws, store.root, workspace_root=ws), providers=[])
     result = Runner(FakeModel(Response(content='done')), restored).confirm(True)
     assert result['status'] == 'completed'
@@ -157,7 +158,7 @@ def test_sessions_are_isolated_and_resume_appends(runtime_factory, tmp_path):
     second.logger.record('marker', text='SECOND_SESSION_ONLY')
     assert 'SECOND_SESSION_ONLY' not in first.logger.journal.path.read_text()
     assert 'FIRST_SESSION_ONLY' not in second.logger.journal.path.read_text()
-    restored = Store(first.store.root, first.store.id, workspace=first.store.workspace)
+    restored = Session(first.store.root, first.store.id, workspace=first.store.workspace)
     logger = RunLogger(restored)
     logger.record('marker', text='RESUMED')
     assert [r['payload']['text'] for r in events(first)] == ['FIRST_SESSION_ONLY', 'RESUMED']
@@ -249,13 +250,13 @@ def test_cancel_started_command_reports_side_effect_once(runtime_factory, ask):
     else:
         result = control.execute(lambda: runner.start('run test'))
     assert result['status'] == 'cancelled' and (ws / 'marker').read_text() == 'ran'
-    entry = rt.store.data['calls'][cmd['id']]
+    entry = rt.store.record.calls[cmd['id']]
     assert entry['executed'] and entry['state'] == 'failed'
-    delivered, = [json.loads(m['content']) for m in rt.store.data['messages'] if m['role'] == 'tool']
+    delivered, = [json.loads(m['content']) for m in rt.store.record.messages if m['role'] == 'tool']
     assert delivered['error']['code'] == 'command_cancelled'
     assert '可能已产生部分修改' in delivered['error']['message']
-    assert not rt.store.data['pending']
-    Runner.check_available(rt.store.data)
+    assert not rt.store.record.pending
+    Runner.check_available(rt.store.record)
 
 
 def test_fast_command_bounds_display_and_preserves_full_log(runtime_factory):
@@ -289,13 +290,13 @@ def test_cli_inputs_outputs_logs_command_and_new_session(tmp_path, monkeypatch):
     commands = iter(['first', '/logs', '/help', '/new', 'second', '/logs', '/exit'])
     monkeypatch.setattr('rich.console.Console.input', lambda *a, **kw: next(commands))
     ws = tmp_path/'cli'
-    assert cli.main(['--workspace',str(ws),'--no-agent-docs']) == 0
-    files = list((application_state_root()/'logs').glob('session_*.jsonl'))
+    assert cli.main(['--workspace',str(ws)]) == 0
+    files = list((application_home()/'logs').glob('session_*.jsonl'))
     assert len(files) == 2
     records = [[json.loads(line) for line in p.read_text(encoding='utf-8').splitlines()] for p in files]
     commands_by_session = [[r['payload']['text'] for r in rows if r['event']=='cli_input'] for rows in records]
     assert sorted(commands_by_session) == sorted([['first','/logs','/help','/new'],['second','/logs','/exit']])
-    assert all(any(r['event']=='cli_output' and '.jsonl' in r['payload']['text'] for r in rows) for rows in records)
+    assert all(any(r['event']=='cli_output' and '.jsonl' in r['payload']['text'].replace('\n','') for r in rows) for rows in records)
 
 
 def test_cli_startup_failure_is_logged(tmp_path, monkeypatch):
@@ -305,8 +306,8 @@ def test_cli_startup_failure_is_logged(tmp_path, monkeypatch):
         raise RuntimeError('fixture startup failure')
     monkeypatch.setattr(cli, 'build_model', broken)
     ws = tmp_path/'startup'
-    assert cli.main(['--workspace',str(ws),'--prompt','hello','--no-agent-docs']) == 2
-    path = next((application_state_root()/'logs').glob('session_*.jsonl'))
+    assert cli.main(['--workspace',str(ws),'--prompt','hello']) == 2
+    path = next((application_home()/'logs').glob('session_*.jsonl'))
     rows = [json.loads(line) for line in path.read_text(encoding='utf-8').splitlines()]
     assert any(r['event']=='cli_error' and r['payload']['error']['message']=='fixture startup failure' for r in rows)
     assert any(r['event']=='cli_output' and 'fixture startup failure' in r['payload']['text'] for r in rows)

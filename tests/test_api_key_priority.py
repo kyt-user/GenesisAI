@@ -133,7 +133,7 @@ def test_interactive_start_does_not_prompt_when_env_exists(tmp_path, monkeypatch
         model.client.close()
         return FakeModel(), False
     monkeypatch.setattr(cli, 'build_model', capture)
-    assert cli.main(['--workspace',str(work),'--config',str(config),'--config-dir',str(directory),'--no-agent-docs']) == 0
+    assert cli.main(['--workspace',str(work),'--config',str(config),'--config-dir',str(directory)]) == 0
     assert selected == ['workspace-key']
     if not saved_config:
         assert not (directory/'config.json').exists()

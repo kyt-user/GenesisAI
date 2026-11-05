@@ -1,0 +1,4 @@
+name: memory_search
+enabled: true
+category: kernel
+description: 检索当前项目/工作区的历史原文、项目知识或代码索引，返回可精确读取的引用

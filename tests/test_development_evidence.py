@@ -4,7 +4,8 @@ from genesisai.agent.loop import Runner
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.shared.messages import Response
 from genesisai.shared.security import Access
-from genesisai.core.state.store import Store, sha
+from genesisai.shared.ids import sha
+from genesisai.core.persistence.session import Session
 from test_acceptance import FakeModel
 
 
@@ -13,9 +14,9 @@ def test_local_file_source_reference_is_valid_without_web_evidence(tmp_path):
     workspace.mkdir()
     note = workspace / "plan.md"
     note.write_text("local plan", encoding="utf-8")
-    store = Store(workspace / ".genesis", workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
-    store.save()
+    store = Session(workspace / ".genesis", workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),

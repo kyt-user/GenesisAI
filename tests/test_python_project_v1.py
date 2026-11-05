@@ -7,12 +7,14 @@ import pytest
 from genesisai.app.cli import select_workspace
 from genesisai.core.extensions.tools.shell.python_support import automatic_test_command, inspect_python_project
 from genesisai.app.evals.python_development import load_dataset, run_all
-from genesisai.core.project_docs import AgentDocsError, AgentDocsManager
-from genesisai.core.state.store import application_state_root, default_workspace
+from genesisai.core.memory import TaskService
+from genesisai.core.persistence.session import Session
+from genesisai.shared.paths import application_home, default_workspace
+
 
 
 PROJECT = Path(__file__).resolve().parents[1]
-FIXTURE = PROJECT / "agent_tests_workspace"
+FIXTURE = PROJECT / "tests" / "fixtures" / "python_project"
 DATASET = Path(__file__).parent / "python_development_dataset" / "manifest.yaml"
 
 
@@ -46,10 +48,10 @@ def test_current_directory_does_not_change_default(tmp_path, monkeypatch):
     assert not (other / ".genesis").exists()
 
 
-def test_runtime_history_is_contained_by_default_workspace():
-    assert application_state_root() == default_workspace() / ".genesis"
+def test_runtime_history_is_outside_default_workspace():
+    assert application_home() == Path.home() / ".genesisai"
     with pytest.raises(ValueError, match="历史目录"):
-        select_workspace(application_state_root() / "nested")
+        select_workspace(application_home() / "nested")
 
 
 def test_cli_rejects_input_and_output_outside_selected_workspace(tmp_path):
@@ -65,7 +67,7 @@ def test_cli_rejects_input_and_output_outside_selected_workspace(tmp_path):
     assert cli.main(["--workspace", str(workspace), "--output", str(workspace / ".genesis" / "out")]) == 2
 
 
-def test_noninteractive_cli_can_initialize_agent_docs(tmp_path, monkeypatch):
+def test_noninteractive_cli_maintains_memory_outside_project(tmp_path, monkeypatch):
     import genesisai.app.cli as cli
     from test_acceptance import FakeModel
 
@@ -74,8 +76,9 @@ def test_noninteractive_cli_can_initialize_agent_docs(tmp_path, monkeypatch):
     monkeypatch.setattr("rich.console.Console.input", lambda *args, **kwargs: next(commands))
     workspace = tmp_path / "agent_tests_workspace"
 
-    assert cli.main(["--workspace", str(workspace), "--yes-agent-docs"]) == 0
-    assert AgentDocsManager.exists(workspace)
+    assert cli.main(["--workspace", str(workspace)]) == 0
+    assert not (workspace / "agent_docs").exists()
+    assert (application_home() / "state" / "genesis.sqlite3").exists()
 
 
 def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, monkeypatch):
@@ -83,7 +86,7 @@ def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, mon
     from genesisai.shared.messages import Response
     from genesisai.core.tools.tool_runtime import ToolRuntime
     from genesisai.shared.security import Access
-    from genesisai.core.state.store import Store
+    from genesisai.core.persistence.session import Session
     from test_acceptance import FakeModel, call
 
     workspace = tmp_path / "agent_tests_workspace"
@@ -93,17 +96,17 @@ def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, mon
 
     code = cli.main([
         "--workspace", str(workspace),
-        "--no-agent-docs", "--prompt", "你知道当前工作区吗",
+        "--prompt", "你知道当前工作区吗",
     ])
 
     assert code == 0
-    system_prompt = model.contexts[0][0].content
+    system_prompt = "\n".join(str(m.content) for m in model.contexts[0])
     assert str(workspace.resolve()) in system_prompt
-    assert "不要调用 Shell、pwd 或其他工具重新探测" in system_prompt
+    assert "不要用工具重新探测工作区" in system_prompt
 
-    store = Store(workspace / ".genesis", workspace=workspace)
-    store.data.update(grants=[str(workspace)], output=str(workspace))
-    store.save()
+    store = Session(workspace / ".genesis", workspace=workspace)
+    store.record.apply(grants=[str(workspace)], output=str(workspace))
+    store.commit()
     runtime = ToolRuntime(
         store,
         Access([workspace], workspace, store.root, workspace_root=workspace),
@@ -118,32 +121,29 @@ def test_selected_workspace_reaches_prompt_and_default_file_output(tmp_path, mon
     assert not (workspace / ".genesis" / "hello.txt").exists()
 
 
-def test_agent_docs_ownership_plan_resume_and_conflict(tmp_path):
-    workspace = tmp_path / "work"
+def test_application_task_plan_resumes_without_project_files(tmp_path):
+    workspace=tmp_path/'work'
     workspace.mkdir()
-    manager = AgentDocsManager(workspace, create=True)
-    task = manager.begin_task("实现小型 Python 项目", run_id="run_one")
-    planned = manager.set_plan(steps=["读取项目", "实现功能"], acceptance=["测试通过"])
-
-    restarted = AgentDocsManager(workspace)
-    resumed = restarted.begin_task("继续任务", run_id="run_two")
-
-    assert planned["plan_ready"] is True
-    assert resumed["id"] == task["id"]
-    assert "run_two" in resumed["run_ids"]
-    plan = workspace / "agent_docs" / "tasks" / task["id"] / "plan.md"
-    plan.write_text(plan.read_text(encoding="utf-8") + "\nmanual edit\n", encoding="utf-8")
-    with pytest.raises(AgentDocsError, match="外部修改"):
-        restarted.set_plan(steps=["覆盖"], acceptance=["不允许"])
+    session=Session(tmp_path/'app',workspace=workspace)
+    manager=TaskService(session)
+    task=manager.begin_task('实现项目',run_id='run_one')
+    manager.set_plan(steps=['实现功能'],acceptance=['测试通过'])
+    restarted=TaskService(Session(session.root,session.id))
+    resumed=restarted.begin_task('继续',run_id='run_two')
+    assert resumed['id']==task['id'] and resumed['plan_ready']
+    assert resumed['run_ids']==['run_one','run_two']
+    assert list(workspace.iterdir())==[]
 
 
-def test_unowned_agent_docs_is_not_taken_over(tmp_path):
-    workspace = tmp_path / "work"
-    (workspace / "agent_docs").mkdir(parents=True)
-    (workspace / "agent_docs" / "user.md").write_text("mine", encoding="utf-8")
-
-    with pytest.raises(AgentDocsError, match="停止接管"):
-        AgentDocsManager(workspace, create=True)
+def test_user_owned_files_are_untouched_by_memory(tmp_path):
+    workspace=tmp_path/'work'
+    (workspace/'agent_docs').mkdir(parents=True)
+    target=workspace/'agent_docs'/'user.md'
+    target.write_text('mine',encoding='utf-8')
+    manager=TaskService(Session(tmp_path/'app',workspace=workspace))
+    manager.begin_task('任务')
+    assert target.read_text(encoding='utf-8')=='mine'
+    assert list((workspace/'agent_docs').iterdir())==[target]
 
 
 def test_python_project_detection_supports_pytest_unittest_and_compileall(tmp_path):

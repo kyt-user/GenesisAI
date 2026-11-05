@@ -1,0 +1,14 @@
+{
+  "results": [
+    {
+      "url": "https://www.apple.com/newsroom/fixture",
+      "title": "Apple event fixture",
+      "snippet": "Offline fixture announcement"
+    }
+  ],
+  "page": {
+    "url": "https://www.apple.com/newsroom/fixture",
+    "title": "Apple event fixture",
+    "text": "Apple announced a fixture product at an offline test event. This synthetic example is used only for local test assertions."
+  }
+}

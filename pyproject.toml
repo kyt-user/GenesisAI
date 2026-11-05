@@ -47,4 +47,4 @@ modules = ["genesisai.shared"]
 testpaths = ["tests"]
 addopts = "-ra"
 markers = ["live: opt-in public network and real model checks"]
-norecursedirs = ["tests/product_acceptance_dataset", ".genesis", "build", "dist"]
+norecursedirs = ["tests/fixtures", "tests/product_acceptance_dataset", ".genesis", "build", "dist"]

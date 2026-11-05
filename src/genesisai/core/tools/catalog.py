@@ -38,12 +38,13 @@ class ToolCatalog:
             raise ToolError("tool_unavailable", f"工具不可用：{reason}")
         return descriptor
 
-    def definitions(self) -> list[dict]:
+    def definitions(self, *, history_lookup=False) -> list[dict]:
         """全量下发：返回所有启用且平台/依赖可用的工具完整定义。"""
         return [
             descriptor.definition()
             for descriptor in self.registry.values()
-            if self._disabled_reason(descriptor) is None
+            if (not history_lookup or descriptor.spec.history_lookup)
+            and self._disabled_reason(descriptor) is None
         ]
 
     def inventory(self) -> dict[str, list[dict]]:

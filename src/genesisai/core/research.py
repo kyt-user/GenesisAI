@@ -47,7 +47,7 @@ class ResearchController:
 
     @property
     def state(self) -> dict:
-        return self.store.data["run_runtime"]
+        return self.store.record.run_runtime
 
     def switch_profile(self, profile: str) -> None:
         current = self.state["profile"]
@@ -55,7 +55,7 @@ class ResearchController:
             return
         self.state["profile"] = profile
         self.state["budget"] = PROFILES[profile].to_dict()
-        self.store.save()
+        self.store.commit()
 
     def register_user_urls(self, text: str) -> None:
         for raw in URL_PATTERN.findall(text):
@@ -63,7 +63,7 @@ class ResearchController:
                 self._register_candidate(raw.rstrip(".,;!?，。；！？"), source_type="user_url")
             except Exception:
                 continue
-        self.store.save()
+        self.store.commit()
 
     def before_execute(self, call: dict) -> dict | None:
         name = call.get("name")
@@ -96,7 +96,7 @@ class ResearchController:
             return result
         call_id = call.get("id")
         cached = bool((result.get("data") or {}).get("cached"))
-        ledger = self.store.data['calls'].get(call_id, {})
+        ledger = self.store.record.calls.get(call_id, {})
         executed = ledger.get('executed', False)
         name = call.get("name")
         try:
@@ -117,14 +117,14 @@ class ResearchController:
         elif intent == "fetch":
             self._after_fetch(call, result)
         self._check_hard_limits()
-        self.store.save()
+        self.store.commit()
         return result
 
     def note_model(self, tokens: int) -> None:
         self.state["usage"]["model_calls"] += 1
         self.state["usage"]["total_tokens"] += max(tokens, 0)
         self._check_hard_limits()
-        self.store.save()
+        self.store.commit()
 
     def note_progress_round(self) -> None:
         if self.state["profile"] not in {"web_quick", "web_normal", "web_deep"}:
@@ -139,7 +139,7 @@ class ResearchController:
             self.state["progress_mark"] = mark
         if self.state["stalled_rounds"] >= 3:
             self.force_answer("no_new_evidence")
-        self.store.save()
+        self.store.commit()
 
     def should_force_answer(self) -> bool:
         # 相关性和字段覆盖属于当前问题，而非品牌。
@@ -201,7 +201,7 @@ class ResearchController:
         except Exception:
             query = ""
         if not result.get("ok"):
-            ledger = self.store.data['calls'].get(call.get('id'), {})
+            ledger = self.store.record.calls.get(call.get('id'), {})
             if query and ledger.get('executed') and query not in self.state["completed_queries"]:
                 self.state["completed_queries"].append(query)
             diagnostics = self.state.get('search_diagnostics') or {}
@@ -258,7 +258,7 @@ class ResearchController:
         if not result.get("ok"):
             # 预检拒绝（例如 retry_exhausted）没有触及网络，
             # 不能覆盖上次实际执行的失败记录。
-            if not self.store.data['calls'].get(call.get('id'), {}).get('executed', False):
+            if not self.store.record.calls.get(call.get('id'), {}).get('executed', False):
                 return
             error = result.get("error") or {}
             code = error.get("code", "execution_error")
@@ -286,7 +286,7 @@ class ResearchController:
         final_url = canonicalize_url(data.get("url") or requested)
         if final_url != requested and final_url not in self.state["candidates"]:
             self.state["candidates"][final_url] = {**(candidate or {}), "canonical_url": final_url, "source_type": "redirect"}
-        source = self.store.data["sources"].get(refs[0], {})
+        source = self.store.record.sources.get(refs[0], {})
         depth = (candidate or {}).get('depth', 0)
         registered_links = []
         if depth < 2:

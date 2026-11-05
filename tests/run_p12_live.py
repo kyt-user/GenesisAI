@@ -77,9 +77,9 @@ def main():
 
     def prompt(_view):
         nonlocal question_index
-        if state and state.store.data['status'] == 'awaiting_confirmation':
+        if state and state.store.record.status == 'awaiting_confirmation':
             command = '/approve'
-            pending = state.store.data['pending'][0]
+            pending = state.store.record.pending[0]
             if state.runtime.registry.get(pending['name']).spec.permission != 'network':
                 command = '/reject'
         elif question_index < len(prompts):
@@ -102,10 +102,8 @@ def main():
     report = {'time_utc': stamp, 'exit_code': code, 'actions': actions, 'mode': 'real model and network', 'scope': args.scope,
               'scenario': args.scenario}
     if state:
-        runs = list(state.store.data['history']) + [run_record(state.store.data)]
-        report.update(session_id=state.store.id, model=state.snapshot.model_name,
-                      history=state.store.data['history'], runs=runs, last_status=state.store.data['status'],
-                      last_answer=state.store.data['answer'], last_runtime=state.store.data['run_runtime'])
+        runs = list(state.store.record.history) + [run_record(state.store.record)]
+        report.update(session_id=state.store.id, model=state.snapshot.model_name, history=state.store.record.history, runs=runs, last_status=state.store.record.status, last_answer=state.store.record.answer, last_runtime=state.store.record.run_runtime)
     (output / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
     print('Live report: ' + str(output), flush=True)
     return code
