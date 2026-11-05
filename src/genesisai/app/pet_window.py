@@ -64,7 +64,7 @@ class PetWindow(QWidget):
         center = self.sprite.mapToGlobal(self.sprite.rect().center())
         offset = QCursor.pos() - center
         dx, dy = offset.x(), offset.y()
-        radius = 5 * self.sprite.width()
+        radius = 3 * self.sprite.width()
         if dx == 0 or dx * dx + dy * dy > radius * radius:
             self.set_flight(None)
         else:

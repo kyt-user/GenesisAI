@@ -11,6 +11,11 @@ class ContextConfig:
     preserve_recent_tokens: int = 20000
     summary_max_tokens: int = 2048
     strategy: str = 'agentic'
+    max_images: int = 4
+    max_image_bytes: int = 10485760
+    max_image_pixels: int = 32000000
+    image_max_side: int = 1536
+    max_request_image_bytes: int = 12582912
 
     @classmethod
     def parse(cls, value=None):

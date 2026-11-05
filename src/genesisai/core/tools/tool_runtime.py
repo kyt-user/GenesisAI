@@ -28,6 +28,8 @@ from genesisai.core.prompt.context_budgeter import ContextBudgeter
 from genesisai.core.prompt.task_protocols import TaskProtocolSelector
 from genesisai.core.state.trace import TraceRecorder
 from genesisai.core.project_docs import ProjectDocsGateway
+from genesisai.core.media.images import ImageStore
+from genesisai.shared.messages import validate_content
 
 
 class ToolRuntime:
@@ -46,6 +48,7 @@ class ToolRuntime:
         self.store = store
         self.access = copy(access)
         self.logger = logger or store.get_logger()
+        self.images = ImageStore(self.store, self.access)
         self._network = network or Network()
         self._providers = providers if providers is not None else [
             BraveSearchProvider(client=self._network),
@@ -87,6 +90,17 @@ class ToolRuntime:
         self.skills = SkillRegistry(workspace, self.registry)
         # MCP 桥接缝：读取 .genesis/mcp.json 并动态注册 category="mcp" 工具。
         self.mcp = McpBridge(workspace, self.registry, self.loader).configure(self.store.data.setdefault('mcp_tools', {}))
+        self.mcp.image_handler = self._mcp_image
+        self.mcp.image_config = lambda: self.images.config
+
+    def _mcp_image(self, block):
+        from genesisai.shared.security import ToolError
+        if not getattr(self, 'supports_images', False):
+            raise ToolError('image_unsupported', '当前模型尚未确认支持图片，请使用 /model 切换')
+        try:
+            return self.images.from_mcp(block)
+        except ValueError as exc:
+            raise ToolError('invalid_image', str(exc)) from exc
 
     @property
     def network(self):
@@ -150,14 +164,21 @@ class ToolRuntime:
         result = self.executor.execute(call, approved)
         return self.research.after_execute(call, self._validate_result(call, result))
 
-    @staticmethod
-    def _validate_result(call, result):
+    def _validate_result(self, call, result):
         if isinstance(result, dict):
             if result.get("pending") is True and isinstance(result.get("preview"), dict):
                 return result
             error = result.get("error")
             if result.get("ok") is True and error is None and isinstance(result.get("data"), dict):
                 valid = True
+                images = result['data'].get('images')
+                if images is not None:
+                    try:
+                        validate_content(images)
+                        valid = isinstance(images, list) and all(p['type'] == 'image' for p in images)
+                        valid = valid and all(self.images.part(p['image_ref']) == p for p in images)
+                    except ValueError:
+                        valid = False
             else:
                 valid = result.get("ok") is False and isinstance(error, dict) and isinstance(error.get("code"), str) and isinstance(error.get("message"), str)
             if valid:

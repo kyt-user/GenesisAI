@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import threading
 import traceback
+import hashlib
 from uuid import uuid4
 
 
@@ -39,12 +40,16 @@ class IOJournal:
         if is_dataclass(value) and not isinstance(value, type):
             value = asdict(value)
         if isinstance(value, dict):
+            if isinstance(value.get('data'), bytes):
+                value = {**value, 'data': {'sha256': hashlib.sha256(value['data']).hexdigest(), 'byte_size': len(value['data'])}}
             return {str(k): "[REDACTED]" if _SECRET_KEY.fullmatch(str(k)) and isinstance(v, str) else self.clean(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.clean(item) for item in value]
         if isinstance(value, Path):
             return str(value)
         if isinstance(value, str):
+            value = re.sub(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+',
+                           lambda m: '[图片载荷 sha256=' + hashlib.sha256(m[0].encode()).hexdigest() + ']', value)
             for secret in sorted(self._secrets, key=len, reverse=True):
                 value = value.replace(secret, "[REDACTED]")
             value = _BEARER.sub(r"\1[REDACTED]", value)

@@ -17,6 +17,8 @@ from genesisai.app.desktop_pet import DesktopPet
 from genesisai.app.session_picker import choose_session, session_entries
 from genesisai.app.select import is_interactive, select
 from genesisai.app.run_queue import QueueItem, RunQueue
+from genesisai.app.attachments import Attachments
+from genesisai.shared.messages import UserInput
 from genesisai.shared.ids import uid
 from genesisai.app.command_input import COMMANDS
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
@@ -145,10 +147,12 @@ def main(argv=None):
     docs_group.add_argument('--yes-agent-docs', action='store_true', help='在已指定工作区初始化 GenesisAI 管理的 agent_docs')
     docs_group.add_argument('--no-agent-docs', action='store_true', help='本次启动不初始化 agent_docs')
     parser.add_argument('--prompt', help='执行单次输入后退出；需要确认时保留会话')
+    parser.add_argument('--image', type=Path, action='append', default=[], help='为单次输入附加本地静态图片，可重复；可省略 --prompt')
     parser.add_argument('--max-rounds', type=int, default=20)
     parser.add_argument('--seconds', type=int, default=DEFAULT_TASK_SECONDS, help='一轮任务总执行时限，默认 300 秒')
     parser.add_argument('--request-timeout', type=int, default=DEFAULT_REQUEST_TIMEOUT, help='单次模型请求超时，默认 60 秒')
     args = parser.parse_args(argv)
+    one_shot = args.prompt is not None or bool(args.image)
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, 'reconfigure', None)
         if reconfigure:
@@ -157,7 +161,7 @@ def main(argv=None):
     view = CliView(console)
     if args.max_rounds < 1 or args.seconds < 1 or args.request_timeout < 1:
         parser.error('预算必须为正数')
-    interactive = not args.prompt and bool(getattr(sys.stdin, 'isatty', lambda: False)())
+    interactive = not one_shot and bool(getattr(sys.stdin, 'isatty', lambda: False)())
     try:
         actual_workspace = select_workspace(args.workspace, create=not args.session)
     except (ValueError, OSError) as exc:
@@ -199,6 +203,7 @@ def main(argv=None):
             output = str((args.output or actual_workspace).resolve())
             mode = args.permissions or 'user'
             staged_skills = []
+            attachments = Attachments()
 
             def restore_environment():
                 for key in environment_from_files:
@@ -237,6 +242,7 @@ def main(argv=None):
                     session_logger.record('session_close', status=store.data['status'])
                 state = session_logger = model = None
                 view.draft = ''
+                attachments.clear()
 
             def open_session(session_id, *, startup=False):
                 nonlocal store, actual_workspace, roots, output, session_logger, mode, staged_skills
@@ -306,16 +312,23 @@ def main(argv=None):
                         client.close()
                     raise
 
-            def submit(text, *, on_registered=None):
+            def submit(text, *, images=None, on_registered=None):
                 view.draft = text
-                if len(text) > 16000 or not text.strip():
+                request = attachments.request(text) if images is None else UserInput(text, images)
+                if len(text) > 16000 or (not text.strip() and not request.images):
                     raise ValueError('输入不能为空或超过16000字符')
                 new = store is None
                 if store:
                     Runner.check_available(store.data)
-                if new and args.prompt:
+                if new and one_shot:
                     create_store()
                 activate()
+                if request.images:
+                    if not state.runtime.supports_images:
+                        raise ValueError('当前模型尚未确认支持图片，请使用 /model 切换；待发附件已保留')
+                    config = state.runner.context_budgeter.config
+                    if len(request.images) > config.max_images or sum(len(p.data) for p in request.images) > config.max_request_image_bytes:
+                        raise ValueError('图片数量或总大小超过当前模型配置限制')
                 if new:
                     session_logger.record('cli_input', text=text)
                 view.draft = ''
@@ -329,13 +342,20 @@ def main(argv=None):
                     session_logger.record('startup_input', purpose='agent_docs_consent', text=consent)
                     if consent == 'allow':
                         AgentDocsManager(actual_workspace, create=True)
-                return run_and_show(lambda: state.runner.start(text, on_registered=on_registered))
+                def registered(run_id):
+                    if images is None:
+                        attachments.consume(request.images)
+                    if on_registered:
+                        on_registered(run_id)
+                # Text remains a first-class input; no separate legacy path.
+                payload = request if request.images else text
+                return run_and_show(lambda: state.runner.start(payload, on_registered=registered))
 
             if args.session:
                 open_session(args.session, startup=True)
             else:
                 check_paths(actual_workspace, roots, output)
-                if not args.prompt:
+                if not one_shot:
                     home()
             if args.yes_agent_docs and not AgentDocsManager.exists(actual_workspace):
                 AgentDocsManager(actual_workspace, create=True)
@@ -411,24 +431,50 @@ def main(argv=None):
                     model = state = None
                     view.render_model_settings(updated)
 
-            if args.prompt:
-                submit(args.prompt)
+            if one_shot:
+                if args.image:
+                    activate()
+                    for path in args.image:
+                        attachments.add(path, state.runtime.access, state.runner.context_budgeter.config)
+                submit(args.prompt or '')
                 return 0 if state.store.data['status'] == 'completed' else 2
+
+            def attachment_command(text):
+                command = text.casefold()
+                if command == '/attachments':
+                    view.render_data('待发送图片', attachments.summary())
+                elif command == '/attachments clear':
+                    attachments.clear()
+                    console.print('已移除待发附件，原图片文件保留。')
+                elif command == '/attach' or command.startswith('/attach '):
+                    path = text[len('/attach'):].strip().strip('"')
+                    if not path:
+                        raise ValueError('用法：/attach 图片路径（含空格可用双引号）')
+                    activate()
+                    part = attachments.add(path, state.runtime.access, state.runner.context_budgeter.config)
+                    console.print(f'已附加 {part.name} · {part.width}×{part.height}；输入文字发送，或 /send 仅发送图片。', markup=False)
+                else:
+                    return False
+                return True
 
             def print_queue():
                 console.print(f'队列{"已暂停" if runs.paused else ""} · 等待 {len(runs.pending)} 项')
                 for index, item in enumerate(runs.pending, 1):
-                    console.print(f'{index}. {item.text[:100]}', markup=False, highlight=False)
+                    console.print(f'{index}. {UserInput(item.text, item.images).preview[:100]}', markup=False, highlight=False)
                 if runs.paused:
                     console.print('输入 /queue resume 继续，或 /queue clear 清空。')
 
             def enqueue(text):
                 if len(text) > 16000:
                     raise ValueError('输入不能超过16000字符')
-                item = QueueItem(uid('queue'), text)
+                request = attachments.request(text)
+                if not text.strip() and not request.images:
+                    raise ValueError('没有待发送文字或图片')
+                item = QueueItem(uid('queue'), text, images=request.images)
                 runs.pending.append(item)
+                attachments.consume(request.images)
                 session_logger.record('queue_add', event_run_id=None, round_num=0,
-                                      queue_id=item.id, position=len(runs.pending), text=text)
+                                      queue_id=item.id, position=len(runs.pending), text=text, images=request.images)
                 console.print(f'已排队 · 第 {len(runs.pending)} 项')
 
             def start_next():
@@ -441,7 +487,7 @@ def main(argv=None):
 
                 try:
                     session_logger.record('queue_dispatch', event_run_id=None, round_num=0, queue_id=item.id)
-                    submit(item.text, on_registered=registered)
+                    submit(item.text, images=item.images, on_registered=registered)
                 except BaseException:
                     runs.paused = True
                     raise
@@ -479,6 +525,11 @@ def main(argv=None):
                         text = raw.strip()
                         command = text.casefold()
                         session_logger.record('cli_input', text=raw)
+                        if attachment_command(text):
+                            continue
+                        if command == '/send':
+                            enqueue('')
+                            continue
                         if command == '/exit':
                             console.print(f'正在停止当前任务，退出后丢弃 {len(runs.pending)} 项排队消息。')
                             break
@@ -526,6 +577,14 @@ def main(argv=None):
                         command = text.casefold()
                         if session_logger:
                             session_logger.record('cli_menu_choice', command=command)
+                    if attachment_command(text):
+                        continue
+                    if command == '/send':
+                        if runs and (runs.pending or data.get('status') == 'awaiting_confirmation'):
+                            enqueue('')
+                        else:
+                            submit('')
+                        continue
                     awaiting = data.get('status') == 'awaiting_confirmation'
                     if command == '/pet':
                         pet.show()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from genesisai.shared.messages import image_tokens, content_text, image_parts
 
 
 def dump(value):
@@ -11,7 +12,52 @@ def dump(value):
 
 
 def estimate_tokens(value):
-    return max(1, (len(dump(value)) + 2) // 3)
+    image_cost = 0
+    def textual(item):
+        nonlocal image_cost
+        if isinstance(item, dict):
+            if item.get('type') == 'image' and 'image_ref' in item:
+                image_cost += image_tokens(item)
+                return {'image_ref': item['image_ref']}
+            return {k: textual(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [textual(v) for v in item]
+        return item
+    text = dump(textual(value))
+    return max(1, (len(text) + 2) // 3) + image_cost
+
+
+def image_placeholder(part):
+    return {'type': 'text', 'text': f"[历史图片 {part['name']}，image_ref={part['image_ref']}；本次未附带像素，需要查看时调用 read_image(image_ref)。]"}
+
+
+def project_images(messages, max_images, max_bytes, *, history=False):
+    """Keep the latest user images and current tool image batch; bound older ones."""
+    values = copy.deepcopy(messages)
+    last_user = max((i for i, m in enumerate(values) if m['role'] == 'user'), default=-1)
+    latest_batch = set()
+    offset = 0
+    for unit in message_units(values):
+        indices = list(range(offset, offset + len(unit)))
+        offset += len(unit)
+        if indices and indices[0] > last_user and any(image_parts(m.get('content')) for m in unit):
+            latest_batch = set(indices)
+    protected = {last_user, *latest_batch}
+    slots = [(i, j, p) for i, m in enumerate(values) for j, p in enumerate(m.get('content') or [])
+             if isinstance(m.get('content'), list) and p.get('type') == 'image']
+    keep = {(i, j) for i, j, p in slots if i in protected}
+    count = len(keep)
+    size = sum(p['byte_size'] for i, j, p in slots if (i, j) in keep)
+    if count > max_images or size > max_bytes:
+        raise ValueError('当前轮次必要图片超过数量或总大小限制，请减少图片或调整 context 图片预算')
+    for i, j, p in reversed(slots):
+        if (i, j) in keep:
+            continue
+        if not history and count < max_images and size + p['byte_size'] <= max_bytes:
+            keep.add((i, j)); count += 1; size += p['byte_size']
+        else:
+            values[i]['content'][j] = image_placeholder(p)
+    return values
 
 
 def fingerprint(messages):
@@ -56,6 +102,8 @@ def shorten(value, limit=800):
             return value
         return value[:limit // 2] + '\n[…已省略；完整内容见会话日志…]\n' + value[-limit // 2:]
     if isinstance(value, dict):
+        if value.get('type') == 'image' and 'image_ref' in value:
+            return image_placeholder(value)
         return {key: shorten(item, limit) for key, item in value.items()}
     if isinstance(value, list):
         return [shorten(item, limit) for item in value[:12]]
@@ -63,6 +111,8 @@ def shorten(value, limit=800):
 
 
 def decode(value):
+    if isinstance(value, list):
+        value = content_text(value)
     try:
         return json.loads(value)
     except (ValueError, TypeError):
@@ -105,6 +155,10 @@ def execution_facts(messages):
 
 def project(messages, target_tokens, preserve_recent_tokens, summarize=None):
     """Pin user constraints; fold even a single long run; keep complete recent units."""
+    original = messages
+    # Assets remain in the full transcript. Only remove older pixels from the
+    # working projection, with explicit references allowing a read_image reload.
+    messages = project_images(messages, 1000000, 2**63, history=True)
     units = message_units(messages)
     pinned = [copy.deepcopy(m) for m in messages if m.get('role') == 'user']
     # Reserve room for evidence and a summary instead of spending the target on the tail.
@@ -119,7 +173,7 @@ def project(messages, target_tokens, preserve_recent_tokens, summarize=None):
     kept_ids = {id(m) for unit in tail_units for m in unit}
     dropped = [m for m in messages if m.get('role') != 'user' and id(m) not in kept_ids]
     if not dropped:
-        return copy.deepcopy(messages), {'strategy': 'basic', 'folded': False}
+        return copy.deepcopy(messages), {'strategy': 'basic', 'folded': messages != original}
     facts = execution_facts(dropped)
     # Per-tool latest records preserve the last validation even after many reads.
     latest_by_tool = {fact.get('tool'): fact for fact in facts}

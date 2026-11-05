@@ -78,7 +78,8 @@ def run_onboarding(console, *, directory=None, initial: ProviderSettings | None 
             console.print("[red]未提供密钥，已取消。[/red]")
             return None
 
-    model_options = [(model.label, f"{model.id} · {model.description}") for model in provider.models]
+    from genesisai.model.providers.catalog import image_support_label
+    model_options = [(model.label, f"{model.id} · {model.description} · {image_support_label(provider, model.id)}") for model in provider.models]
     model_options.append(("自定义模型 ID…", "手动输入不在列表中的模型"))
     default_model = 0
     if initial and initial.provider == provider.id:
@@ -116,7 +117,8 @@ def select_model_only(console, settings: ProviderSettings, *, directory=None):
     provider = get_provider(settings.provider)
     if provider is None:
         return None
-    model_options = [(model.label, f"{model.id} · {model.description}") for model in provider.models]
+    from genesisai.model.providers.catalog import image_support_label
+    model_options = [(model.label, f"{model.id} · {model.description} · {image_support_label(provider, model.id)}") for model in provider.models]
     model_options.append(("自定义模型 ID…", "手动输入不在列表中的模型"))
     default_model = 0
     for position, model in enumerate(provider.models):

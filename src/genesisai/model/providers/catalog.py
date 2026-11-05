@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from genesisai.model.capabilities import image_capability
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,8 @@ PROVIDERS: tuple[ProviderOption, ...] = (
             ModelOption("qwen-plus", "Qwen Plus", "均衡通用模型"),
             ModelOption("qwen-max", "Qwen Max", "能力最强"),
             ModelOption("qwen-turbo", "Qwen Turbo", "速度优先"),
+            ModelOption("qwen3-vl-plus", "Qwen3 VL Plus", "图片理解与工具调用"),
+            ModelOption("qwen3-vl-flash", "Qwen3 VL Flash", "图片理解与工具调用"),
         ),
         default_model="qwen-plus",
         key_hint="sk-...",
@@ -92,3 +95,8 @@ def get_provider(provider_id: str) -> ProviderOption | None:
 def provider_ids() -> list[str]:
     """返回全部提供商 id，保持目录顺序。"""
     return [provider.id for provider in PROVIDERS]
+
+
+def image_support_label(provider, model):
+    capability = image_capability(provider.id, model, provider.base_url)
+    return '支持图片' if capability.supported is True else ('仅文字' if capability.supported is False else '图片能力未确认')

@@ -125,7 +125,7 @@ def test_mouse_flight_temporarily_overrides_thinking(monkeypatch):
     app.processEvents()
     assert pet.label.isVisible()
     center = pet.sprite.mapToGlobal(pet.sprite.rect().center())
-    radius = pet.sprite.width() * 5
+    radius = pet.sprite.width() * 3
 
     def assert_row(row):
         tile = pet.sheet.copy(0, row * 208, 192, 208)

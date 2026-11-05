@@ -7,6 +7,8 @@ from pathlib import Path
 
 from genesisai.shared.budgets import initial_run_runtime
 from genesisai.shared.ids import sha, uid
+from genesisai.shared.messages import validate_content, image_parts
+import re
 
 
 CURRENT_SESSION_SCHEMA_VERSION = 3
@@ -100,6 +102,21 @@ def validate_session(data, expected_id=None):
         raise ValueError('会话 ID 与文件名不一致')
     if not data['workspace']:
         raise ValueError('会话字段 workspace 无效')
+    for ref, source in data['sources'].items():
+        if source.get('kind') == 'image':
+            if not re.fullmatch(r'[a-f0-9]{64}', source.get('sha256', '')):
+                raise ValueError('图片快照哈希无效')
+            validate_content([{'type': 'image', 'image_ref': ref, **{k: source.get(k) for k in ('name', 'mime_type', 'width', 'height', 'byte_size')}}])
+    def validate_messages(messages):
+        for message in messages:
+            if not isinstance(message, dict) or message.get('role') not in {'user', 'assistant', 'system', 'tool'}:
+                raise ValueError('会话消息结构无效')
+            validate_content(message.get('content'))
+            for part in image_parts(message.get('content')):
+                source = data['sources'].get(part['image_ref'], {})
+                if message['role'] not in {'user', 'tool'} or source.get('kind') != 'image' or any(source.get(k) != part[k] for k in ('name', 'mime_type', 'width', 'height', 'byte_size')):
+                    raise ValueError('会话图片引用无效或元数据不一致')
+    validate_messages(data['messages'])
     checkpoint = data.get('context_checkpoint')
     if checkpoint is not None:
         if (not isinstance(checkpoint, dict)
@@ -108,6 +125,7 @@ def validate_session(data, expected_id=None):
                 or not isinstance(checkpoint.get('source_hash'), str)
                 or not isinstance(checkpoint.get('messages'), list)):
             raise ValueError('会话 context_checkpoint 无效')
+        validate_messages(checkpoint['messages'])
     factor = data.get('context_estimate_factor', 1.0)
     if type(factor) not in (int, float) or not 1 <= factor <= 4:
         raise ValueError('会话 context_estimate_factor 无效')

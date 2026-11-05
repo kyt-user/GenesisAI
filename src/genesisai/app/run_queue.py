@@ -7,6 +7,7 @@ from queue import Empty, SimpleQueue
 from threading import Lock
 
 from genesisai.shared.run_control import RunControl
+from genesisai.shared.messages import ImageAttachment
 
 
 PREVIEW_ROWS = 4
@@ -17,6 +18,7 @@ class QueueItem:
     id: str
     text: str
     run_id: str | None = None
+    images: tuple[ImageAttachment, ...] = ()
 
 
 class CommandPreview:

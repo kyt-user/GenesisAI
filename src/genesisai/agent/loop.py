@@ -20,6 +20,8 @@ from genesisai.shared.budgets import initial_run_runtime, is_recall_request, sel
 from genesisai.shared.ids import uid
 from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
+from genesisai.shared.messages import UserInput, content_text
+from genesisai.shared.results import result_content
 
 
 class ContextLimitError(ValueError):
@@ -60,6 +62,11 @@ class Runner(RecoveryMixin):
                 summarize=self._summarize_context, tools=self.runtime.definitions,
                 estimation_key=f'{type(model).__name__}:{getattr(model, "model", "")}',
             )
+        self.runtime.supports_images = getattr(getattr(model, 'image_capability', None), 'supported', None) is True
+        if getattr(self.runtime, 'images', None) is not None:
+            self.runtime.images.config = self.context_budgeter.config
+            if model is not None:
+                model.image_resolver = self.runtime.images.data_url
 
     @property
     def research(self):
@@ -130,8 +137,21 @@ class Runner(RecoveryMixin):
         d = self.store.data
         input_id = self.run_logger.record('user_input', text=text, previous_run_id=d.get('run_id'))
         self.ensure_available()
-        if not text.strip() or len(text) > 16000:
+        request = UserInput(text) if isinstance(text, str) else text
+        if not isinstance(request, UserInput) or not isinstance(request.text, str):
+            raise ValueError('输入必须为文字或 UserInput')
+        text = request.text
+        if (not text.strip() and not request.images) or len(text) > 16000:
             raise ValueError('输入不能为空或超过16000字符')
+        content = text
+        if request.images:
+            if not self.runtime.supports_images:
+                raise ValueError('当前模型尚未确认支持图片；请通过 /model 选择图片模型，附件已保留')
+            config = self.context_budgeter.config
+            if len(request.images) > config.max_images or sum(len(p.data) for p in request.images) > config.max_request_image_bytes:
+                raise ValueError('图片数量或总大小超过限制')
+            parts = [self.runtime.images.import_image(p) for p in request.images]
+            content = ([{'type': 'text', 'text': text}] if text else []) + parts
         self.store.verify_sources()
         # Stage the new turn until its first atomic session save succeeds.
         previous_data = d.copy()
@@ -190,7 +210,7 @@ class Runner(RecoveryMixin):
             d['run_runtime']['reuse_evidence'] = True
         d['run_runtime']['execution_seconds_limit'] = self.seconds
         d['run_runtime']['request_timeout_seconds'] = self.request_timeout
-        d['run_runtime']['objective'] = active_task['title'] if continuation else text
+        d['run_runtime']['objective'] = active_task['title'] if continuation else (text or content_text(content, images=True))
         d['run_runtime']['execution_requested'] = continuation or self.prompt.requests_development_execution(text, protocols)
         d['run_runtime']['project_changed'] = False
         d['run_runtime']['verification_succeeded'] = False
@@ -199,7 +219,7 @@ class Runner(RecoveryMixin):
         d.update(run_id=uid('run'), status='running', rounds=0, tool_count=0, failures=0,
                  deadline=time.time() + self.seconds, pending=[], answer='', usage={},
                  limits=dict(rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures))
-        d['messages'].append(dict(role='user', content=text))
+        d['messages'].append(dict(role='user', content=content))
         self.store.data.update(d)
         d = self.store.data
         try:
@@ -262,7 +282,7 @@ class Runner(RecoveryMixin):
             'code': (result.get('error') or {}).get('code'),
             'executed': executed,
         })
-        d['messages'].append(dict(role='tool', tool_call_id=call['id'], content=json.dumps(result, ensure_ascii=False)))
+        d['messages'].append(dict(role='tool', tool_call_id=call['id'], content=result_content(result)))
         d['failures'] = 0 if result['ok'] else d['failures'] + 1
         d['pending'].pop(0)
         if self.docs.exists():

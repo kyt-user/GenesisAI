@@ -269,17 +269,39 @@ class McpBridge:
             raise ToolError("mcp_error", str(exc)) from exc
         if not isinstance(result, dict):
             raise ToolError("mcp_error", "MCP 工具返回无效结果")
+        blocks = result.get('content', [])
+        if not isinstance(blocks, list) or any(not isinstance(b, dict) for b in blocks):
+            raise ToolError('mcp_error', 'MCP 内容块无效')
+        unsupported = {str(b.get('type')) for b in blocks if b.get('type') not in {'text', 'image'}}
+        if unsupported:
+            raise ToolError('unsupported_content', '当前仅接入文字和图片，MCP 返回了未支持的内容：' + ', '.join(sorted(unsupported)))
+        images = []
+        image_blocks = [b for b in blocks if b.get('type') == 'image']
+        if image_blocks:
+            handler = getattr(self, 'image_handler', None)
+            if handler is None:
+                raise ToolError('image_unavailable', 'MCP 图片服务未绑定')
+            config = self.image_config()
+            if len(image_blocks) > config.max_images:
+                raise ToolError('image_limit', 'MCP 返回图片数量超过限制')
+            for block in image_blocks:
+                images.append(handler(block))
+            if sum(p['byte_size'] for p in images) > config.max_request_image_bytes:
+                raise ToolError('image_limit', 'MCP 图片总大小超过限制')
         texts = [
             item.get("text", "")
             for item in result.get("content", [])
             if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
         ]
-        return {
+        payload = {
             "server": server,
             "tool": tool,
             "text": "\n".join(texts)[:12000],
             "is_error": bool(result.get("isError")),
         }
+        if images:
+            payload.update(images=images, source_refs=[p['image_ref'] for p in images])
+        return payload
 
     def close(self) -> None:
         for transport in self.transports.values():

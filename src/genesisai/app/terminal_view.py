@@ -16,6 +16,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from genesisai.app.command_input import COMMANDS, TaskInput
+from genesisai.shared.messages import content_text
 from genesisai.app.select import is_interactive, select
 from genesisai.app.terminal_text import terminal_text
 
@@ -119,8 +120,8 @@ class CliView:
 
     def _get_input(self):
         if getattr(self, '_input', None) is None:
-            history = [m['content'] for m in getattr(self, 'session_data', {}).get('messages', [])
-                       if m.get('role') == 'user' and m.get('content')]
+            history = [content_text(m.get('content')) for m in getattr(self, 'session_data', {}).get('messages', [])
+                       if m.get('role') == 'user' and content_text(m.get('content'))]
             self._input = TaskInput(history)
         return self._input
 
@@ -258,6 +259,7 @@ class CliView:
         table.add_row("累计 Token（用量）", str(usage.get('total_tokens', 0)))
         context = runtime.get('context_report') or {}
         table.add_row("当前请求（估算 Token）", f"{context.get('tokens_after', '—')} / {context.get('input_limit', '—')}")
+        table.add_row('图片（数量 / 估算 Token / 字节）', f"{context.get('image_count', 0)} / {context.get('image_tokens', 0)} / {context.get('image_bytes', 0)}")
         table.add_row("候选 / Evidence", f"{runtime.get('candidate_count', 0)} / {len(runtime.get('evidence_refs', []))}")
         table.add_row("停止原因", str(runtime.get("stop_reason") or "—"))
         self.console.print(Panel(table, title="预算", title_align="left", border_style="cyan", box=box.ROUNDED))
@@ -292,7 +294,7 @@ class CliView:
         # Some answers (errors, cancellation, and attempt_completion) only exist in the run outcome.
         turns = []
         for message in data.get('messages', []):
-            content = message.get('content')
+            content = content_text(message.get('content'), images=True)
             if message['role'] == 'user':
                 turns.append([content or '', None])
             elif turns and message['role'] == 'assistant' and not message.get('tool_calls') and content:

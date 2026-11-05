@@ -389,3 +389,11 @@ modules = ["genesisai.shared"]
 - 循环骨架 → `agent/loop.py`；模型轮次与协议恢复 → `agent/recovery.py`。
 - 开发验证 → `core/development/policy.py` 的 `DevelopmentPolicy`（`should_auto_verify/requires_change_verification/development_change_required/recover_tool_required/inject_verification_test`），由 `app` 组装期挂到 `ToolRuntime.development`，`agent` 经 `DevelopmentPort` 端口调用。
 - 项目文档收尾 → `core/project_docs/`（经 `DocsPort`）；任务协议选择 → `core/prompt/`（经 `PromptPort`）。
+
+### 11.8 文字与图片输入（2026-11-05）
+
+- `shared/messages.py` 定义文字块、图片引用、冻结的附件与用户输入对象。持久化消息只含引用，不内嵌媒体字节；回答仍为文字。
+- `core/media/images.py` 负责受控读取、解码、方向校正、缩放及不可变快照，CLI、`read_image` 与 MCP 复用。图片资产登记为 `sources.kind=image`，沿用现有会话 JSON，不添加历史迁移逻辑。
+- `app/attachments.py` 管理待发附件；入队后像素保持固定，成功登记前保留草稿。`agent` 仅协调运行和图片内容交付，不导入 core 图像库。
+- `model/capabilities.py` 明确绑定端点与模型能力。公共适配器将内部图片引用解析成请求图片；工具文本结果成对返回后，再附带标注工具来源的图片观察消息。此传输消息不作为真实用户指令写入会话。
+- `core/prompt` 负责图片预算及历史卸载，保留可重载的引用；`core/state/io_journal.py` 记录载荷摘要。模型层通过注入解析器获取图片，不反向依赖 core。

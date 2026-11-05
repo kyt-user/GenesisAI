@@ -5,6 +5,7 @@ from pathlib import Path
 
 from genesisai.app.select import select
 from genesisai.core.state.store import validate_session
+from genesisai.shared.messages import content_text
 
 
 def session_entries(console, root, *, current_id=None, workspace=None):
@@ -19,8 +20,8 @@ def session_entries(console, root, *, current_id=None, workspace=None):
             modified = path.stat().st_mtime
             if workspace is not None and Path(data['workspace']) != workspace:
                 continue
-            title = next((m.get('content') for m in data['messages']
-                          if m.get('role') == 'user' and (m.get('content') or '').strip()), None)
+            title = next((content_text(m.get('content'), images=True) for m in data['messages']
+                          if m.get('role') == 'user' and content_text(m.get('content'), images=True).strip()), None)
             if not title:
                 continue
             entries.append((modified, data['id'], ' '.join(title.split())[:80], data['workspace']))

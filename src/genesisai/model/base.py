@@ -4,9 +4,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
 from genesisai.shared.messages import Message, Response
+from genesisai.model.capabilities import ImageCapability
 
 
 class ModelClient(ABC):
+    image_capability = ImageCapability()
+    image_resolver = None
+
     @abstractmethod
     def chat(
         self,
