@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from tempfile import NamedTemporaryFile
 from pathlib import Path
 
 from genesisai.shared.ids import sha, uid
@@ -30,12 +31,22 @@ def record_change(store, *, operation, path, before_sha=None, after_sha=None, ba
 def atomic_write_bytes(path, payload):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + '.genesis.tmp')
-    with temp.open('wb') as stream:
-        stream.write(payload)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temp, path)
+    with NamedTemporaryFile(dir=path.parent, prefix=".genesis-", delete=False) as stream:
+        temp = Path(stream.name)
+        try:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        except BaseException:
+            stream.close()
+            temp.unlink(missing_ok=True)
+            raise
+    try:
+        if path.exists():
+            shutil.copymode(path, temp)
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def current_sha(path):

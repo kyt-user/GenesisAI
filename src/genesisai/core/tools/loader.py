@@ -23,6 +23,11 @@ class ToolLoader:
         self._cache[name] = implementation
         self._dynamic.add(name)
 
+    def unregister_dynamic(self, name: str) -> None:
+        if name in self._dynamic:
+            self._dynamic.remove(name)
+            del self._cache[name]
+
     def load(self, descriptor: ToolDescriptor):
         if descriptor.name in self._cache:
             return self._cache[descriptor.name]

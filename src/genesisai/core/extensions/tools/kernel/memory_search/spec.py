@@ -1,6 +1,7 @@
 from genesisai.core.tools.base import ToolSpec, object_schema
 
 SPEC = ToolSpec(
+    routes=('memory',),
     parameters=object_schema(
         ["query"],
         query={"type": "string", "minLength": 1, "maxLength": 500},

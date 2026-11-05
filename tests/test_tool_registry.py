@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import genesisai
 from genesisai.core.tools.base import ToolSpec, object_schema
 from genesisai.core.tools.registry import TOOL_FIELDS, RegistryError, ToolRegistry
 
@@ -147,7 +148,7 @@ def test_registry_does_not_import_business_implementations():
 
 def test_registry_root_is_inside_installed_genesisai_package():
     registry = ToolRegistry()
-    package_root = Path(__file__).resolve().parents[1] / "src" / "genesisai"
+    package_root = Path(genesisai.__file__).resolve().parent
     tools = package_root / "core" / "extensions" / "tools"
     assert registry.root == package_root
     assert registry.category_roots["kernel"] == tools / "kernel"

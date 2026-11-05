@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from genesisai.shared.security import ToolError
-from genesisai.core.extensions.tools.filesystem.shared import extract, walk
+from genesisai.core.extensions.tools.filesystem.shared import MAX_BYTES, extract, read_text_document, walk
 
 
 _PY_CLASS = re.compile(r"^(\s*)class\s+(\w+)(?:\(([^)]*)\))?\s*:", re.MULTILINE)
@@ -110,38 +110,77 @@ class Implementation:
         return {"summary": summary, "files": results, "todos": total_todos[:50], "truncated": len(files) >= _MAX_FILES}
 
     def _search(self, context, args, query, mode):
-        results, skipped, paths = [], [], []
-        scan_truncated = False
+        if mode not in {"name", "content"}:
+            raise ToolError("validation_error", "mode 必须是 name/content/index")
+        try:
+            matcher = re.compile(query if args.get("regex") else re.escape(query),
+                                 0 if args.get("regex") else re.IGNORECASE).search
+        except re.error as exc:
+            raise ToolError("validation_error", f"正则表达式无效：{exc}") from exc
+        offset, limit = args.get("offset", 0), args.get("limit", 30)
+        radius = args.get("context_lines", 1)
         base = context.access.read(args["path"])
+        paths = [base] if base.is_file() else walk(context.access, args["path"], cap=None)
+        file_offset = args.get("file_offset", 0)
+        next_file = None
         pattern = args.get("glob", "*")
-        excludes = args.get("exclude", [".git", ".venv", "node_modules", "__pycache__"])
-        matcher = (lambda value: re.search(query, value) is not None) if args.get("regex") else (lambda value: query.casefold() in value.casefold())
-        for index, path in enumerate(walk(context.access, args["path"], cap=1001)):
+        excludes = args.get("exclude", [])
+        hits, files, skipped = [], {}, []
+        seen = 0
+        incomplete = False
+        more = False
+        for index, path in enumerate(paths):
             if context.store.record.deadline and time.time() >= context.store.record.deadline:
                 raise ToolError("timeout", "资料扫描达到运行截止时间")
-            if index == 1000:
-                scan_truncated = True
+            if index < file_offset:
+                continue
+            if index == file_offset + 1000:
+                next_file = index
+                incomplete = True
                 break
-            paths.append(path)
-            relative = path.relative_to(base) if base.is_dir() else Path(path.name)
-            relative_text = str(relative).replace("\\", "/")
-            if any(fnmatch.fnmatch(relative_text, item) or item in relative.parts for item in excludes):
+            relative = path.relative_to(base) if path.is_relative_to(base) and base.is_dir() else Path(path.name)
+            if len(relative.parts) > args.get("depth", 1000):
                 continue
-            if not fnmatch.fnmatch(path.name, pattern) and not fnmatch.fnmatch(relative_text, pattern):
+            if any(fnmatch.fnmatch(relative.as_posix(), item) or item in relative.parts for item in excludes):
                 continue
-            match = matcher(path.name)
+            if not (fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative.as_posix(), pattern)):
+                continue
+            lines = []
+            extracted = path.suffix.lower() in {".pdf", ".docx", ".xlsx"}
             if mode == "content":
                 try:
-                    text, _ = extract(path)
-                    match = match or matcher(text)
+                    if path.stat().st_size > MAX_BYTES:
+                        raise ToolError("size_limit", "文件过大")
+                    if extracted:
+                        content, clipped = extract(path)
+                        incomplete |= clipped
+                    else:
+                        content = read_text_document(path)[0]
+                    lines = content.splitlines()
                 except Exception:
                     skipped.append(str(path))
-            if match:
-                results.append({"path": str(path), "size": path.stat().st_size})
-        offset = args.get("offset", 0)
-        return {
-            "files": results[offset: offset + 100],
-            "skipped": skipped[:50],
-            "truncated": scan_truncated or len(results) > offset + 100,
-            "next_offset": offset + 100 if len(results) > offset + 100 else None,
-        }
+            def matches():
+                for i, line in enumerate(lines):
+                    match = matcher(line)
+                    if match:
+                        left = max(0, match.start() - 100)
+                        yield {"line": i + 1, "column": match.start() + 1,
+                               "kind": "extracted" if extracted else "source", "text": line[left:left + 400],
+                               "before": [s[:240] for s in lines[max(0, i-radius):i]],
+                               "after": [s[:240] for s in lines[i+1:i+1+radius]]}
+                if matcher(path.name):
+                    yield {"kind": "filename"}
+            for hit in matches():
+                seen += 1
+                if seen <= offset:
+                    continue
+                if len(hits) == limit:
+                    more = True
+                    break
+                hits.append({"path": str(path), **hit})
+                files[str(path)] = {"path": str(path), "size": path.stat().st_size}
+            if more:
+                break
+        return {"matches": hits, "files": list(files.values()), "skipped": skipped[:50],
+                "scan_truncated": incomplete, "truncated": incomplete or more,
+                "next_offset": offset + limit if more else None, "next_file_offset": next_file}

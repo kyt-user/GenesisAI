@@ -8,9 +8,13 @@ import time
 from pathlib import Path
 from genesisai.shared.ids import uid
 
-from genesisai.core.tools.base import ToolContext, Tool
+from genesisai.core.extensions.lsp.extension import register_lsp
+from genesisai.core.extensions.tools.shell.jobs import CommandJobs
+from genesisai.core.tools.base import ToolContext
 from genesisai.core.memory.scope import CodeScope
 from genesisai.core.tools.catalog import ToolCatalog
+from genesisai.core.tools.selection import discover, select_tools
+from genesisai.core.tools.output import project_output
 from genesisai.core.tools.executor import ToolExecutor, error_result
 from genesisai.core.tools.ledger import CallLedger
 from genesisai.core.tools.loader import ToolLoader
@@ -87,6 +91,8 @@ class ToolRuntime:
             network=self._network,
             providers=self._providers,
             runtime=self,
+            hosted_network=network is not None,
+            hosted_providers=providers is not None or network is not None,
         )
         self.executor = ToolExecutor(
             catalog=self.catalog,
@@ -124,6 +130,13 @@ class ToolRuntime:
             user=self.store.root / "skills",
         )
         # MCP 桥接缝：读取应用目录 projects/<project_id>/mcp.json 并动态注册 category="mcp" 工具。
+        self.lsp_error = None
+        try:
+            register_lsp(ApplicationPaths(store.root).project(store.record.project_id), self.registry, self.loader)
+        except ValueError as exc:
+            self.lsp_error = str(exc)
+            self.logger.error("lsp_config_error", exc)
+        self.jobs = CommandJobs(store, self.logger.journal.clean)
         self.mcp = McpBridge(
             ApplicationPaths(self.store.root).project(self.store.record.project_id),
             self.registry,
@@ -195,6 +208,7 @@ class ToolRuntime:
         self._network = value
         if hasattr(self, "context"):
             self.context.network = value
+            self.context.hosted_network = True
 
     @property
     def providers(self) -> list:
@@ -205,12 +219,27 @@ class ToolRuntime:
         self._providers = value
         if hasattr(self, "context"):
             self.context.providers = value
+            self.context.hosted_providers = True
 
     def definitions(self) -> list[dict]:
         self.catalog.refresh()
-        return self.catalog.definitions(
-            history_lookup=self.store.record.run_runtime.get("history_lookup", False)
-        )
+        skill_tools = {name for skill in self.store.record.tool_runtime["active_skills"]
+                       if skill in self.skills.items for name in self.skills.items[skill].tools}
+        selected = select_tools(self.catalog.available_tools(), self.store.record.run_runtime, skill_tools)
+        return [item.definition() for item in selected]
+
+    def discover_tools(self, query, limit):
+        self.catalog.refresh()
+        matches = discover(self.catalog.available_tools(), query, limit)
+        state = self.store.record.run_runtime
+        selected = [*state.get("discovered_tools", []), *(item["name"] for item in matches)]
+        state["discovered_tools"] = list(dict.fromkeys(reversed(selected)))[:8][::-1]
+        return {"available_next_round": matches}
+
+    def model_content(self, call, result):
+        descriptor = self.registry.get(call["name"]) if call["name"] in self.registry else None
+        limit = descriptor.spec.max_output_chars if descriptor else 12000
+        return project_output(self.store, call, result, limit)
 
     def execute(self, call: dict, approved: str | None = None) -> dict:
         invocation_id = uid("invocation")
@@ -260,11 +289,7 @@ class ToolRuntime:
                     call, self.executor.execute(call, approved)
                 )
             descriptor = self.catalog.descriptor_for_execution(call["name"])
-            Tool(
-                name=descriptor.name,
-                description=descriptor.description,
-                parameters=descriptor.spec.parameters,
-            )._validate_args(json.loads(call["arguments"]))
+            descriptor.validate_arguments(json.loads(call["arguments"]))
         except Exception:
             return self._validate_result(call, self.executor.execute(call, approved))
         blocked = self.research.before_execute(call)
@@ -273,10 +298,18 @@ class ToolRuntime:
             self.ledger.finish(call, result, 0)
             return self.research.after_execute(call, result)
         result = self.executor.execute(call, approved)
-        return self.research.after_execute(call, self._validate_result(call, result))
+        result = self._validate_result(call, result)
+        if "input_request" in result:
+            return result
+        return self.research.after_execute(call, result)
 
     def _validate_result(self, call, result):
         if isinstance(result, dict):
+            question = result.get("input_request")
+            if (isinstance(question, dict) and isinstance(question.get("question"), str)
+                    and isinstance(question.get("options"), list)
+                    and call.get("name") in self.registry and self.registry.get(call["name"]).spec.awaits_input):
+                return result
             if result.get("pending") is True and isinstance(
                 result.get("preview"), dict
             ):
@@ -325,6 +358,9 @@ class ToolRuntime:
                     return normalized
         return error_result(call, "invalid_result", "工具返回了无效的结果结构")
 
+    def cancel_question(self, call, result):
+        self.ledger.finish(call, result, 0)
+
     def reject(self, call: dict) -> dict:
         result = self.executor.reject(call)
         self.logger.record("tool_rejected", call=call, result=result)
@@ -345,17 +381,24 @@ class ToolRuntime:
                 self.store.record.permission_mode = previous
                 raise
             if mode == "user" and hasattr(self, "mcp"):
-                self.mcp.close()
+                self.close()
         self.policy = policy
         self.access.host_access = mode == "auto"
         if hasattr(self, "executor"):
             self.executor.policy = policy
 
+    def close(self):
+        self.jobs.close()
+        self.mcp.close()
+
     def confirmation_message(self, name: str) -> str:
         """根据工具固定 Spec 返回准确的待确认类型。"""
         self.registry.refresh()
         if name in self.registry:
-            permission = self.registry.get(name).spec.permission
+            spec = self.registry.get(name).spec
+            if spec.launches_service:
+                return "需要确认启动外部服务执行查询"
+            permission = spec.permission
             if self.registry.get(name).category == "mcp":
                 return "需要确认 MCP 服务启动或调用"
             if permission == "network":
@@ -369,7 +412,11 @@ class ToolRuntime:
     def inventory(self) -> dict[str, list[dict]]:
         """返回启用/禁用工具清单（CLI 展示用）。"""
         self.catalog.refresh()
-        return self.catalog.inventory()
+        inventory = self.catalog.inventory()
+        if self.lsp_error:
+            inventory["disabled"].append({"name": "lsp_query", "category": "lsp",
+                                          "description": "语言服务查询", "reason": self.lsp_error})
+        return inventory
 
     @staticmethod
     def error(call: dict, code: str, message: str, retryable: bool = False) -> dict:

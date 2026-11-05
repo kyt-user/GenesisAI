@@ -2,6 +2,7 @@ from genesisai.core.tools.base import ToolSpec, object_schema
 
 
 SPEC = ToolSpec(
+    routes=('direct_answer', 'web'),
     parameters=object_schema(
         [],
         query={"type": "string", "minLength": 1, "maxLength": 500},

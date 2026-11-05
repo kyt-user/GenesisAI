@@ -33,12 +33,13 @@ class ObservationRegistry:
             raise ValueError("Duplicate observation adapter: " + name)
         self.adapters[name] = adapter
 
-    def extract(self, name, args, result):
+    @staticmethod
+    def collect(adapter, args, payload):
         from dataclasses import asdict
 
         values = []
-        if result.get("ok") and name in self.adapters:
-            for item in self.adapters[name](args, result["data"]):
+        if adapter and isinstance(payload, dict):
+            for item in adapter(args, payload):
                 item.validate()
                 values.append(asdict(item))
         return values

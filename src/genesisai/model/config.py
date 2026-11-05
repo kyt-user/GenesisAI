@@ -9,7 +9,7 @@ from urllib.parse import urlsplit
 import yaml
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_CONFIG = Path(__file__).with_name("default.yaml")
 PROVIDERS = frozenset({"deepseek", "qwen", "qwen_token_plan"})
 TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation", "context"})
 GENERATION_KEYS = frozenset({"max_tokens", "temperature", "top_p"})
@@ -24,7 +24,7 @@ class ModelConfig:
 
 
 def load_model_config(path=None) -> ModelConfig:
-    source = Path(path) if path else PROJECT_ROOT / "config/model.yaml"
+    source = Path(path) if path is not None else DEFAULT_CONFIG
     if not source.is_file():
         raise ValueError(f"模型配置不存在：{source}")
     data = yaml.safe_load(source.read_text(encoding="utf-8"))

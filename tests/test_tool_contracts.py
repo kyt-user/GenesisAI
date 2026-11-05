@@ -53,7 +53,7 @@ def test_business_specs_are_the_single_model_schema_source(runtime):
         "attempt_completion": "core",
         "use_skill": "core",
     }
-    definitions = {item["function"]["name"]: item["function"] for item in runtime[3].definitions()}
+    definitions = {item["function"]["name"]: item["function"] for item in (desc.definition() for desc in runtime[3].catalog.available_tools())}
 
     assert set(BUSINESS).issubset(definitions)
     for name in BUSINESS:

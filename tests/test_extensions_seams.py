@@ -134,7 +134,7 @@ class FakeTransport:
         if self.fail:
             raise McpError("boom")
         if method == "initialize":
-            return {"protocolVersion": "2024-11-05"}
+            return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}}
         if method == "tools/list":
             return {
                 "tools": [
@@ -186,6 +186,8 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
     assert runtime.execute(connect, approved=runtime.store.record.calls['connect']['digest'])['ok']
     assert len(transports) == 1
 
+    assert "mcp_fixture_echo" not in {item["function"]["name"] for item in runtime.definitions()}
+    runtime.discover_tools("mcp_fixture_echo", 1)
     names = {item["function"]["name"] for item in runtime.definitions()}
     assert "mcp_fixture_echo" in names
     descriptor = runtime.registry.get("mcp_fixture_echo")
@@ -238,6 +240,53 @@ def test_mcp_invalid_config_is_reported(tmp_path):
     bridge.configure({})
     assert bridge.servers == []
     assert bridge.diagnostics
+
+
+def test_mcp_read_only_requires_json_boolean(tmp_path):
+    write_mcp_config(tmp_path, read_only="false")
+    with pytest.raises(McpError, match="read_only"):
+        load_servers(tmp_path)
+
+
+def test_mcp_subprocess_gets_only_explicit_secret_env(monkeypatch):
+    import sys
+    from genesisai.core.extensions.mcp.bridge import McpServerSpec, StdioTransport
+
+    monkeypatch.setenv("PARENT_API_KEY", "parent")
+    command = (
+        "import json,os; input(); "
+        "print(json.dumps({'id':1,'result':[os.getenv('PARENT_API_KEY'),os.getenv('MCP_TOKEN')]}))"
+    )
+    spec = McpServerSpec("fixture", sys.executable, ("-c", command), {"MCP_TOKEN": "explicit"})
+    transport = StdioTransport(spec)
+    try:
+        assert transport.request("probe", {}) == [None, "explicit"]
+    finally:
+        transport.close()
+
+
+@pytest.mark.parametrize("invalid_tool", [
+    {"name": "ECHO", "inputSchema": {"type": "object"}},
+    {"name": "broken", "inputSchema": {"type": "object", "properties": []}},
+])
+def test_mcp_catalog_validation_precedes_registration(tmp_path, invalid_tool):
+    class BrokenCatalog(FakeTransport):
+        def request(self, method, params):
+            result = super().request(method, params)
+            if method == "tools/list":
+                result["tools"].append(invalid_tool)
+            return result
+
+    runtime = build_runtime(tmp_path)
+    write_mcp_config(tmp_path)
+    bridge = McpBridge(tmp_path, runtime.registry, runtime.loader, transport_factory=BrokenCatalog)
+    cache = {}
+    bridge.configure(cache)
+    with pytest.raises(McpError):
+        bridge.ensure_connected("fixture")
+    assert not cache and not bridge.transports
+    assert "mcp_fixture_echo" not in runtime.registry
+    assert not runtime.loader.loaded("mcp_fixture_echo")
 
 
 def test_mcp_connection_failure_is_isolated(tmp_path):

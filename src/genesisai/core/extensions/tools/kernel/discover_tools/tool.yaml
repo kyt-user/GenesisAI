@@ -1,0 +1,4 @@
+name: discover_tools
+category: kernel
+enabled: true
+description: 按工具名称、分类或能力关键词（如 xlsx、office、mcp、章节）查找工具，让匹配的定义在下一轮可用

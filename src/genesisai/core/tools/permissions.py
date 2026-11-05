@@ -15,7 +15,7 @@ class PermissionPolicy:
         if descriptor.category == 'kernel' and descriptor.name == 'run_commands' and args.get('operation') == 'inspect':
             return False
         spec = descriptor.spec
-        return self.mode == 'user' and (spec.network or spec.side_effect or spec.permission not in {'read', 'core'})
+        return self.mode == 'user' and (spec.launches_service or spec.network or spec.side_effect or spec.permission not in {'read', 'core'})
 
     @staticmethod
     def freeze(preview: dict) -> tuple[str, float]:

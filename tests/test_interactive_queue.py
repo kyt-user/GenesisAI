@@ -240,7 +240,7 @@ def test_windows_job_reaps_tree_when_host_is_killed(tmp_path):
     launcher = ('import subprocess,sys,os,time; print(os.getpid(),flush=True); '
                 f'subprocess.Popen([sys.executable,"-c",{child!r}]); time.sleep(8)')
     owner = ('import sys,subprocess,time; sys.path.insert(0,sys.argv[1]); '
-             'from genesisai.core.extensions.tools.shell.process_tree import owned_process; '
+             'from genesisai.shared.process_tree import owned_process; '
              'job=owned_process([sys.executable,"-c",sys.argv[2]]); job.__enter__(); time.sleep(9)')
     src = Path(__file__).resolve().parents[1] / 'src'
     handles = []

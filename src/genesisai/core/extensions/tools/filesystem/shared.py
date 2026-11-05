@@ -112,7 +112,7 @@ def walk(access, path, cap=1000):
         folders[:] = [f for f in sorted(folders) if f not in {'.git', '.venv', 'node_modules', '__pycache__'} and not Path(directory, f).is_symlink() and not getattr(Path(directory, f), 'is_junction', lambda: False)()]
         for name in sorted(files):
             count += 1
-            if count > cap:
+            if cap is not None and count > cap:
                 return
             candidate = Path(directory, name)
             try:

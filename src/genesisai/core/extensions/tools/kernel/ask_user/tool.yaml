@@ -1,0 +1,4 @@
+name: ask_user
+enabled: true
+category: kernel
+description: 关键信息缺失时暂停当前任务，向用户提问；可给出选项，也可自由回答

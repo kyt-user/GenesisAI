@@ -52,7 +52,7 @@ class Session:
             if interrupted:
                 self.commit()
         else:
-            workspace = Path(workspace or default_workspace()).resolve()
+            workspace = Path(workspace or default_workspace(self.root)).resolve()
             project_id, workspace_id = bind_workspace(self.database, workspace)
             self.record = SessionRecord(
                 self.id, str(workspace), project_id, workspace_id

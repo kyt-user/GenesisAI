@@ -1,4 +1,4 @@
-"""工具目录：判定启用/可用并全量下发工具定义。"""
+"""工具目录：管理启用状态、依赖与运行资格。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from genesisai.core.tools.registry import ToolRegistry
 
 
 class ToolCatalog:
-    """工具目录：以 enabled 与平台/依赖可用性为唯一判据，全量下发定义。"""
+    """工具目录：根据 enabled、平台和依赖提供可用工具清单。"""
 
     def __init__(self, registry: ToolRegistry, loader, store):
         self.registry = registry
@@ -38,14 +38,8 @@ class ToolCatalog:
             raise ToolError("tool_unavailable", f"工具不可用：{reason}")
         return descriptor
 
-    def definitions(self, *, history_lookup=False) -> list[dict]:
-        """全量下发：返回所有启用且平台/依赖可用的工具完整定义。"""
-        return [
-            descriptor.definition()
-            for descriptor in self.registry.values()
-            if (not history_lookup or descriptor.spec.history_lookup)
-            and self._disabled_reason(descriptor) is None
-        ]
+    def available_tools(self):
+        return [item for item in self.registry.values() if self._disabled_reason(item) is None]
 
     def inventory(self) -> dict[str, list[dict]]:
         """CLI 用清单：将工具分为启用与禁用两组。"""

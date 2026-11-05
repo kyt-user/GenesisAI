@@ -28,7 +28,7 @@ from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
 from genesisai.core.persistence.session import Session
 from genesisai.core.persistence.locking import HostLock
-from genesisai.shared.paths import application_home, default_workspace
+from genesisai.shared.paths import application_home, default_workspace, is_private_app_path
 from genesisai.core.paths import ApplicationPaths
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.core.tools.permissions import PermissionPolicy
@@ -60,7 +60,7 @@ def select_workspace(explicit: Path | None, *, create=True) -> Path:
     )
     if workspace.exists() and not workspace.is_dir():
         raise ValueError("工作区必须是目录")
-    if workspace.is_relative_to(application_home()):
+    if is_private_app_path(workspace, application_home()):
         raise ValueError("工作区不能位于应用历史目录内")
     if create:
         workspace.mkdir(parents=True, exist_ok=True)
@@ -153,7 +153,7 @@ def main(argv=None):
         description="GenesisAI：面向小型项目开发的单 Agent CLI"
     )
     parser.add_argument(
-        "--config", type=Path, help="模型 YAML，默认读取 config/model.yaml"
+        "--config", type=Path, help="指定模型 YAML，默认使用随包提供的配置"
     )
     parser.add_argument(
         "--config-dir", type=Path, help="用户配置目录，默认 ~/.genesisai"
@@ -169,7 +169,7 @@ def main(argv=None):
     parser.add_argument(
         "--workspace",
         type=Path,
-        help="任务工作目录，默认 ~/GenesisAI/workspace；历史保存在应用目录 ~/.genesisai",
+        help="任务工作目录，默认使用应用目录（GENESISAI_HOME 或 ~/.genesisai）下的 workspace",
     )
     parser.add_argument(
         "--input",
@@ -300,13 +300,13 @@ def main(argv=None):
                 path = Path(destination).resolve()
                 if not path.is_relative_to(workspace):
                     raise ValueError("输出目录必须位于用户指定的工作区内")
-                if path.is_relative_to(state_root):
+                if is_private_app_path(path, state_root):
                     raise ValueError("输出目录不能位于应用状态目录内")
 
             def leave_session():
                 nonlocal state, session_logger, model
                 if state:
-                    state.runtime.mcp.close()
+                    state.runtime.close()
                 client = getattr(model, "client", None)
                 if client:
                     client.close()
@@ -508,7 +508,6 @@ def main(argv=None):
                 runs.close()
                 if runs.future is not None:
                     runs.drain(render_progress)
-                    runs.flush_preview(view.render_progress)
                     result = runs.finish()
                     if result["status"] == "awaiting_confirmation":
                         result = state.runner.cancel()
@@ -572,7 +571,7 @@ def main(argv=None):
                     )
                 if updated:
                     if state:
-                        state.runtime.mcp.close()
+                        state.runtime.close()
                     client = getattr(model, "client", None)
                     if client:
                         client.close()
@@ -679,7 +678,6 @@ def main(argv=None):
                     if runs and runs.future is not None:
                         if runs.future.done():
                             runs.drain(render_progress)
-                            runs.flush_preview(view.render_progress)
                             stop_requested = runs.control.cancelled.is_set()
                             try:
                                 result = runs.finish()
@@ -690,7 +688,7 @@ def main(argv=None):
                                 raise
                             if (
                                 stop_requested
-                                and result["status"] == "awaiting_confirmation"
+                                and result["status"] in {"awaiting_confirmation", "awaiting_input"}
                             ):
                                 result = state.runner.cancel()
                             show(result)
@@ -833,6 +831,15 @@ def main(argv=None):
                         raise ValueError(
                             "请先处理当前会话的队列。使用 /queue 查看或 /queue clear 清空。"
                         )
+                    if (command == "/answer" or command.startswith("/answer ") or
+                            (data.get("status") == "awaiting_input" and not command.startswith("/"))):
+                        if data.get("status") != "awaiting_input":
+                            raise ValueError("当前没有待回答的问题")
+                        if state is None:
+                            activate()
+                        reply = text.partition(" ")[2] if command.startswith("/answer") else text
+                        run_and_show(lambda: state.runner.answer(reply))
+                        continue
                     if (
                         runs
                         and not command.startswith("/")
@@ -991,7 +998,7 @@ def main(argv=None):
                         runs
                         and command == "/cancel"
                         and data.get("status")
-                        not in {"running", "awaiting_confirmation", "interrupted"}
+                        not in {"running", "awaiting_confirmation", "awaiting_input", "interrupted"}
                     ):
                         console.print("当前没有运行中的任务。")
                         continue
@@ -1017,7 +1024,7 @@ def main(argv=None):
                                     runs.paused = True
                                     print_queue()
                             finally:
-                                local_state.runtime.mcp.close()
+                                local_state.runtime.close()
                             continue
                         if command.startswith("/") and not command.startswith(
                             ("/skills", "/workflow")
@@ -1193,7 +1200,7 @@ def main(argv=None):
         if environment_from_files:
             restore_environment()
         if state:
-            state.runtime.mcp.close()
+            state.runtime.close()
             client = getattr(state.runner.model, "client", None)
             if client:
                 client.close()

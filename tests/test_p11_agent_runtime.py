@@ -48,12 +48,12 @@ def tool_call(name, arguments, call_id="call_1"):
 def runtime_env(tmp_path):
     workspace = tmp_path / "workspace"
     output = workspace / "outputs"
-    store = Session(workspace)
+    store = Session(tmp_path / "app", workspace=workspace)
     store.record.apply(output=str(output), deadline=time.time() + 300)
     store.commit()
     runtime = ToolRuntime(
         store,
-        Access([], output, workspace),
+        Access([], output, store.root, workspace_root=workspace),
         permission_mode="auto",
         providers=[],
     )

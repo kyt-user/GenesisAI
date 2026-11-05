@@ -24,8 +24,13 @@ class CallLedger:
         }
         self.store.commit()
 
+    def await_input(self, call, question):
+        self.store.record.calls[call["id"]] = {"call": call, "state": "awaiting_input",
+                                               "question": question, "executed": False}
+        self.store.commit()
+
     def start(self, call: dict) -> None:
-        self.store.record.calls[call['id']] = {"call": call, "state": "started"}
+        self.store.record.calls[call['id']] = {"call": call, "state": "started", "executed": True}
         self.store.commit()
 
     def finish(self, call: dict, result: dict, elapsed_ms: int) -> None:

@@ -1,6 +1,7 @@
 from genesisai.core.tools.base import ToolSpec, object_schema
 
 SPEC = ToolSpec(
+    routes=("memory", "tool_output"),
     parameters=object_schema(
         ["ref"],
         ref={"type": "string", "minLength": 1, "maxLength": 100},

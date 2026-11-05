@@ -6,10 +6,11 @@ import json
 import time
 from pathlib import Path
 
+from genesisai.core.tools.base import SchemaConfigError, SchemaValidationError, PartialToolResult
+from genesisai.core.tools.worker import tool_worker
 from genesisai.shared.results import error_result
 from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.security import ToolError
-from genesisai.core.tools.base import SchemaConfigError, SchemaValidationError, Tool
 
 
 class ToolExecutor:
@@ -28,8 +29,6 @@ class ToolExecutor:
         execution_started = False
         try:
             state = self.context.store.record
-            if getattr(state, 'status') == 'running' and getattr(state, 'deadline') and (time.time() >= state.deadline):
-                raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
             self._validate_call(call)
             prior = self.ledger.prior(call)
             if prior and prior["state"] in {"succeeded", "failed"}:
@@ -41,54 +40,70 @@ class ToolExecutor:
                     "上次调用结果不确定；禁止自动重复执行",
                 )
 
+            if state.status == 'running' and state.deadline and (time.time() >= state.deadline):
+                raise ToolError('task_timeout', '任务执行时间已用完，进度已保存')
+
             descriptor = self.catalog.descriptor_for_execution(call["name"])
             args = json.loads(call["arguments"])
-            Tool(
-                name=descriptor.name,
-                description=descriptor.description,
-                parameters=descriptor.spec.parameters,
-            )._validate_args(args)
+            descriptor.validate_arguments(args)
             implementation = self.loader.load(descriptor)
-            preview = implementation.prepare(self.context, args)
+            deadline = started_at + descriptor.spec.timeout_seconds
+            if state.status == "running" and state.deadline:
+                deadline = min(deadline, time.monotonic() + state.deadline - time.time())
+            with tool_worker(
+                self.context, implementation, self.context.runtime.observations.adapters.get(descriptor.name), deadline
+            ) as worker:
+                preview = worker.request("prepare", args)
 
-            confirmation_required = self.policy.requires_confirmation(descriptor, args) or (
-                prior is not None and prior.get("state") == "prepared"
-            )
-            if confirmation_required:
-                if not isinstance(preview, dict):
-                    raise ToolError("permission_error", "需要确认的工具没有提供资源预览")
-                preview = {**preview, "args": args}
-                if approved is None:
-                    if not prior or prior.get("state") != "prepared" or prior.get("expires", 0) < time.time():
-                        digest_value, expires = self.policy.freeze(preview)
-                        self.ledger.prepare(call, preview, digest_value, expires)
-                    return {"pending": True, "call_id": call["id"], "preview": preview}
-                self.policy.validate(preview, prior, approved)
+                if descriptor.spec.awaits_input:
+                    waiting = state.run_runtime.get("pending_question", {})
+                    if waiting.get("call_id") != call["id"] or "answer" not in waiting:
+                        if not prior:
+                            self.ledger.await_input(call, preview)
+                        return {"call_id": call["id"], "input_request": preview}
+                confirmation_required = self.policy.requires_confirmation(descriptor, args) or (
+                    prior is not None and prior.get("state") == "prepared"
+                )
+                if confirmation_required:
+                    if not isinstance(preview, dict):
+                        raise ToolError("permission_error", "需要确认的工具没有提供资源预览")
+                    preview = {**preview, "args": args}
+                    if approved is None:
+                        if not prior or prior.get("state") != "prepared" or prior.get("expires", 0) < time.time():
+                            digest_value, expires = self.policy.freeze(preview)
+                            self.ledger.prepare(call, preview, digest_value, expires)
+                        return {"pending": True, "call_id": call["id"], "preview": preview}
+                    self.policy.validate(preview, prior, approved)
 
-            if cancellation_requested():
-                raise ToolError('user_cancelled', '任务已取消')
-            self.ledger.start(call)
-            self.ledger.store.record.calls[call['id']]['executed'] = True
-            execution_started = True
-            payload = implementation.execute(self.context, args)
-            if not isinstance(payload, dict):
-                raise ToolError("invalid_result", "工具结果必须是对象")
-            result = {
-                "call_id": call["id"],
-                "ok": True,
-                "data": payload,
-                "error": None,
-                "source_refs": payload.get("source_refs", []),
-                "artifact_refs": payload.get("artifact_refs", []),
-                "truncated": bool(payload.get("truncated", False)),
-            }
-            observer = getattr(implementation, 'observe', None)
-            registry = self.context.runtime.observations
-            if observer is not None and descriptor.name not in registry.adapters:
-                registry.register(descriptor.name, observer)
-            result['observations'] = registry.extract(descriptor.name, args, result)
-        except Exception as exc:
-            self.context.runtime.logger.error('tool_error', exc, call=call)
+                if cancellation_requested():
+                    raise ToolError('user_cancelled', '任务已取消')
+                worker.check_deadline()
+                self.ledger.start(call)
+                execution_started = True
+                payload, observations = worker.request("execute", args)
+                if not isinstance(payload, dict):
+                    raise ToolError("invalid_result", "工具结果必须是对象")
+                result = {
+                    "call_id": call["id"],
+                    "ok": True,
+                    "data": payload,
+                    "error": None,
+                    "source_refs": payload.get("source_refs", []),
+                    "artifact_refs": payload.get("artifact_refs", []),
+                    "truncated": bool(payload.get("truncated", False)),
+                }
+                if descriptor.spec.awaits_input:
+                    payload["answer"] = waiting["answer"]
+                if isinstance(payload, PartialToolResult):
+                    result.update(ok=False, data=dict(payload), error=payload.error)
+                result["observations"] = observations
+                if field := descriptor.spec.completion_field:
+                    candidate = payload.get(field)
+                    if not isinstance(candidate, str) or not candidate.strip():
+                        raise ToolError("invalid_result", "完成提议需要非空文本")
+                    result["completion_candidate"] = candidate
+        except Exception as exc:  # noqa: BLE001 - ledger covers all extension failures
+            self.context.runtime.logger.error('tool_error', exc, call=call)  # noqa: PLE1205 - structured RunLogger
             call_id = call.get("id", "") if isinstance(call, dict) else ""
             current = self.ledger.store.record.calls.get(call_id, {})
             target = preview.get("target") if isinstance(preview, dict) else None
@@ -96,14 +111,14 @@ class ToolExecutor:
                 current.get("state") == "started"
                 and descriptor is not None
                 and descriptor.spec.side_effect
-                and getattr(exc, "error_type", None) not in {"command_not_found", "command_cancelled"}
-                and target
-                and Path(target).exists()
+                and getattr(exc, "error_type", None) not in {"command_not_found", "command_cancelled", "mcp_tool_error", "patch_conflict"}
+                and (getattr(exc, "error_type", None) in {"tool_timeout", "worker_lost", "worker_cancelled"}
+                     or (target and Path(target).exists()))
             ):
                 result = error_result(
                     call,
                     "unknown_execution",
-                    "操作可能已执行但登记未完成；请检查输出，禁止自动重放",
+                    f"{getattr(exc, 'error_type', 'execution_error')}：操作可能已执行，请检查输出，禁止自动重放",
                 )
                 self.ledger.unknown(call, result)
                 return result
@@ -139,8 +154,8 @@ class ToolExecutor:
                     }
                     try:
                         self.ledger.store.commit()
-                    except Exception:
-                        pass
+                    except Exception as persist_error:  # noqa: BLE001 - retain the unknown in memory
+                        self.context.runtime.logger.error("tool_state_save_error", persist_error, call=call)  # noqa: PLE1205
                     return result
                 raise
         return result

@@ -1,11 +1,13 @@
 """内核工具：单一编辑内核。吸收 file_create/file_patch/file_move/file_delete/file_copy/directory_create。"""
 
+import difflib
 import hashlib
 import re
 import shutil
 from pathlib import Path
 
 from genesisai.shared.changes import atomic_write_bytes, backup_file, current_sha, record_change
+from genesisai.core.tools.base import PartialToolResult
 from genesisai.shared.security import ToolError
 from genesisai.shared.ids import sha
 
@@ -24,7 +26,7 @@ SOURCE_SUFFIXES = frozenset({
     ".php", ".rb", ".sql", ".sh", ".ps1", ".bat", ".cmd",
 })
 TEXT_SUFFIXES = REPORT_SUFFIXES | SOURCE_SUFFIXES
-OPERATIONS = frozenset({"create", "patch", "move", "delete", "copy", "mkdir"})
+OPERATIONS = frozenset({"create", "replace", "patch", "move", "delete", "copy", "mkdir"})
 
 
 def _require(args, key):
@@ -41,6 +43,7 @@ class Implementation:
         from pathlib import Path
         from genesisai.shared.ids import sha
         paths = [payload.get('path'), payload.get('source'), payload.get('destination')]
+        paths.extend(item["path"] for item in payload.get("applied", []))
         observations = [Observation('resource_changed', path=str(Path(p).resolve()),
                         sha256=sha(Path(p)) if Path(p).is_file() else None) for p in dict.fromkeys(paths) if p]
         validation = payload.get('validation')
@@ -51,7 +54,7 @@ class Implementation:
     def prepare(self, context, args):
         operation = args.get("operation")
         if operation not in OPERATIONS:
-            raise ToolError("validation_error", "operation 必须是 create/patch/move/delete/copy/mkdir 之一")
+            raise ToolError("validation_error", "operation 必须是 create/replace/patch/move/delete/copy/mkdir 之一")
         return getattr(self, f"_prepare_{operation}")(context, args)
 
     def execute(self, context, args):
@@ -123,22 +126,61 @@ class Implementation:
         if expected and expected.casefold() != before:
             raise ToolError("patch_conflict", "文件哈希与 expected_sha256 不一致")
         text, encoding, newline, bom = read_text_document(target)
-        updated = apply_unified_patch(text, _require(args, "patch"), newline)
+        if args.get("operation") == "replace":
+            old = _require(args, "old_text").replace("\r\n", "\n").replace("\n", newline)
+            if "new_text" not in args:
+                raise ToolError("validation_error", "replace 需要 new_text")
+            start = text.find(old)
+            if start < 0 or text.find(old, start + 1) >= 0:
+                raise ToolError("patch_conflict", "old_text 必须在目标中恰好出现一次")
+            new = args["new_text"].replace("\r\n", "\n").replace("\n", newline)
+            updated = text[:start] + new + text[start + len(old):]
+        else:
+            updated = apply_unified_patch(text, _require(args, "patch"), newline)
         payload = encode_text_document(updated, encoding, bom)
-        return target, before, hashlib.sha256(payload).hexdigest(), payload
+        diff = "\n".join(difflib.unified_diff(text.splitlines(), updated.splitlines(),
+                                             fromfile=str(target), tofile=str(target), lineterm=""))
+        return target, before, hashlib.sha256(payload).hexdigest(), payload, diff
 
     def _prepare_patch(self, context, args):
-        target, before, after, _ = self._patch_values(context, args)
-        return {"name": "editor", "operation": "patch", "args": args, "target": str(target),
-                "before_sha256": before, "after_sha256": after}
+        batch = args.get("patches")
+        if batch is not None and (args["operation"] != "patch" or any(key in args for key in ("patch", "path", "expected_sha256"))):
+            raise ToolError("validation_error", "批量补丁请仅提供 patches")
+        self.changes = [self._patch_values(context, entry) for entry in (batch or [args])]
+        if len({change[0] for change in self.changes}) != len(self.changes):
+            raise ToolError("validation_error", "批量补丁的目标文件重复")
+        previews = [{"target": str(path), "before_sha256": before, "after_sha256": after,
+                     "diff": diff[:3000], "diff_truncated": len(diff) > 3000}
+                    for path, before, after, _, diff in self.changes]
+        return {"name": "editor", "operation": args["operation"], "args": args,
+                **({"files": previews} if batch else previews[0])}
 
     def _execute_patch(self, context, args):
-        target, before, _, payload = self._patch_values(context, args)
-        backup = backup_file(context.store, target)
-        atomic_write_bytes(target, payload)
-        after = current_sha(target)
-        change = record_change(context.store, operation="patch", path=target, before_sha=before, after_sha=after, backup=backup)
-        return {"path": str(target), "before_sha256": before, "after_sha256": after, "change_id": change["id"]}
+        applied = []
+        for i, (path, before, after, payload, _) in enumerate(self.changes):
+            written = False
+            try:
+                if current_sha(path) != before:
+                    raise ToolError("patch_conflict", "预览后文件已改变")
+                backup = backup_file(context.store, path)
+                atomic_write_bytes(path, payload)
+                written = True
+                change = record_change(context.store, operation="patch", path=path, before_sha=before,
+                                       after_sha=after, backup=backup)
+                applied.append({"path": str(path), "before_sha256": before, "after_sha256": after,
+                                "change_id": change["id"]})
+            except Exception as exc:
+                if "patches" not in args:
+                    raise
+                if written:
+                    applied.append({"path": str(path), "before_sha256": before, "after_sha256": after,
+                                    "backup": backup, "change_id": None})
+                return PartialToolResult("batch_incomplete", str(exc), applied=applied, failed_path=str(path),
+                                         unattempted=[str(item[0]) for item in self.changes[i+1:]])
+        return {"applied": applied} if "patches" in args else applied[0]
+
+    _prepare_replace = _prepare_patch
+    _execute_replace = _execute_patch
 
     # --- move ---
     def _move_values(self, context, args):

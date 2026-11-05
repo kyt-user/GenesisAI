@@ -13,6 +13,11 @@ from genesisai.shared.messages import ImageAttachment
 PREVIEW_ROWS = 4
 
 
+def preview_tail(text):
+    """Bound the draft shown above the input while retaining the full answer separately."""
+    return '\n'.join(text[-4096:].rsplit('\n', PREVIEW_ROWS)[-PREVIEW_ROWS:])
+
+
 @dataclass
 class QueueItem:
     id: str
@@ -53,6 +58,7 @@ class RunQueue:
         self._output = None
         self.stage = ''
         self.preview = ''
+        self._message = []
 
     def emit(self, kind, value):
         with self._output_lock:
@@ -65,10 +71,11 @@ class RunQueue:
                 self._output = None
                 self.events.put((kind, value))
 
-    def flush_preview(self, render):
-        if self.preview:
-            render('stream_token', {'text': self.preview})
-            self.preview = ''
+    def _commit_message(self, render):
+        if self._message:
+            render('assistant_message', {'text': ''.join(self._message)})
+            self._message.clear()
+        self.preview = ''
 
     def drain(self, render, *, limit=None):
         count = 0
@@ -88,22 +95,19 @@ class RunQueue:
                 render(kind, {'text': text})
                 continue
             if kind == 'model':
-                self.flush_preview(render)
+                self._commit_message(render)
                 self.stage = f"等待模型 · 第 {value['round']} 轮"
             elif kind == 'reasoning_token':
                 if self.stage == '模型正在规划':
                     continue
                 self.stage = '模型正在规划'
             elif kind == 'tool_start':
-                self.flush_preview(render)
+                self._commit_message(render)
                 self.stage = value['name']
             elif kind == 'stream_token':
                 self.stage = '模型正在回复'
-                self.preview += value['text']
-                if '\n' in value['text'] and self.preview.count('\n') >= PREVIEW_ROWS:
-                    complete, newline, tail = self.preview.rpartition('\n')
-                    render(kind, {'text': complete + newline})
-                    self.preview = tail
+                self._message.append(value['text'])
+                self.preview = preview_tail(self.preview + value['text'])
                 continue
             render(kind, value)
 
@@ -112,10 +116,14 @@ class RunQueue:
             raise RuntimeError('当前任务尚未收尾')
         self.stage = '正在启动'
         self.preview = ''
+        self._message.clear()
         self.control = RunControl(self.emit)
         self.future = self.worker.submit(self.control.execute, action)
 
     def finish(self):
+        # The validated run result supplies the final message, including corrections.
+        self._message.clear()
+        self.preview = ''
         future, self.future = self.future, None
         item, self.starting = self.starting, None
         stopped = self.control.cancelled.is_set()
@@ -127,7 +135,7 @@ class RunQueue:
                 self.pending.appendleft(item)
             self.paused = bool(self.pending)
             raise
-        self.paused = bool(self.pending) and (stopped or result['status'] not in {'completed', 'awaiting_confirmation'})
+        self.paused = bool(self.pending) and (stopped or result['status'] not in {'completed', 'awaiting_confirmation', 'awaiting_input'})
         return result
 
     def close(self):

@@ -77,15 +77,17 @@ def test_changed_files_keep_history_and_require_fresh_evidence(tmp_path, deleted
         assert runner._answer_refs_valid(f'[{new_ref}]')
 
 
-def test_terminal_stream_is_not_erased_by_live_spinner():
+def test_terminal_final_markdown_survives_preview_cleanup():
     sink = StringIO()
     view = CliView(Console(file=sink, width=100, force_terminal=True,
                           legacy_windows=False, _environ={'TERM': 'xterm-256color'}))
     with view.working('BUSY'):
-        for chunk in ['FIRST', 'SECOND', 'THIRD']:
+        for chunk in ['**FIRST', 'SECOND', 'THIRD**']:
             view.render_progress('stream_token', {'text': chunk})
-    body = sink.getvalue().split('FIRST', 1)[1]
-    assert body.startswith('SECONDTHIRD')
+    end_of_preview = len(sink.getvalue())
+    view.render_result({'status': 'completed', 'answer': '**FIRSTSECONDTHIRD**'}, {})
+    body = sink.getvalue()[end_of_preview:]
+    assert body.count('FIRSTSECONDTHIRD') == 1 and '**' not in body
     assert '\x1b[2K' not in body
 
 

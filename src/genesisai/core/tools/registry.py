@@ -61,6 +61,11 @@ class ToolRegistry:
         self._dynamic[descriptor.name] = descriptor
         self._items[descriptor.name] = descriptor
 
+    def unregister_dynamic(self, name: str) -> None:
+        if name in self._dynamic:
+            del self._dynamic[name]
+            del self._items[name]
+
     def _scan(self) -> dict[str, ToolDescriptor]:
         items: dict[str, ToolDescriptor] = {}
         manifests: list[tuple[str | None, Path, Path]] = []

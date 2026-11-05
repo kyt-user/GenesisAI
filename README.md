@@ -4,6 +4,10 @@ GenesisAI 是面向 CLI 用户的单 Agent 开发助手。它在一个持续 Ses
 
 本项目处于开发阶段，以当前实现和最新决定为准；不维护旧接口和历史会话格式的兼容或迁移。开发约定见 [AGENTS.md](AGENTS.md)。
 
+## 使用与商业授权
+
+GenesisAI 采用 **Apache License 2.0 附 Commons Clause 1.0**，以源码可用方式发布。个人和企业可以用它开发自己的产品，包括收费产品。如果你向第三方收取费用或其他对价，而所提供的产品或服务的价值全部或主要来自 GenesisAI 的功能，请先向授权方 `kyt-user` 取得单独商业授权。完整条款见 [LICENSE](LICENSE)，常见场景见[商业使用说明](docs/商业使用说明.md)。
+
 ## 安装
 
 需要 Python 3.11 或更高版本。
@@ -36,7 +40,7 @@ python -m venv .venv
 
 内部异常会显示诊断编号，可用 `/trace` 查看脱敏堆栈位置。部分结果显示“部分完成”，不会因已取得官网页面而自动标记完成。
 
-`config/model.yaml` 只保存用户需要修改的四项信息：
+默认模型配置随包安装。要自定义模型，可复制[默认配置](src/genesisai/model/default.yaml)，修改后通过 `genesis --config <文件路径>` 加载。例如：
 
 ```yaml
 provider: deepseek
@@ -72,7 +76,7 @@ genesis
 
 普通启动先进入本地首页。直接输入第一条任务开始新会话，空输入框按 ↑ 选择当前工作区最近的五段对话，或用 `/sessions` 浏览所有工作区的历史。打开后按原顺序显示最近三轮，`/history` 显示当前对话全文。仅浏览历史无需模型密钥，也不会创建空会话。
 
-默认工作区是 `~/GenesisAI/workspace`（Windows 为 `%USERPROFILE%\GenesisAI\workspace`），首次启动自动创建，不随应用安装目录或启动位置变化。交互式和 `--prompt` 模式都可直接使用默认值；使用 `--workspace "E:\my-project"` 指定其他任务目录，不存在时自动创建。提交任务时，所选模型会收到本次请求的会话上下文和相关工具结果，任务记录和工程索引由应用维护，不向用户项目创建管理目录。
+默认工作区是 `~/.genesisai/workspace`（Windows 为 `%USERPROFILE%\.genesisai\workspace`），首次启动自动创建。设置 `GENESISAI_HOME` 后，默认工作区随应用目录变为 `GENESISAI_HOME/workspace`。交互式和 `--prompt` 模式共用这个默认值，也可以用 `--workspace "E:\my-project"` 指定其他任务目录。提交任务时，所选模型会收到本次请求的会话上下文和相关工具结果，任务记录和工程索引由应用维护。
 
 选择结果会作为可信运行时状态直接提供给 Agent。输入目录和输出目录都不得越过当前任务工作区；普通相对输出写入该工作区根目录。所有项目的历史和附件统一保存于 `~/.genesisai/`（可用 `GENESISAI_HOME` 覆盖）。会话事件与执行状态写入 `state/genesis.sqlite3`，图片写入 `assets/images/`，项目扩展配置位于 `projects/<project_id>/`。会话保存原工作目录，使用 `/status` 查看任务与历史路径。指定其他工作区不会改变历史存储位置。
 
@@ -100,6 +104,7 @@ genesis
 | ------------------------------------------------------- | ---------------------------------------- |
 | `/help`、`/status`、`/history`、`/model`        | 查看使用方法和当前状态                   |
 | `/`、`/sessions`、`/new`、`/resume`、`/cancel`、`/exit` | 选择历史会话、创建会话或管理当前运行 |
+| `/answer 文字或编号`                                    | 回答当前任务的澄清问题                   |
 | `/tools`                                              | 查看启用与禁用的工具                     |
 | `/queue`、`/queue resume`、`/queue clear` | 查看、继续或清空本次交互的排队消息 |
 | `/pet` | 唤出跟随当前会话的 Windows 桌宠，任务运行中也可使用 |
@@ -124,7 +129,7 @@ genesis
 ## 架构约束
 
 - 模型客户端只由一个 `Runner` 驱动，不创建子 Agent。
-- 模型请求携带所有已启用且满足平台和依赖条件的工具定义；Skills 按需加载。
+- 每轮按任务和已加载 Skill 选择工具定义，模型可通过 `discover_tools` 查找其他可用能力。
 - Prompt、Tool 和 Skill 使用严格 YAML 必要字段，均无版本字段。
 - 历史、任务、索引、附件、日志与备份由应用维护；项目 MCP、Skill、Workflow 位于应用目录的 `projects/<project_id>/`。
 - 项目知识携带来源、状态与版本；源码变化使依赖结论失效，原始历史仍可按引用查阅。用户项目只读取可选的 `AGENTS.md`。

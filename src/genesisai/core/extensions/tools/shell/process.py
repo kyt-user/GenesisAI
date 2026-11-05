@@ -12,7 +12,7 @@ from genesisai.shared.security import ToolError
 from genesisai.shared.ids import uid
 
 from genesisai.shared.run_control import current_run
-from .process_tree import owned_process
+from genesisai.shared.process_tree import owned_process, safe_environment
 
 
 def validate_command(command):
@@ -21,11 +21,6 @@ def validate_command(command):
     if any(not isinstance(item, str) or not item or len(item) > 4000 for item in command):
         raise ToolError('validation_error', 'command 参数无效')
     return command
-
-
-def safe_environment():
-    blocked = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')
-    return {key: value for key, value in os.environ.items() if not any(word in key.upper() for word in blocked)}
 
 
 TOOL_OUTPUT_LIMIT = 12000

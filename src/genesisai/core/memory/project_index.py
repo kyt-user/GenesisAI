@@ -9,6 +9,7 @@ import subprocess
 from genesisai.core.persistence.database import Database, encode
 from genesisai.core.memory.invalidation import invalidate_sources
 from genesisai.core.persistence.projects import repository_anchor, canonical
+from genesisai.shared.paths import is_private_app_path
 
 IGNORED = {
     ".git",
@@ -195,7 +196,7 @@ class ProjectIndex:
                 or is_link(candidate)
                 or not candidate.resolve().is_relative_to(root)
                 or not self.code_scope.permits(candidate.resolve())
-                or candidate.resolve().is_relative_to(self.database.root)
+                or is_private_app_path(candidate.resolve(), self.database.root)
             ):
                 continue
             name = Path(relative).as_posix()

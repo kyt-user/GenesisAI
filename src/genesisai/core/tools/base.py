@@ -71,6 +71,8 @@ class Tool:
                 raise SchemaConfigError(f"Schema 配置无效：不支持的类型 '{expected}'")
             if not validator(args[name]):
                 raise SchemaValidationError(f"字段 '{name}' 必须是 {expected} 类型")
+            if "enum" in definition and args[name] not in definition["enum"]:
+                raise SchemaValidationError(f"字段 '{name}' 不在允许的选项中")
             self._validate_bounds(args[name], definition, name)
 
     def _validate_schema(self) -> None:
@@ -132,6 +134,11 @@ class Tool:
             for item in value:
                 if item_schema.get("type") == "string" and not isinstance(item, str):
                     raise SchemaValidationError(f"字段 '{name}' 数组元素必须是字符串")
+                if item_schema.get("type") == "object":
+                    if not isinstance(item, dict):
+                        raise SchemaValidationError(f"字段 '{name}' 数组元素必须是对象")
+                    if "properties" in item_schema:
+                        Tool(name=name, description="", parameters=item_schema)._validate_args(item)
                 cls._validate_bounds(item, item_schema, name)
 
 
@@ -149,10 +156,23 @@ class ToolSpec:
     platforms: tuple[str, ...] = ("win32", "linux", "darwin")
     dependencies: tuple[str, ...] = ()
     history_lookup: bool = False
+    routes: tuple[str, ...] = ()
+    launches_service: bool = False
+    awaits_input: bool = False
+    external_schema: bool = False
+    completion_field: str | None = None
 
     def validate(self) -> None:
+        if not isinstance(self.routes, tuple) or not all(isinstance(r, str) and r for r in self.routes):
+            raise SchemaConfigError("Spec routes 必须是任务标签元组")
+        if type(self.launches_service) is not bool or type(self.awaits_input) is not bool:
+            raise SchemaConfigError("服务启动和用户提问标记必须为布尔值")
+        if self.awaits_input and (self.permission != "core" or self.side_effect or self.launches_service):
+            raise SchemaConfigError("提问工具必须为无副作用的 core 工具")
+        if self.completion_field is not None and (not isinstance(self.completion_field, str) or not self.completion_field):
+            raise SchemaConfigError("Spec completion_field 必须是结果中的文字字段名")
         if type(self.history_lookup) is not bool or (
-            self.history_lookup and (self.side_effect or self.network or self.permission not in {"read", "core"})
+            self.history_lookup and (self.side_effect or self.network or self.launches_service or self.awaits_input or self.permission not in {"read", "core"})
         ):
             raise SchemaConfigError("历史查阅工具必须只读且不访问网络")
         if self.permission not in {"core", "read", "write", "network", "shell"}:
@@ -163,8 +183,8 @@ class ToolSpec:
             raise SchemaConfigError("Spec 布尔字段无效")
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or self.timeout_seconds < 1:
             raise SchemaConfigError("Spec timeout_seconds 无效")
-        if isinstance(self.max_output_chars, bool) or not isinstance(self.max_output_chars, int) or self.max_output_chars < 1:
-            raise SchemaConfigError("Spec max_output_chars 无效")
+        if type(self.max_output_chars) is not int or self.max_output_chars < 256:
+            raise SchemaConfigError("Spec max_output_chars 至少为 256，以容纳完整结果的引用")
         if not isinstance(self.platforms, tuple) or not self.platforms or any(not isinstance(item, str) for item in self.platforms):
             raise SchemaConfigError("Spec platforms 无效")
         if not isinstance(self.dependencies, tuple) or any(not isinstance(item, str) or not item for item in self.dependencies):
@@ -183,6 +203,10 @@ class ToolSpec:
             raise SchemaConfigError("output 路径只适用于写入工具")
         if self.path_scope == "workspace" and self.permission not in {"read", "write", "shell"}:
             raise SchemaConfigError("workspace 路径不适用于当前权限")
+        if self.external_schema:
+            from .external_schema import validator
+            validator(self.parameters)
+            return
         Tool(name="spec_check", description="spec", parameters=self.parameters)._validate_schema()
 
     def unavailable_reason(self) -> str | None:
@@ -203,8 +227,33 @@ class ToolDescriptor:
     directory: Path
     spec: ToolSpec
 
+    def validate_arguments(self, args):
+        if self.spec.external_schema:
+            from .external_schema import validator
+            if not isinstance(args, dict):
+                raise SchemaValidationError("工具参数必须是对象")
+            error = next(validator(self.spec.parameters).iter_errors(args), None)
+            if error:
+                raise SchemaValidationError(f"{error.json_path}: {error.message}")
+        else:
+            Tool(name=self.name, description=self.description, parameters=self.spec.parameters)._validate_args(args)
+
     def definition(self) -> dict:
         return Tool(name=self.name, description=self.description, parameters=self.spec.parameters).to_openai_format()
+
+
+class PartialToolResult(dict):
+    """A failed operation with known partial results and observations."""
+    def __init__(self, code, message, **data):
+        super().__init__(data)
+        self.error = {"code": code, "message": message, "retryable": False}
+
+
+class HostBoundTool:
+    """Adapter for a persistent host-owned service, e.g. a live MCP connection."""
+
+    def __init__(self, service):
+        self.host_service = service
 
 
 @dataclass
@@ -216,6 +265,9 @@ class ToolContext:
     network: Any
     providers: list
     runtime: Any = None
+    # Explicitly injected live clients keep their identity on the host.
+    hosted_network: bool = True
+    hosted_providers: bool = True
 
 
 def object_schema(required: list[str], **properties) -> dict:

@@ -19,7 +19,7 @@ DATASET = Path(__file__).parent / "python_development_dataset" / "manifest.yaml"
 
 
 def test_default_workspace_is_independent_of_launch_directory(tmp_path):
-    assert default_workspace() == tmp_path / "home" / "GenesisAI" / "workspace"
+    assert default_workspace() == tmp_path / "home" / ".genesisai" / "workspace"
     assert select_workspace(None) == default_workspace()
     assert default_workspace().is_dir()
 
@@ -64,7 +64,7 @@ def test_cli_rejects_input_and_output_outside_selected_workspace(tmp_path):
 
     assert cli.main(["--workspace", str(workspace), "--input", str(outside)]) == 2
     assert cli.main(["--workspace", str(workspace), "--output", str(outside)]) == 2
-    assert cli.main(["--workspace", str(workspace), "--output", str(workspace / ".genesis" / "out")]) == 2
+    assert cli.main(["--workspace", str(tmp_path), "--output", str(application_home() / "state")]) == 2
 
 
 def test_noninteractive_cli_maintains_memory_outside_project(tmp_path, monkeypatch):

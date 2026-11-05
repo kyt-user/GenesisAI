@@ -1,9 +1,27 @@
 """Keep each command and its descendants inside one owned process group."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import os
 import signal
 import subprocess
+
+
+# Supervised workers report nested POSIX groups, since setsid detaches those
+# commands from the outer tool group. Windows jobs already include nested jobs.
+group_listener = ContextVar("process_group_listener", default=None)
+
+
+def safe_environment():
+    blocked = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')
+    return {key: value for key, value in os.environ.items() if not any(word in key.upper() for word in blocked)}
+
+
+def kill_group(pid):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 def _kill_on_job_close(kernel, job):
@@ -32,13 +50,15 @@ def _kill_on_job_close(kernel, job):
 def owned_process(command, **options):
     if os.name != 'nt':
         with subprocess.Popen(command, start_new_session=True, **options) as process:
+            listener = group_listener.get()
             try:
+                if listener:
+                    listener(process.pid, True)
                 yield process
             finally:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                kill_group(process.pid)
+                if listener:
+                    listener(process.pid, False)
         return
 
     import ctypes

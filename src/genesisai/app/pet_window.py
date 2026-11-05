@@ -12,6 +12,7 @@ SHEET = Path(__file__).with_name('assets') / 'pet' / 'spritesheet.webp'
 ANIMATIONS = {
     'idle': (0, (1900, 110, 180, 2400, 110, 200), ''),
     'running': (6, (320, 170, 190, 340, 170, 300), '正在思考'),
+    'awaiting_input': (3, (160, 340, 500, 450), '等待回答'),
     'awaiting_confirmation': (3, (160, 340, 500, 450), '等待确认'),
     'completed': (4, (180, 190, 260, 300, 200), '已完成'),
     'failed': (5, (180, 180, 240, 1300), '执行失败'),

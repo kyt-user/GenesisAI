@@ -2,6 +2,7 @@ from genesisai.core.tools.base import ToolSpec, object_schema
 
 
 SPEC = ToolSpec(
+    routes=('direct_answer', 'local_files', 'file_management', 'coding', 'revision', 'creative'),
     parameters=object_schema(
         ["operation"],
         operation={"type": "string", "minLength": 1, "maxLength": 20},
@@ -9,6 +10,12 @@ SPEC = ToolSpec(
         content={"type": "string", "maxLength": 100000},
         source={"type": "string", "minLength": 1, "maxLength": 2000},
         destination={"type": "string", "minLength": 1, "maxLength": 2000},
+        old_text={"type": "string", "minLength": 1, "maxLength": 100000},
+        new_text={"type": "string", "maxLength": 100000},
+        patches={"type": "array", "minItems": 1, "maxItems": 20, "items": object_schema(
+            ["path", "patch"], path={"type": "string", "minLength": 1, "maxLength": 2000},
+            patch={"type": "string", "minLength": 1, "maxLength": 100000},
+            expected_sha256={"type": "string", "minLength": 64, "maxLength": 64})},
         patch={"type": "string", "minLength": 1, "maxLength": 100000},
         expected_sha256={"type": "string", "minLength": 64, "maxLength": 64},
         source_refs={"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 2000}, "maxItems": 100},

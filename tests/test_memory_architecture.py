@@ -393,6 +393,7 @@ def test_registered_tools_and_verifier_complete_without_core_dispatch(
                     parameters=object_schema([]),
                     permission=permission,
                     side_effect=permission == "write",
+                    routes=("coding",) if permission == "write" else (),
                 ),
             ),
             implementation,

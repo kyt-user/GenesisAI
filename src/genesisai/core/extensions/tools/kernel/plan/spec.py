@@ -2,6 +2,7 @@ from genesisai.core.tools.base import ToolSpec, object_schema
 
 
 SPEC = ToolSpec(
+    routes=('coding',),
     parameters=object_schema(
         ["steps", "acceptance"],
         steps={"type": "array", "items": {"type": "string", "minLength": 1, "maxLength": 500}, "minItems": 1, "maxItems": 30},

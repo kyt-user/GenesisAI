@@ -89,7 +89,7 @@ class DevelopmentPolicy:
         """代码修改后注入自动测试调用进行验证。"""
         d = runner.store.record
         state = d.run_runtime
-        available = {item["function"]["name"] for item in runner.runtime.definitions()}
+        available = {item["name"] for item in runner.runtime.inventory()["enabled"]}
         selected = None
         for planner in self.verifiers.values():
             selected = planner(d.workspace, state, available)

@@ -131,24 +131,27 @@ def test_running_prompt_keeps_editable_draft_across_progress_and_completion():
             runs.close()
 
 
-def test_streaming_queue_commits_lines_and_renders_unfinished_line_once():
+def test_streaming_queue_keeps_a_preview_and_commits_one_message_before_tools():
     from genesisai.app.run_queue import RunQueue
 
     runs = RunQueue()
     output = []
     def render(kind, payload):
-        assert kind == 'stream_token'
-        output.append(payload['text'])
+        output.append((kind, payload))
 
     try:
         runs.emit('stream_token', {'text': 'a\nb\nc\nfirst'})
         runs.emit('stream_token', {'text': ' line\nsecond '})
         runs.emit('stream_token', {'text': 'line'})
         runs.drain(render)
-        assert output == ['a\nb\nc\nfirst line\n'] and runs.preview == 'second line'
-        runs.flush_preview(render)
-        runs.flush_preview(render)
-        assert ''.join(output) == 'a\nb\nc\nfirst line\nsecond line'
+        assert not output and runs.preview == 'b\nc\nfirst line\nsecond line'
+        runs.emit('tool_start', {'name': 'read_files'})
+        runs.drain(render)
+        assert output == [
+            ('assistant_message', {'text': 'a\nb\nc\nfirst line\nsecond line'}),
+            ('tool_start', {'name': 'read_files'}),
+        ]
+        assert not runs.preview
     finally:
         runs.close()
 

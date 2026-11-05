@@ -3,6 +3,9 @@
 吸收原 shell_run、test_run、python_project，并承载 git_* 等命令式读取。
 """
 
+from pathlib import Path
+import re
+
 from genesisai.shared.security import ToolError
 from genesisai.core.extensions.tools.shell.process import run_process, validate_command
 from genesisai.core.extensions.tools.shell.python_support import (
@@ -13,23 +16,27 @@ from genesisai.core.extensions.tools.shell.python_support import (
 )
 
 
-_TEST_HINTS = frozenset({"pytest", "nose", "unittest", "jest", "vitest", "mocha", "npm", "cargo", "go", "dotnet", "mvn", "gradle", "pytest.exe"})
-
-
-def _looks_like_test(command) -> bool:
-    if not command:
-        return False
-    names = {part.casefold() for part in command[:2]}
-    if names & _TEST_HINTS:
-        return True
-    joined = " ".join(command).casefold()
-    return "test" in joined or "pytest" in joined
+def _test_entrypoint(command):
+    executable = Path(command[0]).name.casefold().removesuffix(".exe").removesuffix(".cmd")
+    args = command[1:]
+    if any(word in {"--help", "-h", "--version", "-V", "--collect-only", "--co", "--fixtures",
+                    "--listTests", "--showConfig", "--no-run", "--list"} for word in args):
+        return None
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", executable) and args[:1] == ["-m"]:
+        executable, args = (args[1], args[2:]) if len(args) > 1 else ("", [])
+    if executable in {"pytest", "unittest"}:
+        return executable
+    if executable in {"npm", "cargo", "go", "dotnet", "mvn", "gradle"} and args[:1] == ["test"]:
+        return executable
+    return None
 
 
 class Implementation:
     @staticmethod
     def observe(args, payload):
         from genesisai.core.tools.observations import Observation
+        if payload.get("passed") and not payload.get("summary", {}).get("passed"):
+            return []
         if 'summary' in payload and type(payload.get('passed')) is bool:
             return [Observation('verification', passed=payload['passed'], detail=str(payload.get('command', '')))]
         return []
@@ -42,6 +49,8 @@ class Implementation:
 
     def _resolve(self, context, args):
         operation = args.get("operation", "run")
+        if operation not in {"inspect", "run"} or (operation == "inspect" and args.get("background")):
+            raise ToolError("validation_error", "后台任务仅支持 run 操作")
         root = self._root(context, args)
         if operation == "inspect":
             return operation, None, root, args.get("timeout_seconds", 300), None
@@ -66,16 +75,21 @@ class Implementation:
         if operation == "inspect":
             return {"name": "run_commands", "operation": "inspect", "target": str(root)}
         return {"name": "run_commands", "operation": "run", "command": command,
+                "background": args.get("background", False),
                 "target": str(root), "timeout_seconds": timeout, "detected": detection}
 
     def execute(self, context, args):
         operation, command, root, timeout, detection = self._resolve(context, args)
         if operation == "inspect":
             return inspect_python_project(root)
-        is_test = detection is not None or _looks_like_test(command)
+        if args.get("background"):
+            job = context.runtime.jobs.start(command, str(root), timeout)
+            context.store.record.run_runtime["background_jobs"] = True
+            return job
+        is_test = detection is not None or _test_entrypoint(command) is not None
         result = run_process(context, command, root, timeout, kind="test" if is_test else "shell")
         if is_test:
-            framework = (detection or {}).get("test_framework", "custom")
+            framework = (detection or {}).get("test_framework") or _test_entrypoint(command)
             result.update(
                 framework=framework,
                 selected_automatically=detection is not None,

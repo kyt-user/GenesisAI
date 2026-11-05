@@ -168,6 +168,15 @@ def parse_test_summary(framework: str, stdout: str, stderr: str, exit_code: int)
         errors = re.search(r"errors=(\d+)", text)
         summary["failed"] = int(failures.group(1)) if failures else 0
         summary["errors"] = int(errors.group(1)) if errors else 0
+    elif framework in {"npm", "cargo", "go", "dotnet", "mvn", "gradle"}:
+        markers = re.findall(r"\b(\d+) (?:passed|passing)\b|^\s*# pass (\d+)|\bPassed:\s*(\d+)", text, re.M | re.I)
+        summary["passed"] = sum(int(next(filter(None, m))) for m in markers)
+        if framework == "go":
+            summary["passed"] = len(re.findall(r"^ok\s+(?!.*\[no tests to run\]).+$", text, re.M))
+        if framework == "mvn":
+            for ran, failures, errors, skipped in re.findall(
+                    r"Tests run: (\d+), Failures: (\d+), Errors: (\d+), Skipped: (\d+)", text):
+                summary["passed"] = max(summary["passed"], int(ran)-int(failures)-int(errors)-int(skipped))
     elif framework == "compileall":
         summary["passed"] = 1 if exit_code == 0 else 0
         summary["errors"] = 0 if exit_code == 0 else 1

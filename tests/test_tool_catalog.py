@@ -30,11 +30,11 @@ def definition_names(runtime):
     return [item["function"]["name"] for item in runtime.definitions()]
 
 
-def test_definitions_are_all_enabled_and_available_tools(runtime):
+def test_definitions_select_a_subset_of_enabled_and_available_tools(runtime):
     inventory = runtime.inventory()
     enabled = {item["name"] for item in inventory["enabled"]}
 
-    assert set(definition_names(runtime)) == enabled
+    assert {"discover_tools", "attempt_completion"} <= set(definition_names(runtime)) < enabled
     assert "read_files" in enabled and "editor" in enabled
     assert all(item.get("reason") for item in inventory["disabled"])
     assert enabled | {item["name"] for item in inventory["disabled"]} == set(runtime.registry._items)

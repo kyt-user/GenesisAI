@@ -1,0 +1,4 @@
+name: stop_job
+enabled: true
+category: kernel
+description: 停止指定会话后台作业及其子进程

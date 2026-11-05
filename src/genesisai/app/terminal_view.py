@@ -11,11 +11,12 @@ import time
 from rich import box
 from rich.console import Console, Group
 from rich.highlighter import JSONHighlighter
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from genesisai.app.answer_markdown import AnswerMarkdown
 from genesisai.app.command_input import COMMANDS, TaskInput
+from genesisai.app.run_queue import preview_tail
 from genesisai.shared.messages import content_text
 from genesisai.app.select import is_interactive, select
 from genesisai.app.terminal_text import terminal_text
@@ -43,6 +44,7 @@ class CliSnapshot:
 STATUS_STYLE = {
     "partial": ("! 部分完成", "yellow"),
     "completed": ("✓ 任务完成", "green"),
+    "awaiting_input": ("？ 等待回答，可输入编号或文字", "yellow"),
     "awaiting_confirmation": ("◆ 等待确认", "yellow"),
     "running": ("● 运行中", "cyan"),
     "failed": ("× 运行失败", "red"),
@@ -183,7 +185,7 @@ class CliView:
             else:
                 value = "—"
             table.add_row(Text(labels[group], style=styles[group]), value)
-        footer = Text("\n所有已启用工具在每次模型请求中全量下发；不可用工具按平台/依赖自动剔除。", style="dim")
+        footer = Text("\n模型按任务选用工具，需要其他能力时可通过 discover_tools 查找。", style="dim")
         self.console.print(Panel(Group(table, footer), title=f"Tools · {total}", title_align="left", border_style="cyan"))
 
     def render_changes(self, changes: list[dict], run_id: str | None) -> None:
@@ -303,7 +305,7 @@ class CliView:
             self.console.print(Text(terminal_text(question)))
             if answer:
                 self.console.print(Text('GenesisAI', style='bold cyan'))
-                self.console.print(Markdown(terminal_text(answer)))
+                self._print_answer(answer)
 
     def render_opened(self, store):
         self.console.print(Text(f'已打开历史会话 · {store.id} · {store.workspace}', style='bold'))
@@ -312,6 +314,9 @@ class CliView:
         if store.record.status == 'awaiting_confirmation' and store.record.pending:
             call = store.record.pending[0]
             self.render_confirmation(call['name'], store.record.calls[call['id']].get('preview') or {})
+        elif store.record.status == 'awaiting_input':
+            self.console.print(Text(terminal_text(store.record.answer)))
+            self.console.print('输入选项编号或文字继续当前任务，也可以 /cancel。')
         elif store.record.status == 'interrupted':
             self.console.print('上次运行已中断。输入 /resume 继续，或 /cancel 取消。')
 
@@ -325,6 +330,9 @@ class CliView:
         self.console.print(Text('每行一个事件；正文不截断，认证信息脱敏。', style='dim'))
 
     def render_progress(self, kind: str, value: dict) -> None:
+        if kind == 'assistant_message':
+            self._print_answer(value['text'])
+            return
         if kind == 'command_output':
             self.console.print(Text(terminal_text(value['text'])), end='')
             return
@@ -334,8 +342,7 @@ class CliView:
                 self.console.print(Text("💭 正在规划…", style="dim"))
             return
         if kind == "stream_token":
-            # Live 动画会清除当前行，必须先停止再输出未换行的正文片段。
-            if self._working_status is not None:
+            if self._working_status is not None and not self.console.is_terminal:
                 self._working_status.stop()
                 self._working_status = None
             # 如果需要，退出推理模式。
@@ -347,25 +354,26 @@ class CliView:
             text = value.get("text", "")
             self._stream_chars += len(text)
             self._streamed_text += text
-            self.console.print(Text(terminal_text(text)), end="", highlight=False)
+            if self.console.is_terminal:
+                if self._working_status is not None:
+                    self._working_status.update(Text(terminal_text(preview_tail(self._streamed_text))))
+            else:
+                # Redirected output is append-only; preserve the Markdown source as it arrives.
+                self.console.print(Text(terminal_text(text)), end="", highlight=False)
             return
         if kind == "model":
             if self._streaming:
-                self.console.print()
-                if value.get("retry"):
-                    self.console.print("响应中断，正在重试…", style="dim")
-            self._streaming = False
-            self._streamed_text = ''
+                self._end_stream(intermediate=True)
+            if value.get("retry"):
+                self.console.print("响应中断，正在重试…", style="dim")
             # 重置新一轮的推理状态。
             self._reasoning_active = False
             if self._working_status is not None:
                 self._working_status.update('正在分析任务 · Ctrl+C 停止')
             return
         if kind == "tool_start":
-            # 如果正在流式输出，先干净地结束再显示工具。
             if self._streaming:
-                self.console.print()  # ensure newline
-                self._streaming = False
+                self._end_stream(intermediate=True)
             name = value["name"]
             self._running_tools.append(name)
             label = TOOL_LABELS.get(name, name)
@@ -400,30 +408,17 @@ class CliView:
             self.console.print(f"[yellow]⟳[/yellow] [dim]自动验证 · 第 {value.get('round', 1)} 轮[/dim]")
             return
 
-    def render_result(self, result: dict, data: dict) -> None:
-        # 如果流式传输已经显示了答案，就渲染一个紧凑的元数据栏。
-        streamed_same_answer = self._streaming and self._streamed_text == (result.get('answer') or '')
-        if self._streaming:
-            self._streaming = False
-            self._stream_chars = 0
-            self._streamed_text = ''
-            self.console.print()  # newline after streamed content
-        if streamed_same_answer:
-            status = result.get("status", "failed")
-            label, style = STATUS_STYLE.get(status, (status, "white"))
-            footer = Text()
-            footer.append(f"{label}", style=f"bold {style}")
-            footer.append(f"  ·  轮次 {data.get('rounds', 0)}", style="dim")
-            footer.append(f"  ·  工具 {data.get('tool_count', 0)}", style="dim")
-            total_tokens = (data.get("usage") or {}).get("total_tokens")
-            if total_tokens is not None:
-                footer.append(f"  ·  Token {total_tokens}", style="dim")
-            self.console.print(footer)
-            return
-        status = result.get("status", "failed")
-        label, style = STATUS_STYLE.get(status, (status, "white"))
-        answer = result.get("answer") or "(无内容)"
-        evidence = {item['source_ref']: item for item in (data.get('run_runtime') or {}).get('evidence', {}).values()}
+    def _end_stream(self, *, intermediate=False):
+        if self.console.is_terminal:
+            if intermediate:
+                self._print_answer(self._streamed_text)
+        else:
+            self.console.print()
+        self._streaming = False
+        self._stream_chars = 0
+        self._streamed_text = ''
+
+    def _print_answer(self, answer, evidence=None):
         def readable_source(match):
             ref = match.group(1)
             item = evidence.get(ref)
@@ -431,18 +426,29 @@ class CliView:
                 return match.group(0)
             title = str(item.get('title') or '来源').replace('[', '').replace(']', '').replace('\n', ' ')
             url = str(item.get('canonical_url') or '').replace('(', '%28').replace(')', '%29')
-            return f'[{title}]({url})（{url}）'
-        answer = re.sub(r'\[?(src_[0-9a-f]{16})\]?', readable_source, str(answer))
-        if self.console.width < 100:
-            answer = self._narrow_tables(answer)
+            return f'[{title}]({url})' if url else title
+        if evidence:
+            answer = re.sub(r'\[?(src_[0-9a-f]{16})\]?', readable_source, answer)
+        hyperlinks = self.console.is_terminal and not self.console.legacy_windows
+        self.console.print(AnswerMarkdown(answer, hyperlinks=hyperlinks))
+
+    def render_result(self, result: dict, data: dict) -> None:
+        answer = result.get('answer') or '(无内容)'
+        already_printed = not self.console.is_terminal and self._streaming and self._streamed_text == answer
+        if self._streaming:
+            self._end_stream()
+        status = result.get('status', 'failed')
+        label, style = STATUS_STYLE.get(status, (status, 'white'))
+        self.console.print(Text(label, style=style))
+        if not already_printed:
+            evidence = {item['source_ref']: item for item in (data.get('run_runtime') or {}).get('evidence', {}).values()}
+            self._print_answer(answer, evidence)
         footer = Text()
         footer.append(f"轮次 {data.get('rounds', 0)}", style="dim")
         footer.append(f"   工具 {data.get('tool_count', 0)}", style="dim")
         total_tokens = (data.get("usage") or {}).get("total_tokens")
         if total_tokens is not None:
             footer.append(f"   Token {total_tokens}", style="dim")
-        self.console.print(Text(label, style=style))
-        self.console.print(Markdown(terminal_text(answer)))
         self.console.print(footer)
 
     def render_confirmation(self, tool_name: str, preview: dict) -> None:
@@ -450,7 +456,10 @@ class CliView:
         body.append("工具    ", style="dim")
         body.append(terminal_text(tool_name), style="bold yellow")
         body.append("\n目标    ", style="dim")
-        body.append(terminal_text(preview.get("target", "未知")), style="white")
+        target = preview.get("target") or (f"{len(preview['files'])} 个文件" if preview.get("files") else "未知")
+        body.append(terminal_text(target), style="white")
+        if preview.get("background"):
+            body.append(f"\n后台作业 · 最长 {preview['timeout_seconds']} 秒", style="yellow")
         args = preview.get("args") or {}
         operation = preview.get("operation")
         if operation:
@@ -462,8 +471,11 @@ class CliView:
                 body.append('\n\n' + terminal_text(content[:800]))
                 if len(content) > 800:
                     body.append('\n…预览已截断', style='dim')
-        elif operation == 'patch':
-            body.append('\n\n' + terminal_text(str(args.get('patch', ''))[:1200]))
+        elif operation in {'patch', 'replace'}:
+            for change in preview.get('files', [preview]):
+                body.append('\n\n' + terminal_text(change.get('diff', '')))
+                if change.get('diff_truncated'):
+                    body.append('\n…预览已截断', style='dim')
         elif args.get('source'):
             body.append('\n来源  ' + terminal_text(args['source']))
         elif args and not preview.get('command') and tool_name != 'fetch_web_content':
@@ -481,25 +493,6 @@ class CliView:
         self.console.print(
             Panel(body, title="◆ 操作确认", title_align="left", border_style="yellow", box=box.ROUNDED)
         )
-
-    @staticmethod
-    def _narrow_tables(answer):
-        """在窄终端上将普通 Markdown 表格渲染为字段列表。"""
-        lines = answer.splitlines()
-        output, index = [], 0
-        while index < len(lines):
-            if index + 1 < len(lines) and lines[index].strip().startswith('|') and re.fullmatch(r'[\s|:\-]+', lines[index + 1]) and '-' in lines[index + 1]:
-                headers = [cell.strip() for cell in lines[index].strip().strip('|').split('|')]
-                index += 2
-                while index < len(lines) and lines[index].strip().startswith('|'):
-                    cells = [cell.strip() for cell in lines[index].strip().strip('|').split('|')]
-                    output.extend(['', '- ' + '；'.join(f'{headers[i] if i < len(headers) else "信息"}：{cell}' for i, cell in enumerate(cells))])
-                    index += 1
-                output.append('')
-            else:
-                output.append(lines[index])
-                index += 1
-        return '\n'.join(output)
 
     def render_error(self, message: str, *, title="错误") -> None:
         self.console.print(Text.assemble(('× ' + title + '\n', 'red bold'), (message, '')))

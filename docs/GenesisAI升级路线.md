@@ -1,5 +1,7 @@
 # GenesisAI 升级路线
 
+> 历史设计记录。工具下发与执行契约已在 2026-11-05 更新，现行行为见[用户指南 §5](用户指南.md)。
+
 日期：2026-09-10
 状态：P0、P1、P1.1 已形成当前基线；P2～P6 任务集与阶段验收标准已编写；P7 作为独立产品仿真总验收；代码实施尚未开始
 适用范围：GenesisAI 从“网络搜索与本地资料整理 CLI”升级为“面向程序员的本地单 Agent CLI”
@@ -208,7 +210,7 @@ Observability / Evaluation
 
 ### 7.2 用户配置
 
-`config/model.yaml` 只保留用户通常需要修改的通用字段：
+随包提供的 `src/genesisai/model/default.yaml` 只保留用户通常需要修改的通用字段：
 
 ```yaml
 provider: deepseek

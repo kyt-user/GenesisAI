@@ -2,6 +2,7 @@ from genesisai.core.tools.base import ToolSpec, object_schema
 
 
 SPEC = ToolSpec(
+    routes=('direct_answer', 'local_files', 'file_management', 'coding'),
     parameters=object_schema(
         ["path"],
         path={"type": "string", "minLength": 1, "maxLength": 2000},

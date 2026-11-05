@@ -1,0 +1,4 @@
+name: read_job
+enabled: true
+category: kernel
+description: 列出本会话后台作业，或按 job_id 查询状态和分页输出

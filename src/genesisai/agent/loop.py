@@ -25,7 +25,6 @@ from genesisai.shared.ids import uid
 from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
 from genesisai.shared.messages import UserInput, content_text
-from genesisai.shared.results import result_content
 
 
 class ContextLimitError(ValueError):
@@ -116,6 +115,7 @@ class Runner(RecoveryMixin):
             "limit_reached": "partial",
             "failed": "failed",
             "cancelled": "cancelled",
+            "awaiting_input": "await_input",
             "awaiting_confirmation": "await_confirmation",
             "interrupted": "interrupted",
         }.get(value)
@@ -134,7 +134,7 @@ class Runner(RecoveryMixin):
                 "tool_activity": self.store.record.run_runtime.get("tool_activity", []),
             }
             self.tasks.finish(value, answer or "")
-        if value == "awaiting_confirmation":
+        if value in {"awaiting_confirmation", "awaiting_input"}:
             self.store.record.run_runtime.setdefault("confirmation_paused_at", None)
             if self.store.record.run_runtime["confirmation_paused_at"] is None:
                 self.store.record.run_runtime["confirmation_paused_at"] = time.time()
@@ -167,7 +167,7 @@ class Runner(RecoveryMixin):
     @staticmethod
     def check_available(d):
         """检查是否可以开始新运行；存在未完成运行时抛出异常。"""
-        if d.status in {"running", "awaiting_confirmation", "interrupted"}:
+        if d.status in {"running", "awaiting_confirmation", "awaiting_input", "interrupted"}:
             raise ValueError("先 /resume、处理确认或 /cancel，再提交新输入")
         if any(
             (
@@ -369,13 +369,13 @@ class Runner(RecoveryMixin):
             return self.fail(exc)
         return self.drive()
 
-    def context(self, *, recovery=False, final=False):
+    def context(self, *, recovery=False, final=False, tools=None):
         """构建当前轮次的模型上下文。"""
         try:
+            if tools is None:
+                tools = [] if final or recovery else self.runtime.definitions()
             self.store.record.run_runtime["capabilities"] = {
-                "enabled": [
-                    item["function"]["name"] for item in self.runtime.definitions()
-                ],
+                "enabled": [item["function"]["name"] for item in tools],
             }
             return self.context_budgeter.build(
                 self.store.record.run_runtime["profile"], recovery=recovery, final=final
@@ -401,10 +401,14 @@ class Runner(RecoveryMixin):
             }
         )
         d.messages.append(
-            dict(role="tool", tool_call_id=call["id"], content=result_content(result))
+            dict(role="tool", tool_call_id=call["id"], content=self.runtime.model_content(call, result))
         )
         d.failures = 0 if result["ok"] else d.failures + 1
         d.pending.pop(0)
+        if d.run_runtime.get("pending_question", {}).get("call_id") == call["id"]:
+            d.run_runtime.pop("pending_question")
+        if result.get("ok") and not d.pending and result.get("completion_candidate"):
+            d.run_runtime["completion_candidate"] = result["completion_candidate"]
         self.runtime.deliver_observations(
             result.get("observations", []), call_id=call["id"]
         )
@@ -429,6 +433,8 @@ class Runner(RecoveryMixin):
                     result = self.runtime.error(
                         call, code, "本次运行已停止，工具未执行；原因：" + code
                     )
+            if entry.get("state") == "awaiting_input":
+                self.runtime.cancel_question(call, result)
             self.append_result(call, result)
 
     def stop(self, status, message, reason=None):
@@ -496,6 +502,8 @@ class Runner(RecoveryMixin):
             return self.status(
                 "interrupted", "存在不确定调用。请检查输出并 /cancel；不会自动重放。"
             )
+        if d.status == "awaiting_input":
+            return self.status("awaiting_input")
         if d.status not in {"interrupted", "awaiting_confirmation"}:
             raise ValueError("没有可恢复的运行")
         self.store.verify_sources()
@@ -505,6 +513,35 @@ class Runner(RecoveryMixin):
             # The host can stop just after the first durable user-message checkpoint.
             self.machine.restart()
         self.machine.transition("execute", "resume")
+        return self.drive()
+
+    @staticmethod
+    def _resume_clock(d):
+        state = d.run_runtime
+        paused_at = state.get("confirmation_paused_at")
+        if paused_at is not None:
+            duration = max(0, time.time() - paused_at)
+            d.deadline += duration
+            state["paused_seconds"] = state.get("paused_seconds", 0) + duration
+            state["confirmation_paused_at"] = None
+
+    def answer(self, text):
+        d = self.store.record
+        question = d.run_runtime.get("pending_question", {})
+        if d.status != "awaiting_input" or not d.pending or question.get("call_id") != d.pending[0]["id"]:
+            raise ValueError("当前没有待回答的问题")
+        text = text.strip()
+        if not text or len(text) > 8000:
+            raise ValueError("答案长度须为 1 至 8000 个字符")
+        options = question.get("options", [])
+        if text in {str(i) for i in range(1, len(options) + 1)}:
+            text = options[int(text) - 1]
+        question["answer"] = text
+        self._resume_clock(d)
+        d.status = "running"
+        d.answer = ""
+        self.machine.transition("execute", "user_answer", save=False)
+        self.store.commit()
         return self.drive()
 
     def confirm(self, approve):
@@ -525,13 +562,7 @@ class Runner(RecoveryMixin):
     def _confirm(self, approve):
         """执行确认或拒绝操作，处理过期确认的重新预览。"""
         d = self.store.record
-        state = d.run_runtime
-        paused_at = state.get("confirmation_paused_at")
-        if paused_at is not None:
-            duration = max(0, time.time() - paused_at)
-            d.deadline += duration
-            state["paused_seconds"] = state.get("paused_seconds", 0) + duration
-            state["confirmation_paused_at"] = None
+        self._resume_clock(d)
         call = d.pending[0]
         if time.time() >= d.deadline:
             return self.stop("limit_reached", "运行已超时；确认没有执行", "deadline")
@@ -602,6 +633,12 @@ class Runner(RecoveryMixin):
                     if outcome is not None:
                         return outcome
                     continue
+                proposal = state.pop("completion_candidate", None)
+                if proposal:
+                    outcome = self._finish_answer(proposal)
+                    if outcome is not None:
+                        return outcome
+                    continue
                 decision = self.completion.decide(state)
                 final, recovery = decision == "answer", decision == "recover"
                 if final and self.machine.state not in {"verify", "recover"}:
@@ -626,21 +663,17 @@ class Runner(RecoveryMixin):
                     self.research.force_answer("model_answer_reserve")
                     continue
                 self.research.note_progress_round()
-                context = self.context(recovery=recovery, final=final)
                 tool_definitions = (
                     [] if final or recovery else self.runtime.definitions()
                 )
+                context = self.context(recovery=recovery, final=final, tools=tool_definitions)
                 response = self._call_model(context, tool_definitions)
                 if cancellation_requested():
                     return self.cancel()
                 if isinstance(response, dict):
                     return response
                 calls = [asdict(call) for call in response.tool_calls or []]
-                if not calls and re.search(
-                    r"<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)",
-                    response.content or "",
-                    re.I,
-                ):
+                if not calls and self._serialized_tool_markup(response.content):
                     outcome = self._recover_serialized_tool_output()
                     if outcome is not None:
                         return outcome
@@ -680,87 +713,88 @@ class Runner(RecoveryMixin):
                     continue
                 if not response.content:
                     continue
-                if self.development.development_change_required(state):
-                    outcome = self.development.recover_tool_required(self)
-                    if outcome is not None:
-                        return outcome
-                    continue
-                # 自验证：文件修改后自动运行测试。
-                if (
-                    self._needs_verification or state.get("verification_required")
-                ) and self.development.should_auto_verify(state):
-                    outcome = self.development.inject_verification_test(self)
-                    if outcome == "skip":
-                        pass  # run_commands not available; fall through to answer
-                    elif outcome is not None:
-                        return outcome
-                    else:
-                        continue
-                if self.machine.state in {"execute", "recover"}:
-                    self.machine.transition("verify", "model_answer")
-                if not self._answer_refs_valid(response.content):
-                    outcome = self._recover_bad_refs()
-                    if outcome is not None:
-                        return outcome
-                    continue
-                unsupported_prices = self._unsupported_price_claims(response.content)
-                if unsupported_prices:
-                    outcome = self._recover_unsupported_prices(unsupported_prices)
-                    if outcome is not None:
-                        return outcome
-                    continue
-                self.store.verify_artifacts(current_run_only=True)
-                EvidenceBundle(self.store).verify()
-                d.messages.append(
-                    dict(role="assistant", content=response.content, tool_calls=None)
-                )
-                self.store.commit()
-                partial = response.content.lstrip().startswith("[[PARTIAL]]")
-                answer = (
-                    response.content.lstrip().removeprefix("[[PARTIAL]]").lstrip()
-                    if partial
-                    else response.content
-                )
-                price_request = bool(
-                    re.search(
-                        r"价格|售价|多少钱|price|cost",
-                        str(state.get("objective") or ""),
-                        re.I,
-                    )
-                )
-                verified_price = (
-                    price_request
-                    and bool(self._price_amounts(response.content))
-                    and not unsupported_prices
-                    and bool(SOURCE_REF.findall(response.content))
-                )
-                if verified_price and not partial:
-                    state["stop_reason"] = "model_answer"
-                verification_incomplete = bool(state.get("verification_required"))
-                if verification_incomplete:
-                    state["stop_reason"] = "verification_failed"
-                forced = state.get("stop_reason") not in {
-                    None,
-                    "model_answer",
-                    "finish_reason_length",
-                    "empty_response",
-                    "invalid_source_reference",
-                }
-                state["stop_reason"] = state.get("stop_reason") or (
-                    "evidence_gap" if partial else "model_answer"
-                )
-                return self.status(
-                    "partial"
-                    if partial or forced or verification_incomplete
-                    else "completed",
-                    answer,
-                )
+                outcome = self._finish_answer(response.content)
+                if outcome is not None:
+                    return outcome
         except KeyboardInterrupt:
             return self.cancel()
         except ContextLimitError as exc:
             return self.stop("failed", str(exc), "context_error")
         except Exception as exc:
             return self.fail(exc)
+
+    @staticmethod
+    def _serialized_tool_markup(text):
+        return re.search(r"<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)", text or "", re.I)
+
+    def _finish_answer(self, answer_text):
+        """Validate every proposed final answer against the same evidence and task gates."""
+        d = self.store.record
+        state = d.run_runtime
+        if self._serialized_tool_markup(answer_text):
+            return self._recover_serialized_tool_output()
+        if self.development.development_change_required(state):
+            return self.development.recover_tool_required(self)
+        # 自验证：文件修改后自动运行测试。
+        if (
+            self._needs_verification or state.get("verification_required")
+        ) and self.development.should_auto_verify(state):
+            outcome = self.development.inject_verification_test(self)
+            if outcome != "skip":
+                return outcome
+        if self.machine.state in {"execute", "recover"}:
+            self.machine.transition("verify", "model_answer")
+        if not self._answer_refs_valid(answer_text):
+            return self._recover_bad_refs()
+        unsupported_prices = self._unsupported_price_claims(answer_text)
+        if unsupported_prices:
+            return self._recover_unsupported_prices(unsupported_prices)
+        self.store.verify_artifacts(current_run_only=True)
+        EvidenceBundle(self.store).verify()
+        d.messages.append(
+            dict(role="assistant", content=answer_text, tool_calls=None)
+        )
+        self.store.commit()
+        partial = answer_text.lstrip().startswith("[[PARTIAL]]")
+        answer = (
+            answer_text.lstrip().removeprefix("[[PARTIAL]]").lstrip()
+            if partial
+            else answer_text
+        )
+        price_request = bool(
+            re.search(
+                r"价格|售价|多少钱|price|cost",
+                str(state.get("objective") or ""),
+                re.I,
+            )
+        )
+        verified_price = (
+            price_request
+            and bool(self._price_amounts(answer_text))
+            and not unsupported_prices
+            and bool(SOURCE_REF.findall(answer_text))
+        )
+        if verified_price and not partial:
+            state["stop_reason"] = "model_answer"
+        verification_incomplete = bool(state.get("verification_required"))
+        if verification_incomplete:
+            state["stop_reason"] = "verification_failed"
+        forced = state.get("stop_reason") not in {
+            None,
+            "model_answer",
+            "finish_reason_length",
+            "empty_response",
+            "invalid_source_reference",
+        }
+        state["stop_reason"] = state.get("stop_reason") or (
+            "evidence_gap" if partial else "model_answer"
+        )
+        return self.status(
+            "partial"
+            if partial or forced or verification_incomplete
+            else "completed",
+            answer,
+        )
 
     def _execute_pending(self, limits):
         """执行单个待处理工具调用并更新验证状态。"""
@@ -769,7 +803,7 @@ class Runner(RecoveryMixin):
         prior = d.calls.get(call["id"])
         if prior and prior["state"] in {"unknown", "started"}:
             return self.status("interrupted", "存在不确定调用，禁止自动重放")
-        if not prior:
+        if not prior and d.run_runtime.get("pending_question", {}).get("call_id") != call["id"]:
             if d.tool_count >= limits["tools"]:
                 if not d.run_runtime["evidence_refs"] and (
                     d.run_runtime["profile"] in {"direct_answer", "local_files"}
@@ -787,6 +821,11 @@ class Runner(RecoveryMixin):
         result = self.runtime.execute(call)
         elapsed_ms = round((time.monotonic() - started) * 1000)
 
+        if "input_request" in result:
+            question = result["input_request"]
+            d.run_runtime["pending_question"] = {**question, "call_id": call["id"]}
+            options = [f"{i}. {value}" for i, value in enumerate(question["options"], 1)]
+            return self.status("awaiting_input", "\n".join([question["question"], *options]))
         if result.get("pending"):
             if cancellation_requested():
                 return self.cancel()
@@ -810,18 +849,12 @@ class Runner(RecoveryMixin):
         self.append_result(call, result)
         if cancellation_requested():
             return self.cancel()
-        if call["name"] == "attempt_completion" and result.get("ok"):
-            answer = (result.get("data") or {}).get("result")
-            if answer:
-                return self.stop("completed", answer, "attempt_completion")
         if self.research.should_force_answer():
             self.close_pending("research_complete")
         return None
 
     def _update_development_state(self, call, result):
         """Consume tool-owned facts for both direct and approved executions."""
-        if not result.get("ok"):
-            return
         state = self.store.record.run_runtime
         for item in result.get("observations", []):
             if item["kind"] == "resource_changed":
@@ -832,7 +865,7 @@ class Runner(RecoveryMixin):
                     self._needs_verification = True
                     state["verification_required"] = True
                     state["verification_succeeded"] = False
-            elif item["kind"] == "verification":
+            elif result.get("ok") and item["kind"] == "verification":
                 passed = item["passed"]
                 self._needs_verification = not passed
                 state["verification_required"] = not passed

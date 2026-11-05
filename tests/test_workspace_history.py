@@ -86,6 +86,30 @@ def test_history_is_not_accessible_as_default_workspace_task_files():
         access.write(str(store.root / 'overwrite.txt'))
 
 
+def test_custom_app_home_allows_workspace_files_and_index_only(monkeypatch, tmp_path):
+    from genesisai.core.tools.tool_runtime import ToolRuntime
+
+    root = tmp_path / 'relocated app'
+    monkeypatch.setenv('GENESISAI_HOME', str(root))
+    workspace = cli.select_workspace(None)
+    assert workspace == root / 'workspace'
+    assert cli.select_workspace(workspace / 'subproject') == workspace / 'subproject'
+    store = Session(root)
+    assert store.workspace == workspace
+    (root / 'config.json').write_text('{"value": "PRIVATE_MARKER"}', encoding='utf-8')
+    access = Access([workspace], workspace, store.root, workspace_root=workspace)
+    target = access.create('module.py', b'PUBLIC_MARKER = True')
+    assert access.read('module.py') == access.workspace_path(target, must_exist=True)
+    runtime = ToolRuntime(store, access, providers=[], permission_mode='auto')
+    runtime.project_index.refresh()
+    assert runtime.memory.search('PUBLIC_MARKER', corpus='code')
+    assert not runtime.memory.search('PRIVATE_MARKER', corpus='code')
+    with pytest.raises(ToolError, match='状态文件'):
+        runtime.access.read('../config.json')
+    with pytest.raises(ToolError, match='状态文件'):
+        runtime.access.workspace_path('../state/genesis.sqlite3', must_exist=True)
+
+
 def test_default_workspace_file_conflict_is_reported(tmp_path, capsys):
     default_workspace().parent.mkdir(parents=True)
     default_workspace().write_text('occupied')
