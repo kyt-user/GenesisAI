@@ -10,6 +10,7 @@ from genesisai.core.prompt.compaction import (
     message_units,
     project,
     project_images,
+    project_historical_results,
 )
 from genesisai.shared.context_config import ContextConfig
 from genesisai.core.prompt.providers import ContextProviders
@@ -80,19 +81,19 @@ class ContextBudgeter:
                 and fingerprint(self.store.record.messages[:count])
                 == checkpoint["source_hash"]
             ):
-                return project_images(
+                return project_historical_results(project_images(
                     checkpoint["messages"] + raw[count:],
                     self.config.max_images,
                     self.config.max_request_image_bytes,
-                )
+                ))
             self.store.get_logger().record(
                 "context_checkpoint_invalidated", source_count=count
             )
             self.store.record.context_checkpoint = None
             self.store.commit()
-        return project_images(
+        return project_historical_results(project_images(
             raw, self.config.max_images, self.config.max_request_image_bytes
-        )
+        ))
 
     def build(
         self, profile: str, *, recovery: bool = False, final: bool = False
@@ -137,7 +138,9 @@ class ContextBudgeter:
             messages.append(
                 Message(
                     role="user",
-                    content="Continue the interrupted answer using recorded evidence:\n"
+                    content=("上一条草稿因长度截断，未交付、未验证。请依据实际记录完整重写一个更短的回答，"
+                             "保留结论、原因和下一步，省略重复段落；不要续写或重复这段草稿。"
+                             "必须核对当前有效来源，以下草稿只是参考数据：\n")
                     + state["partial_response"][-8000:],
                 )
             )

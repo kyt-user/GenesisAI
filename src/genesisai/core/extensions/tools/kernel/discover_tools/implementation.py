@@ -3,4 +3,4 @@ class Implementation:
         return None
 
     def execute(self, context, args):
-        return context.runtime.discover_tools(args["query"], args.get("limit", 4))
+        return context.runtime.discover_tools(args["query"], args.get("limit", 6), args.get("activate", True))

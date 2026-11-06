@@ -183,7 +183,9 @@ def test_long_history_then_real_edit_test_and_followup_complete(tmp_path):
     runner = Runner(model, runtime)
     result = runner.start('修复 calc.py 并执行测试')
     assert result['status'] == 'completed'
-    assert store.record.context_checkpoint
+    # The prior-turn projection can now fit without a durable compaction.
+    assert 'x' * 6000 not in '\n'.join(m.content or '' for m in model.contexts[0])
+    assert 'x' * 6000 in store.record.messages[2]['content']
     assert len(store.record.messages) > original_count
     assert store.record.run_runtime['verification_succeeded']
     assert store.record.calls['verify']['result']['data']['exit_code'] == 0

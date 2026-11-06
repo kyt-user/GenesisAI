@@ -131,7 +131,7 @@ def test_runner_passes_final_stream_token_limit(tmp_path):
     response = runner._call_model(runner.context(), [])
 
     assert response.content == "done"
-    assert model.options["max_tokens"] == 600
+    assert model.options["max_tokens"] == runner.context_budgeter.config.output_reserve_tokens
 
 
 def test_ordinary_cli_answer_is_visible_before_final_chunk(tmp_path):

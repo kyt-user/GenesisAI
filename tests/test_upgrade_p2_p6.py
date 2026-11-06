@@ -54,7 +54,10 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
     assert shell["ok"] and shell["data"]["exit_code"] == 0 and "ok" in shell["data"]["stdout"]
     runtime.set_permission("user")
     blocked = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "commit", "-m", "x"], "cwd": "."}, "blocked_git")
-    assert blocked["pending"] and blocked["preview"]["command"] == ["git", "commit", "-m", "x"]
+    assert blocked["pending"]
+    program, *args = blocked["preview"]["command"]
+    assert Path(program).is_absolute() and Path(program).stem.casefold() == "git"
+    assert args == ["commit", "-m", "x"]
     runtime.set_permission("auto")
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
     status = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": "."}, "git_toplevel")

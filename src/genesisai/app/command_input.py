@@ -17,7 +17,7 @@ from genesisai.app.terminal_text import terminal_text
 COMMANDS = [
     ('/sessions', '继续历史会话', '会话'),
     ('/new', '返回工作区首页', '会话'),
-    ('/pet', '唤出 Windows 桌宠', '会话'),
+    ('/pet', '选择或切换 Windows 桌宠', '会话'),
     ('/workspace', '查看或切换工作区', '项目'),
     ('/auth', '切换模型提供商和配置密钥', '模型与权限'),
     ('/model', '切换当前提供商的模型', '模型与权限'),

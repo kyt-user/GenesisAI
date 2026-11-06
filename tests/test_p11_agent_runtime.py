@@ -5,7 +5,8 @@ import pytest
 
 from genesisai.agent.completion import CompletionValidator
 from genesisai.core.prompt.context_budgeter import ContextBudgeter
-from genesisai.shared.budgets import PROFILES, select_initial_profile
+from genesisai.shared.budgets import PROFILES
+from genesisai.core.prompt.task_protocols import select_initial_profile
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.core.prompt.composer import PromptComposer
@@ -70,6 +71,31 @@ def test_p11_profiles_are_fixed_and_conservative():
     assert select_initial_profile("你好") == "direct_answer"
     assert select_initial_profile("读取并修改 DOCX 和 XLSX") == "local_files"
     assert select_initial_profile("查询官网目前的售价") == "web_quick"
+
+
+def test_mcp_structured_links_register_candidates_without_promoting_snippets(runtime_env):
+    from genesisai.core.extensions.mcp.bridge import McpBridge
+
+    store, runtime = runtime_env
+    url = "https://example.org/item"
+    bridge = McpBridge(store.workspace, runtime.registry, runtime.loader)
+    result = bridge._content("news", "search", {
+        "content": [{"type": "text", "text": "USD 9, https://in-prose.example/"}],
+        "structuredContent": {"items": [
+            {"title": "summary", "links": {"item": url + "?utm_source=test", "original": url}},
+            {"links": {"private": "http://127.0.0.1/", "invalid": "https://user:pass@example.org/"}},
+            {"url": "file:///C:/secret"}, {"links": []}, None,
+        ]},
+    })
+    call = {"id": "m1", "name": "mcp_news_search", "arguments": "{}"}
+    runtime.research.after_execute(call, {"ok": False, "data": result})
+    assert not store.record.run_runtime["candidates"]
+    runtime.research.after_execute(dict(call, id="m2"), {"ok": True, "data": result})
+    state = store.record.run_runtime
+    assert list(state["candidates"]) == [url]
+    assert state["candidates"][url]["query_call_id"] == "m2"
+    assert state["candidates"][url]["tool_name"] == "mcp_news_search"
+    assert not state["evidence_refs"] and not store.record.sources
     assert select_initial_profile("再说一下刚才查到的售价") == "direct_answer"
 
 
@@ -147,12 +173,13 @@ def test_p11_length_recovers_once_without_tools(runtime_env):
 def test_p11_second_length_delivers_partial(runtime_env):
     _, runtime = runtime_env
     model = FakeModel(
-        Response(content="第一部分", finish_reason="length"),
-        Response(content="第二部分", finish_reason="length"),
+        Response(content="第一份草稿。", finish_reason="length"),
+        Response(content="重写后的完整句子。尚未写完的", finish_reason="length"),
     )
     result = Runner(model, runtime).start("长回答")
     assert result["status"] == "partial"
-    assert "第一部分" in result["answer"] and "第二部分" in result["answer"]
+    assert "第一份草稿" not in result["answer"] and "重写后的完整句子。" in result["answer"]
+    assert "尚未写完的" not in result["answer"]
 
 
 def test_p11_context_compacts_old_tool_bodies_and_keeps_previous_answer(runtime_env):

@@ -13,7 +13,7 @@ from genesisai.model.config import build_model, load_model_config
 from genesisai.model.settings import load_settings
 from genesisai.model.providers.catalog import PROVIDERS
 from genesisai.app import onboarding
-from genesisai.app.desktop_pet import DesktopPet
+from genesisai.app.desktop_pet import DesktopPet, PET_CHOICES
 from genesisai.app.session_picker import choose_session, session_entries
 from genesisai.app.select import is_interactive, select
 from genesisai.app.run_queue import QueueItem, RunQueue
@@ -21,7 +21,7 @@ from genesisai.app.attachments import Attachments
 from genesisai.shared.messages import UserInput
 from genesisai.shared.ids import uid
 from genesisai.app.command_input import COMMANDS
-from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
+from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
 from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
@@ -82,6 +82,7 @@ def build_cli_session(
     workspace=None,
     logger=None,
     request_timeout=DEFAULT_REQUEST_TIMEOUT,
+    max_tools=DEFAULT_MAX_TOOLS,
 ):
     """将一个持久化 Session 绑定到访问边界、Runtime、Runner 和 UI 快照。"""
     store.record.apply(grants=list(roots), output=str(output))
@@ -118,6 +119,7 @@ def build_cli_session(
         model,
         runtime,
         max_rounds=max_rounds,
+        max_tools=max_tools,
         seconds=seconds,
         request_timeout=request_timeout,
         on_event=on_event,
@@ -193,12 +195,13 @@ def main(argv=None):
         default=[],
         help="为单次输入附加本地静态图片，可重复；可省略 --prompt",
     )
-    parser.add_argument("--max-rounds", type=int, default=20)
+    parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="模型交互轮次硬上限，默认 60；单轮内部重试另受超时与重试次数限制")
+    parser.add_argument("--max-tools", type=int, default=DEFAULT_MAX_TOOLS, help="工具调用硬上限，默认 180")
     parser.add_argument(
         "--seconds",
         type=int,
         default=DEFAULT_TASK_SECONDS,
-        help="一轮任务总执行时限，默认 300 秒",
+        help="一轮任务总执行时限，默认 1800 秒；恢复同一运行不会重置",
     )
     parser.add_argument(
         "--request-timeout",
@@ -214,7 +217,7 @@ def main(argv=None):
             reconfigure(encoding="utf-8", errors="replace")
     console = Console(legacy_windows=False)
     view = CliView(console)
-    if args.max_rounds < 1 or args.seconds < 1 or args.request_timeout < 1:
+    if min(args.max_rounds, args.max_tools, args.seconds, args.request_timeout) < 1:
         parser.error("预算必须为正数")
     interactive = not one_shot and bool(getattr(sys.stdin, "isatty", lambda: False)())
     try:
@@ -260,6 +263,14 @@ def main(argv=None):
                 Maintenance.recover_after_host_lock(Database(state_root))
             pet = DesktopPet()
             lifetime.callback(pet.close)
+
+            def choose_pet():
+                current = next(i for i, choice in enumerate(PET_CHOICES) if choice[0] == pet.character)
+                picked = select(console, "选择桌宠", [(name, detail) for _, name, detail in PET_CHOICES],
+                                index=current)
+                if picked is not None:
+                    pet.show(PET_CHOICES[picked][0])
+
             runs = RunQueue() if interactive and is_interactive(console) else None
             console.record = True
             store = None
@@ -418,6 +429,7 @@ def main(argv=None):
                         model=selected_model,
                         permission_mode=mode,
                         max_rounds=args.max_rounds,
+                        max_tools=args.max_tools,
                         seconds=args.seconds,
                         request_timeout=args.request_timeout,
                         on_event=runs.emit if runs else view.render_progress,
@@ -722,7 +734,7 @@ def main(argv=None):
                                 f"{'取消中' if runs.control.cancelled.is_set() else runs.stage} · 等待 {len(runs.pending)} 项"
                             )
                         elif command == "/pet":
-                            pet.show()
+                            choose_pet()
                         elif command == "/queue":
                             print_queue()
                         elif command == "/queue clear":
@@ -794,7 +806,7 @@ def main(argv=None):
                         continue
                     awaiting = data.get("status") == "awaiting_confirmation"
                     if command == "/pet":
-                        pet.show()
+                        choose_pet()
                         continue
                     if command == "/exit":
                         if runs and runs.pending:
@@ -1012,6 +1024,7 @@ def main(argv=None):
                                 model=None,
                                 permission_mode=mode,
                                 max_rounds=args.max_rounds,
+                                max_tools=args.max_tools,
                                 seconds=args.seconds,
                                 request_timeout=args.request_timeout,
                                 on_event=view.render_progress,

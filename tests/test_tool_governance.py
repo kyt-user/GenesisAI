@@ -38,6 +38,7 @@ def test_discover_new_tool_mid_run_and_reset_next_task(env):
 
     register(runtime, "external_measure", Custom(), permission="read")
     model = FakeModel(
+        response(call("external_measure", {}, "premature")),
         response(call("discover_tools", {"query": "external_measure"}, "discover")),
         response(call("external_measure", {}, "measure")),
         Response(content="42"),
@@ -48,10 +49,29 @@ def test_discover_new_tool_mid_run_and_reset_next_task(env):
     names = lambda turn: {t["function"]["name"] for t in model.tool_definitions[turn]}
     assert "external_measure" not in names(0)
     assert "xlsx_create" not in names(0)
-    assert "external_measure" in names(1)
+    assert names(0) == names(1)
+    def system_prompt(turn):
+        return "\n".join(m.content for m in model.contexts[turn] if m.role == "system")
+
+    issue = system_prompt(1)
+    assert "当前请求未提供的工具：external_measure" in issue and "请先用 discover_tools 查找" in issue
+    assert "external_measure" in names(2)
+    assert "当前请求未提供的工具：external_measure" not in system_prompt(2)
+    assert "premature" not in store.record.calls
     assert store.record.calls["measure"]["result"]["data"]["value"] == 42
     assert runner.start("你好")["status"] == "completed"
     assert "external_measure" not in names(-1)
+
+
+def test_duplicate_ids_get_distinct_guidance_and_batch_is_not_executed(env):
+    _, _, store, runtime = env
+    duplicate = call("discover_tools", {"query": "read_files"}, "repeated")
+    model = FakeModel(response(duplicate, duplicate), Response(content="已停止"))
+    Runner(model, runtime).start("你好")
+    issue = "\n".join(m.content for m in model.contexts[1] if m.role == "system")
+    assert "调用 ID 为空或重复" in issue
+    assert "本批工具调用未执行，当前请求未提供" not in issue
+    assert "repeated" not in store.record.calls
 
 
 def test_truncated_result_is_bounded_and_exactly_readable(env):
@@ -106,14 +126,19 @@ def test_tool_deadline_kills_work_and_prevents_late_write(
     marker = tmp_path / "late"
     descendant = tmp_path / "late-child"
     started = tmp_path / "entered"
+    # The deadline includes Windows process startup and module imports. Leave
+    # enough room to enter the requested stage even during the full suite;
+    # the work still must be killed before either delayed write can occur.
+    timeout_seconds = 3
+    work_delay = 5
 
     class Slow:
         def wait(self):
             if write and stage == "execute":
-                script = f"import time; from pathlib import Path; time.sleep(1.9); Path({str(descendant)!r}).touch()"
+                script = f"import time; from pathlib import Path; time.sleep({work_delay}); Path({str(descendant)!r}).touch()"
                 subprocess.Popen([sys.executable, "-c", script])
             started.touch()
-            time.sleep(2.0)
+            time.sleep(work_delay)
             marker.touch()
 
         def prepare(self, context, args):
@@ -132,17 +157,18 @@ def test_tool_deadline_kills_work_and_prevents_late_write(
         Slow(),
         permission="write" if write else "read",
         side_effect=write,
-        timeout_seconds=1,
+        timeout_seconds=timeout_seconds,
     )
     invocation = call("slow_tool", {}, "slow")
     before = time.monotonic()
     result = runtime.execute(invocation)
-    assert started.exists() and time.monotonic() - before < 1.9
+    assert started.exists() and time.monotonic() - before < timeout_seconds + 1.5
     assert result["error"]["code"] == code
     assert not result["error"]["retryable"]
     assert store.record.calls["slow"]["executed"] is (stage == "execute")
     assert runtime.execute(invocation)["error"]["code"] == code
-    time.sleep(1.4)
+    # Wait through the whole forbidden-write window, including descendants.
+    time.sleep(work_delay + 0.2)
     assert not marker.exists() and not descendant.exists()
 
 

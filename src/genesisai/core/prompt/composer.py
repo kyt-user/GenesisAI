@@ -104,6 +104,8 @@ class PromptComposer:
             name = self.extra_protocols.get(item)
             if name and name not in names:
                 names.append(name)
+        if "web" in state.get("capability_routes", []) and "protocols/web_research.prompt.yaml" not in names:
+            names.append("protocols/web_research.prompt.yaml")
         if not final and not recovery:
             names.extend(
                 ("tools/catalog_usage.prompt.yaml", "tools/skill_usage.prompt.yaml")
@@ -138,6 +140,10 @@ class PromptComposer:
             "budget": state.get("budget", {}),
             "usage": state.get("usage", {}),
             "stop_reason": state.get("stop_reason"),
+            "任务约束": state.get("constraints", {}),
+            "局部能力限制": state.get("capability_blocks", {}),
+            "进度检查点": state.get("progress_checkpoint"),
+            "待完成验证作业": state.get("pending_verification_jobs", []),
             "沿用证据": state.get("reuse_evidence", False),
             "工具能力状态": {} if final or recovery else state.get("capabilities", {}),
             "输出恢复要求": state.get("response_issue"),

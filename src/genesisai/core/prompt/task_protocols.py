@@ -8,6 +8,41 @@ from __future__ import annotations
 
 import re
 
+from genesisai.shared.budgets import is_recall_request
+from genesisai.core.tools.selection import FORMAT_TERMS
+
+
+_URL = re.compile(r"https?://[^\s<>()]+", re.I)
+_NETWORK_DENIAL = re.compile(r"禁止联网|不要联网|不许联网|离线(?:处理|完成|操作)|do not (?:access the network|browse)|no network", re.I)
+_DISCUSSION = re.compile(r"先讨论|先规划|只讨论|只读|仅分析|不要修改|不要写|暂时不要|不要执行|do not (?:modify|edit|execute)|read.only", re.I)
+_LOCAL_ACTION = re.compile(r"修复|重构|实现|编写|修改|运行|跑测试|构建|开发|移动文件|删除文件|(?<![a-z])(?:fix|refactor|implement|pytest)(?![a-z])", re.I)
+
+
+def select_initial_profile(text: str) -> str:
+    """只选择起始工作流程；能力可组合，权限不由分类结果授予。"""
+    value = _URL.sub(" ", text.casefold())
+    if is_recall_request(value):
+        return "direct_answer"
+    if not _NETWORK_DENIAL.search(value):
+        if any(word in value for word in ("深度调研", "深入调研", "全面调研", "deep research")):
+            return "web_deep"
+        if any(word in value for word in ("专题报告", "比较并整理", "对比报告", "研究报告")):
+            return "web_normal"
+    local_action = bool(_LOCAL_ACTION.search(value))
+    local_path = bool(re.search(r"[a-z]:[\\/]|(?:^|\s)(?:\./|/[^/])", value))
+    if not _NETWORK_DENIAL.search(value) and not local_action and not local_path and (
+        _URL.search(text) or re.search(r"(?<![a-z])(?:github|gitlab)(?![a-z])", value)
+        or any(word in value for word in ("官网", "联网", "上网", "网上查", "网络查询", "搜索", "检索", "目前", "当前价格", "今天", "近期", "最新", "售价", "多少钱"))
+    ):
+        return "web_quick"
+    if any(word in value for word in ("写小说", "续写", "扩写", "角色", "章节", "故事", "剧情", "世界观", "人物设定", "情节", "写作", "创作", "第一章", "下一章")):
+        return "creative"
+    if local_action or local_path or any(word in value for word in (
+        "本地文件", "本地资料", "这个目录", "工作区", "代码", "仓库", "测试", "报错", "文件管理", "办公文档", "工作簿", "演示文稿",
+    )) or re.search(r"(?<![a-z0-9_])(?:git|bug|python|pyproject|pip|ruff|mypy|skill|docx|xlsx|pptx|pdf)(?![a-z0-9_])", value):
+        return "local_files"
+    return "direct_answer"
+
 _CONTINUATION_EXACT = {
     "开始",
     "开始吧",
@@ -59,13 +94,15 @@ class TaskProtocolSelector:
     """按关键词判定继续意图与所需协议集合（原 Runner 静态谓词，属 L4 core）。"""
 
     def is_development_continuation(self, text: str, active_task) -> bool:
-        """判断短文本是否为开发任务的继续指令。"""
+        """判断当前输入是否明确要求继续已有开发任务。"""
         if not active_task or active_task.get("status") in {"verified", "cancelled"}:
             return False
         value = _normalize(text)
-        if len(value) > 24:
+        if _DISCUSSION.search(text) or re.search(r"新任务|另一个任务|换个话题|停止|取消", text):
             return False
-        return value in _CONTINUATION_EXACT
+        return value in _CONTINUATION_EXACT or bool(re.match(
+            r"(?:请|帮我)?(?:继续(?:实现|执行|修复|修改|开发|完成)|按(?:刚才|上述|之前|这个|该)(?:的)?(?:计划|方案|清单).*(?:实现|执行|修复|完成))", value
+        ))
 
     def accepts_default_plan(self, text: str) -> bool:
         """判断文本是否表示接受默认计划。"""
@@ -76,10 +113,7 @@ class TaskProtocolSelector:
         if "coding" not in protocols:
             return False
         value = text.casefold()
-        if any(
-            phrase in value
-            for phrase in ("先讨论", "先规划", "有什么要问", "暂时不要写", "不要修改")
-        ):
+        if _DISCUSSION.search(value) or "有什么要问" in value:
             return False
         return any(
             word in value
@@ -89,6 +123,52 @@ class TaskProtocolSelector:
     def __init__(self):
         self.selectors = {}
 
+    def route(self, text: str, active_task=None, previous=None) -> dict:
+        continuation = self.is_development_continuation(text, active_task)
+        followup = continuation or bool(re.search(r"刚才|上述|上面|之前|你不是|再试|重试|为什么|怎么会|继续", text))
+        if re.search(r"新任务|另一个任务|换个话题", text):
+            followup = continuation
+        profile = "local_files" if continuation else select_initial_profile(text)
+        protocols = self.protocols_for(text)
+        if continuation and "coding" not in protocols:
+            protocols.append("coding")
+        routes = {profile, *protocols}
+        value = _URL.sub(" ", text.casefold())
+        for route, pattern in {
+            "local_files": r"\b(?:local|files?|directory|workspace)\b",
+            "testing": r"\b(?:tests?|testing|pytest)\b",
+            "web": r"\b(?:web|online|internet)\b",
+            "image": r"图片|截图|图像|image|\.png|\.webp|\.jpg",
+            "jobs": r"后台|作业|job_|background job",
+            "mcp": r"mcp", "skill": r"技能|skill",
+            "memory": r"历史|记忆|之前|上次|上一轮|memory",
+        }.items():
+            if re.search(pattern, value):
+                routes.add(route)
+        for fmt, words in FORMAT_TERMS.items():
+            if any(word in value for word in words):
+                routes.add(fmt)
+        if not _NETWORK_DENIAL.search(text) and (profile.startswith("web") or _URL.search(text) or any(w in text for w in ("联网", "上网", "官网", "查文档"))):
+            routes.add("web")
+        constraints = {"network_forbidden": bool(_NETWORK_DENIAL.search(text)), "read_only": bool(_DISCUSSION.search(text))}
+        if followup and previous:
+            routes.update(previous.get("capability_routes", []))
+            for key in constraints:
+                constraints[key] |= previous.get("constraints", {}).get(key, False)
+            if re.search(r"(?:现在)?(?:允许联网|可以联网)|联网权限已恢复", text):
+                constraints["network_forbidden"] = False
+            if self.requests_development_execution(text, protocols) and not _DISCUSSION.search(text):
+                constraints["read_only"] = False
+        return {
+            "profile": profile,
+            "protocols": protocols,
+            "capability_routes": sorted(routes),
+            "constraints": constraints,
+            "followup": followup,
+            "development_continuation": continuation and not constraints["read_only"],
+            "execution_requested": not constraints["read_only"] and (continuation or self.requests_development_execution(text, protocols)),
+        }
+
     def register(self, name, selector):
         if not name or name in self.selectors or not callable(selector):
             raise ValueError("Protocol selector requires a unique name and callable")
@@ -96,7 +176,7 @@ class TaskProtocolSelector:
 
     def protocols_for(self, text: str) -> list:
         """根据用户输入关键词推断所需的协议列表。"""
-        value = text.casefold()
+        value = _URL.sub(" ", text.casefold())
         result = []
         if any(
             word in value
@@ -111,7 +191,6 @@ class TaskProtocolSelector:
                 "编写",
                 "开发",
                 "函数",
-                "类",
                 "python",
                 "pyproject",
                 "pip",
@@ -133,7 +212,7 @@ class TaskProtocolSelector:
             )
         ):
             result.append("testing")
-        if any(word in value for word in ("git", "diff", "提交记录", "分支")):
+        if re.search(r"(?<![a-z])(?:git|diff)(?![a-z])|提交记录|分支", value):
             result.append("git_read")
         if any(
             word in value for word in ("文件", "目录", "移动", "重命名", "删除", "整理")

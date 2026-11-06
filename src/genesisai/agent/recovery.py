@@ -53,20 +53,17 @@ class RecoveryMixin:
                 int(getattr(self.model, 'generation', {}).get('max_tokens') or self.context_budgeter.config.output_reserve_tokens),
             )}
             options['timeout'] = request_limit
-            if tools == []:
-                if state.get('profile') == 'web_quick':
-                    options['max_tokens'] = min(options['max_tokens'], 900)
-                elif state.get('profile') == 'direct_answer':
-                    options['max_tokens'] = min(options['max_tokens'], 600)
             self.on_event('model', dict(round=d.rounds, retry=bool(attempts)))
             log_details = {'model_call_id': call_id, 'attempt': attempts + 1}
             if hasattr(self.model, 'bind_logging'):
                 self.model.bind_logging(self.run_logger, **log_details)
             self.run_logger.log_model_input(d.rounds, context, tools, model=getattr(self.model, 'model', type(self.model).__name__), options=options, stream=True, **log_details)
             try:
-                # Research and verification answers must pass the evidence checks before display.
+                # Answers involving sources or execution must pass validation
+                # before display, including local-file follow-up explanations.
                 preview = (not state['profile'].startswith('web')
-                           and not state.get('evidence_refs') and not state.get('execution_requested')
+                           and not self.store.record.sources and not state.get('execution_requested')
+                           and not (self.store.record.last_run_outcome or {}).get('tool_activity')
                            and not state.get('verification_required') and state.get('phase') != 'recover')
                 prefix = ''
                 started_text = False
@@ -203,10 +200,11 @@ class RecoveryMixin:
     def _handle_length(self, content):
         """处理模型输出达到长度上限的情况。"""
         state = self.store.record.run_runtime
-        if content: state['partial_response'] = (state.get('partial_response', '') + '\n' + content).strip()
+        state['partial_response'] = content.strip()
         state['recovery_counts']['length'] += 1; self.store.commit()
         if state['recovery_counts']['length'] > 1:
-            state['stop_reason'] = 'second_length'; return self.status('partial', state['partial_response'] or '模型输出两次达到长度上限。')
+            state['stop_reason'] = 'second_length'
+            return self._finish_answer(state['partial_response'], terminal=True)
         state['phase'] = 'recover'; state['stop_reason'] = 'finish_reason_length'; self.machine.transition('recover', 'finish_reason_length', save=False); self.store.commit(); return None
 
     def _recover_serialized_tool_output(self):
@@ -235,29 +233,47 @@ class RecoveryMixin:
     def _invalid_calls(self, calls, definitions):
         """检查工具调用 ID 是否重复或调用了未提供的工具。"""
         ids = [call['id'] for call in calls]
-        if len(ids) != len(set(ids)) or any((not value or value in self.store.record.calls for value in ids)): return '模型返回重复或无效工具调用 ID'
+        if (any(not isinstance(value, str) or not value.strip() or value in self.store.record.calls for value in ids)
+                or len(ids) != len(set(ids))):
+            return '本批工具调用未执行：调用 ID 为空或重复。重试时请为每个调用生成新的唯一 ID。'
         offered = {item['function']['name'] for item in definitions}
-        if any(call['name'] not in offered for call in calls): return '模型调用了当前请求未提供的工具'
+        missing = [c['name'] for c in calls if not isinstance(c['name'], str) or c['name'] not in offered]
+        if missing:
+            # Tool names in a model response are untrusted prompt input.
+            names = ', '.join(n for n in missing[:5] if isinstance(n, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,64}', n))
+            if 'discover_tools' in offered:
+                guidance = '请先用 discover_tools 查找所需工具，下一轮按下发的定义调用。'
+            elif offered:
+                guidance = '请从当前下发的工具中选择，或根据已有资料回答。'
+            else:
+                guidance = '本轮只接受文字回答，请说明已有结论或信息缺口。'
+            return f'本批工具调用未执行，当前请求未提供的工具：{names or "无效工具名"}。{guidance}'
         return None
 
     def _recover_tool_protocol(self, message):
         """处理无效工具调用的恢复流程。"""
-        state = self.store.record.run_runtime; state['recovery_counts']['tool_protocol'] += 1
+        state = self.store.record.run_runtime
+        state['recovery_counts']['tool_protocol'] += 1
         if state['recovery_counts']['tool_protocol'] > 1:
-            if state['evidence_refs']: self.research.force_answer('tool_protocol_repeated'); self.store.commit(); return None
+            if state['evidence_refs'] and state['phase'] == 'explore' and not state.get('stop_reason'):
+                self.research.force_answer('tool_protocol_repeated')
+                state['response_issue'] = '工具调用连续无效。请根据已有正文给出文字回答并说明缺口。'
+                self.store.commit()
+                return None
             return self.stop('failed', message)
-        state['stop_reason'] = None; self.store.event('tool_protocol_error', code='invalid_tool_call', retry_count=1); self.store.commit(); return None
+        state['response_issue'] = message
+        self.store.event('tool_protocol_error', code='invalid_tool_call', retry_count=1)
+        self.store.commit()
+        return None
+
+    def _available_sources(self):
+        """校验、恢复提示和终止说明共用同一份可引用来源。"""
+        evidence = set(self.store.record.run_runtime['evidence_refs'])
+        return {ref: source for ref, source in self.store.record.sources.items()
+                if not source.get('stale') and (ref in evidence or source.get('kind') in {'file', 'image'})}
 
     def _answer_refs_valid(self, content):
-        """检查回答中的来源引用是否都已登记且可引用。"""
-        refs = SOURCE_REF.findall(content)
-        evidence = set(self.store.record.run_runtime['evidence_refs'])
-        sources = self.store.record.sources
-        return not refs or all(
-            ref in sources and not sources[ref].get('stale')
-            and (ref in evidence or sources[ref].get('kind') in {'file', 'image'})
-            for ref in refs
-        )
+        return set(SOURCE_REF.findall(content)).issubset(self._available_sources())
 
     @staticmethod
     def _price_claims(content):
@@ -297,7 +313,7 @@ class RecoveryMixin:
             supported.update(self._price_claims(str(source.get('text', ''))))
         return [f'{currency} {amount}' for currency, amount in sorted(claimed - supported)]
 
-    def _recover_bad_refs(self):
+    def _recover_bad_refs(self, content):
         """处理回答中引用了不存在来源的情况。"""
         state = self.store.record.run_runtime
         counts = state['recovery_counts']
@@ -305,38 +321,67 @@ class RecoveryMixin:
         self.store.event('answer_validation_error', code='invalid_source_reference', retry_count=counts['source_reference'])
         if counts['source_reference'] > 1:
             return self.stop(
-                'partial' if state['evidence_refs'] else 'failed',
+                'partial' if self._available_sources() else 'failed',
                 self._evidence_fallback('模型连续生成了无法验证的来源引用。'),
                 'invalid_source_reference',
             )
-        allowed = ', '.join(state['evidence_refs']) or '无'
+        allowed = ', '.join(self._available_sources()) or '无'
         state['response_issue'] = (
-            '上一条回答引用了不存在或尚未读取的来源，已丢弃且不会进入会话历史。'
+            '上一条回答引用了不存在、过期或尚未读取的来源，已丢弃且不会进入会话历史。'
             f'只可引用以下 source_ref：{allowed}。没有有效来源时不要生成 source_ref。'
         )
+        paths = list(dict.fromkeys(
+            source['path'] for ref in SOURCE_REF.findall(content)
+            if (source := self.store.record.sources.get(ref, {})).get('stale')
+            and source.get('kind') == 'file' and source.get('path')
+        ))[:3]
+        record = self.store.record
+        if (paths and not state['recovery_counts'].get('length')
+                and record.rounds + 2 <= record.limits['rounds'] and record.tool_count < record.limits['tools']):
+            state['source_read_paths'] = paths
+            state['response_issue'] += ' 可用本轮 read_files 补读失效文件一次，再依据新结果完整重写；不要假定新旧引用内容相同。'
         state['phase'] = 'recover'; state['stop_reason'] = 'invalid_source_reference'; self.machine.transition('recover', 'invalid_source_reference', save=False); self.store.commit(); return None
 
     def _evidence_fallback(self, reason):
         """为终止消息补充已读取来源的信息。"""
-        state = self.store.record.run_runtime
-        refs = [ref for ref in state.get('evidence_refs', []) if ref in getattr(self.store.record, 'sources', {})]
+        refs = list(self._available_sources())
         if not refs:
             return reason + ' 本轮没有取得可引用正文。'
         sources = '、'.join(f'[{ref}]' for ref in refs[-3:])
         return reason + f' 已读取的来源为 {sources}，但当前问题尚未形成可验证答案。'
 
-    def _recover_unsupported_prices(self, amounts):
+    def _price_gap(self):
+        state = self.store.record.run_runtime
+        if state['evidence_refs']:
+            message = self._evidence_fallback('已取得正文，但现有材料不足以核实回答中的价格或比较结论。')
+        elif state['candidates']:
+            message = '已找到相关链接，但尚未取得支持所报价格的正文，无法据此给出可靠的价格结论。'
+        else:
+            message = '本轮没有取得可核实的价格资料。'
+        return self.stop('partial', message, 'unsupported_evidence_claim')
+
+    def _recover_unsupported_prices(self):
         """处理回答中包含未支持价格的情况。"""
         state = self.store.record.run_runtime
         counts = state['recovery_counts']
         counts['evidence_claim'] = counts.get('evidence_claim', 0) + 1
         self.store.event('answer_validation_error', code='unsupported_price_claim', retry_count=counts['evidence_claim'])
-        if counts['evidence_claim'] > 1:
-            return self.stop(
-                'partial' if state['evidence_refs'] else 'failed',
-                '未能生成由已读取正文支持的价格答复；已有资料已经保存。',
-                'unsupported_evidence_claim',
-            )
+        record = self.store.record
+        remaining = self.research.remaining()
+        if counts['evidence_claim'] > 1 or record.rounds >= record.limits['rounds'] or not remaining['model_calls']:
+            return self._price_gap()
+        urls = [url for url, candidate in state['candidates'].items()
+                if candidate['status'] in {'candidate', 'retryable'} and len(url) <= 2000]
+        if (urls and state['phase'] == 'explore' and not state.get('stop_reason')
+                and remaining['search_fetches'] > 0 and remaining['model_calls'] >= 2
+                and record.rounds + 2 <= record.limits['rounds'] and record.tool_count < record.limits['tools']):
+            state['price_read_candidates'] = urls[:40]
+            state['response_issue'] = (
+                '上一条回答中的金额缺少正文引用。请从 fetch_web_content 的 URL 选项中选择与所问价格'
+                '最相关的原文，只读取一次，或以 [[PARTIAL]] 回答已知内容和缺口。')
+            self.machine.transition('execute', 'read_price_source', save=False)
+            self.store.commit()
+            return None
         state['phase'] = 'recover'
         state['stop_reason'] = 'unsupported_evidence_claim'
         state['response_issue'] = (

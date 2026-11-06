@@ -27,6 +27,8 @@ class DevelopmentPolicy:
 
     def should_auto_verify(self, state: dict) -> bool:
         """判断当前状态是否满足自动验证条件。"""
+        if state.get("pending_verification_jobs"):
+            return False
         profile = state.get("profile", "")
         protocols = state.get("protocols", [])
         if profile != "local_files" and "coding" not in protocols:

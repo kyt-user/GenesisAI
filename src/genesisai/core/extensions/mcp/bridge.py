@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from itertools import islice
 from contextlib import contextmanager
 from threading import Timer
 import time
@@ -35,6 +36,28 @@ _TOOL_NAME = re.compile(r"[^a-z0-9_]")
 
 class McpError(ValueError):
     """MCP 配置或协议错误。"""
+
+
+def _candidate_links(structured):
+    """Extract explicit item links, never URLs embedded in prose or tool instructions."""
+    items = structured.get("items") if isinstance(structured, dict) else None
+    if not isinstance(items, list):
+        return []
+    candidates = {}
+    for item in items[:40]:
+        if not isinstance(item, dict):
+            continue
+        links = item.get("links")
+        urls = [item.get("url")]
+        if isinstance(links, dict):
+            urls.extend(islice(links.values(), 8))
+        for url in urls:
+            if isinstance(url, str) and len(url) <= 2000 and url.startswith(("https://", "http://")):
+                title = item.get("title")
+                candidates[url] = {"url": url, "title": title[:100] if isinstance(title, str) else ""}
+                if len(candidates) == 40:
+                    return list(candidates.values())
+    return list(candidates.values())
 
 
 @dataclass(frozen=True)
@@ -441,6 +464,9 @@ class McpBridge:
         }
         if "structuredContent" in result:
             payload["structuredContent"] = result["structuredContent"]
+            links = _candidate_links(result["structuredContent"])
+            if links:
+                payload["candidate_links"] = links
         if images:
             payload.update(images=images, source_refs=[p['image_ref'] for p in images])
         return payload

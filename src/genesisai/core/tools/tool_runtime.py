@@ -13,7 +13,7 @@ from genesisai.core.extensions.tools.shell.jobs import CommandJobs
 from genesisai.core.tools.base import ToolContext
 from genesisai.core.memory.scope import CodeScope
 from genesisai.core.tools.catalog import ToolCatalog
-from genesisai.core.tools.selection import discover, select_tools
+from genesisai.core.tools.selection import allowed_by_constraints, discover, select_tools
 from genesisai.core.tools.output import project_output
 from genesisai.core.tools.executor import ToolExecutor, error_result
 from genesisai.core.tools.ledger import CallLedger
@@ -221,20 +221,29 @@ class ToolRuntime:
             self.context.providers = value
             self.context.hosted_providers = True
 
-    def definitions(self) -> list[dict]:
+    def definitions(self, *, names=None) -> list[dict]:
         self.catalog.refresh()
+        available = self.catalog.available_tools()
+        if names is not None:
+            return [item.definition() for item in available if item.name in names]
         skill_tools = {name for skill in self.store.record.tool_runtime["active_skills"]
                        if skill in self.skills.items for name in self.skills.items[skill].tools}
-        selected = select_tools(self.catalog.available_tools(), self.store.record.run_runtime, skill_tools)
+        state = {**self.store.record.run_runtime, "pending_tools": self.store.record.pending}
+        selected = select_tools(available, state, skill_tools)
         return [item.definition() for item in selected]
 
-    def discover_tools(self, query, limit):
+    def discover_tools(self, query, limit, activate=True):
         self.catalog.refresh()
-        matches = discover(self.catalog.available_tools(), query, limit)
+        matches = discover([item for item in self.catalog.available_tools()
+                            if allowed_by_constraints(item, self.store.record.run_runtime)], query, limit)
         state = self.store.record.run_runtime
-        selected = [*state.get("discovered_tools", []), *(item["name"] for item in matches)]
-        state["discovered_tools"] = list(dict.fromkeys(reversed(selected)))[:8][::-1]
-        return {"available_next_round": matches}
+        if activate:
+            selected = [*state.get("discovered_tools", []), *(item["name"] for item in matches)]
+            state["discovered_tools"] = list(dict.fromkeys(reversed(selected)))[::-1]
+            state["explicit_discovery"] = next((item["name"] for item in matches if item["name"].casefold() == query.strip().casefold()), None)
+        selected_names = {item["function"]["name"] for item in self.definitions()} if activate else set()
+        return {"available_next_round": [item for item in matches if item["name"] in selected_names], "candidates": matches,
+                "deferred": [item["name"] for item in matches if activate and item["name"] not in selected_names]}
 
     def model_content(self, call, result):
         descriptor = self.registry.get(call["name"]) if call["name"] in self.registry else None
@@ -292,6 +301,10 @@ class ToolRuntime:
             descriptor.validate_arguments(json.loads(call["arguments"]))
         except Exception:
             return self._validate_result(call, self.executor.execute(call, approved))
+        if not allowed_by_constraints(descriptor, self.store.record.run_runtime):
+            result = error_result(call, "task_constraint", "当前用户任务约束不允许此操作；调用未执行。请使用允许的能力继续。")
+            self.ledger.finish(call, result, 0)
+            return result
         blocked = self.research.before_execute(call)
         if blocked is not None:
             result = self._validate_result(call, blocked)

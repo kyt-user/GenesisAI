@@ -26,7 +26,7 @@ genesis = "genesisai.app.cli:entry"
 where = ["src"]
 
 [tool.setuptools.package-data]
-genesisai = ["model/default.yaml", "app/assets/pet/spritesheet.webp", "core/prompt/templates/**/*.prompt.yaml", "core/extensions/skills/builtin/*/skill.yaml", "core/extensions/skills/builtin/*/SKILL.md", "core/extensions/tools/*/*/tool.yaml"]
+genesisai = ["model/default.yaml", "app/assets/pet/bird-atlas.png", "app/assets/pet/bird-props.png", "app/assets/pet/spritesheet.webp", "core/prompt/templates/**/*.prompt.yaml", "core/extensions/skills/builtin/*/skill.yaml", "core/extensions/skills/builtin/*/SKILL.md", "core/extensions/tools/*/*/tool.yaml"]
 
 [tool.importlinter]
 root_package = "genesisai"

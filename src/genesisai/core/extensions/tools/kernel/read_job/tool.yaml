@@ -1,4 +1,4 @@
 name: read_job
 enabled: true
 category: kernel
-description: 列出本会话后台作业，或按 job_id 查询状态和分页输出
+description: 列出本会话后台作业，或按 job_id 查询状态和分页输出；wait_seconds 最多等待 30 秒，可使用 next_offset 继续读输出。测试完成后返回测试摘要，运行中不代表通过。

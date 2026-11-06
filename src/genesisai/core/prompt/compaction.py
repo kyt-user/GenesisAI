@@ -85,6 +85,34 @@ def fingerprint(messages):
     return hashlib.sha256(dump(messages).encode("utf-8")).hexdigest()
 
 
+def project_historical_results(messages):
+    """Omit large prior-turn bodies only when their exact archive is addressable.
+
+    Tool-call/result pairing and current-turn detail remain intact. This is a
+    disposable request projection; the event library retains the original bytes.
+    """
+    values = copy.deepcopy(messages)
+    last_user = max((i for i, m in enumerate(values) if m['role'] == 'user'), default=-1)
+    for message in values[:last_user]:
+        content = message.get('content')
+        ref = (message.get('metadata') or {}).get('history_ref')
+        if message['role'] != 'tool' or not ref or not isinstance(content, str) or len(content) <= 4000:
+            continue
+        payload = decode(content)
+        if not isinstance(payload, dict):
+            payload = {'text': payload}
+        summary = shorten(payload, limit=400)
+        if len(dump(summary)) > 3000:
+            summary = {k: payload[k] for k in ('ok', 'error', 'source_refs', 'artifact_refs', 'output_ref') if k in payload}
+            summary['facts'] = execution_facts([message])
+        summary['history_ref'] = ref
+        summary['body_omitted'] = True
+        summary['notice'] = ('历史工具正文已归档。预览不能代替完整原文；需要细节时调用 memory_read(ref=history_ref)，'
+                             '未下发时先 discover_tools。文件可能变化，当前代码事实请重新 read_files。')
+        message['content'] = dump(summary)
+    return values
+
+
 def message_units(messages):
     """Keep a parallel tool call batch and all its results indivisible."""
     units = []

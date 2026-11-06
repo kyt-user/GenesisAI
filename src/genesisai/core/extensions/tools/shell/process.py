@@ -12,15 +12,8 @@ from genesisai.shared.security import ToolError
 from genesisai.shared.ids import uid
 
 from genesisai.shared.run_control import current_run
-from genesisai.shared.process_tree import owned_process, safe_environment
-
-
-def validate_command(command):
-    if not isinstance(command, list) or not command or len(command) > 64:
-        raise ToolError('validation_error', 'command 必须是非空字符串数组且不超过 64 项')
-    if any(not isinstance(item, str) or not item or len(item) > 4000 for item in command):
-        raise ToolError('validation_error', 'command 参数无效')
-    return command
+from genesisai.shared.process_tree import owned_process
+from genesisai.core.extensions.tools.shell.commands import process_invocation, validate_command
 
 
 TOOL_OUTPUT_LIMIT = 12000
@@ -71,7 +64,8 @@ def _capture(context, command, cwd, timeout, log_path):
                 summaries[name] = (''.join(summary), size)
                 wake.set()
 
-        with owned_process(command, cwd=str(cwd), env=safe_environment(), stdin=subprocess.DEVNULL,
+        invocation, env = process_invocation(command, cwd)
+        with owned_process(invocation, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             for name in ('stdout', 'stderr'):
                 # Reader owns this descriptor until EOF, including bytes left in
@@ -113,7 +107,7 @@ def run_process(context, command, cwd, timeout, *, kind):
         exit_code, summaries = _capture(context, command, cwd, timeout, log_path)
     except FileNotFoundError as exc:
         logger.error('command_error', exc, **metadata)
-        raise ToolError('command_not_found', '命令不存在或不可执行') from exc
+        raise ToolError('command_not_found', f'程序 {command[0]!r} 启动失败，工作目录 {cwd}。请检查入口及其解释器是否仍存在。') from exc
     except subprocess.TimeoutExpired as exc:
         logger.error('command_error', exc, timeout=timeout, **metadata)
         raise ToolError('command_timeout', f'命令超过 {timeout} 秒上限', retryable=False) from exc

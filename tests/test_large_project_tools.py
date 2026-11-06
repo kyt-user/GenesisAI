@@ -1,0 +1,150 @@
+import json
+import sys
+
+from genesisai.agent.loop import Runner
+from genesisai.core.extensions.tools.shell.jobs import CommandJobs
+from genesisai.shared.messages import Response, ToolCall
+from test_development_continuation import development_env
+from test_p11_agent_runtime import FakeModel
+
+
+def call(runtime, name, args, ident):
+    result = runtime.execute({'id': ident, 'name': name, 'arguments': json.dumps(args)})
+    assert result['ok'], result
+    return result
+
+
+def test_index_pages_cover_more_than_100_files_and_detect_changes(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    for i in range(115):
+        (root / f'module_{i:03}.py').write_text(f'def f{i}():\n    pass\n', encoding='utf-8')
+    args = {'path': '.', 'mode': 'index', 'limit': 40}
+    pages, names = [], []
+    for i in range(4):
+        data = call(runtime, 'search_codebase', args, f'page{i}')['data']
+        names.extend(item['file'] for item in data['files'])
+        pages.append(data)
+        if data['next_cursor'] is None:
+            break
+        args['cursor'] = data['next_cursor']
+    assert len(names) == len(set(names)) == 115
+    assert len(pages) == 3 and pages[-1]['total_files'] == 115
+    (root / 'module_new.py').write_text('x = 1', encoding='utf-8')
+    stale = runtime.execute({'id': 'stale', 'name': 'search_codebase', 'arguments': json.dumps({**args, 'cursor': pages[0]['next_cursor']})})
+    assert stale['error']['code'] == 'stale_cursor'
+
+
+def test_index_exclusions_and_large_file_coverage(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    (root / 'node_modules').mkdir()
+    (root / 'node_modules' / 'hidden.js').write_text('export const ignored = 1;', encoding='utf-8')
+    (root / 'big.py').write_text('# filler\n' * 25000 + 'def tail(): pass', encoding='utf-8')
+    data = call(runtime, 'search_codebase', {'path': '.', 'mode': 'index'}, 'index')['data']
+    assert data['total_files'] == 1
+    assert data['files'][0]['content_truncated'] and data['partial_files']
+
+
+def test_python_index_reuses_ast_without_string_false_positives(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    (root / 'module.py').write_text('"""\ndef fake(): pass\n"""\nfrom . import sibling\nasync def actual(\n    x: int,\n):\n    return x\n', encoding='utf-8')
+    data = call(runtime, 'search_codebase', {'path': '.', 'mode': 'index'}, 'ast')['data']
+    assert [f['name'] for f in data['files'][0]['functions']] == ['actual']
+    assert data['files'][0]['coverage'] == 'python_ast'
+    assert data['files'][0]['imports'] == [{'module': '.'}]
+    assert runtime.project_index.refresh()['updated'] == 1
+    assert runtime.project_index.refresh()['updated'] == 0
+
+
+def test_incremental_index_updates_only_changed_module(tmp_path, record_testsuite_property):
+    import time
+    root, _, _, store, runtime = development_env(tmp_path)
+    for i in range(130):
+        (root / f'module_{i:03}.py').write_text(f'from module_{max(0, i-1):03} import value\nvalue = {i}\n', encoding='utf-8')
+    started = time.perf_counter()
+    assert runtime.project_index.refresh()['updated'] == 130
+    first_ms = (time.perf_counter() - started) * 1000
+    started = time.perf_counter()
+    assert runtime.project_index.refresh()['updated'] == 0
+    unchanged_ms = (time.perf_counter() - started) * 1000
+    (root / 'module_065.py').write_text('value = 999\n', encoding='utf-8')
+    started = time.perf_counter()
+    assert runtime.project_index.refresh(changed_paths=['module_065.py'])['updated'] == 1
+    changed_ms = (time.perf_counter() - started) * 1000
+    record_testsuite_property('routing_index_130_modules_ms', json.dumps({'initial': round(first_ms, 1), 'unchanged': round(unchanged_ms, 1), 'one_changed': round(changed_ms, 1)}))
+
+
+def test_search_modes_and_output_budget_preserve_pagination(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    (root / 'a.py').write_text('\n'.join(f'needle_{i} = {i}' for i in range(30)), encoding='utf-8')
+    (root / 'b.py').write_text('needle = 1\n', encoding='utf-8')
+    files = call(runtime, 'search_codebase', {'path': '.', 'query': 'needle', 'output_mode': 'files'}, 'files')['data']
+    assert len(files['matches']) == 2
+    counts = call(runtime, 'search_codebase', {'path': '.', 'query': 'needle', 'output_mode': 'count'}, 'counts')['data']
+    assert sum(m['matching_lines'] for m in counts['matches']) == 31
+    args = {'path': 'a.py', 'query': 'needle', 'context_lines': 40, 'max_output_chars': 1000}
+    first = call(runtime, 'search_codebase', args, 'first')['data']
+    second = call(runtime, 'search_codebase', {**args, 'offset': first['next_offset']}, 'second')['data']
+    assert second['matches'][0]['line'] == first['matches'][-1]['line'] + 1
+
+
+def test_read_independent_ranges_and_continue_total_budget(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    (root / 'a.py').write_text('one\ntwo\nthree\n', encoding='utf-8')
+    (root / 'b.py').write_text('four\nfive\nsix\n', encoding='utf-8')
+    data = call(runtime, 'read_files', {'files': [{'path': 'a.py', 'line_start': 2, 'line_end': 2}, {'path': 'b.py', 'line_start': 3, 'line_end': 3}]}, 'ranges')['data']
+    assert [item['text'] for item in data['files']] == ['2: two', '3: six']
+    (root / 'long.txt').write_text('A' * 250000 + 'TAIL', encoding='utf-8')
+    data = call(runtime, 'read_files', {'files': [{'path': 'long.txt', 'offset': 249500, 'limit': 2000}, {'path': 'a.py'}], 'max_output_chars': 1000}, 'read')['data']
+    assert 'TAIL' in data['files'][0]['text']
+    assert sum(len(f['text']) for f in data['files']) <= 1000
+    data = call(runtime, 'read_files', {'files': [{'path': 'long.txt', 'line_start': 1, 'line_end': 1}], 'max_output_chars': 1000}, 'longline')['data']
+    assert data['remaining_requests'][0]['offset'] == 0
+    resumed = call(runtime, 'read_files', {'files': data['remaining_requests'], 'max_output_chars': 1000}, 'resumed')['data']
+    assert len(resumed['files'][0]['text']) == 1000
+
+
+def test_background_test_waits_and_verifies_only_current_work(tmp_path):
+    root, manager, _, store, runtime = development_env(tmp_path)
+    (root / 'test_ok.py').write_text('import unittest\nclass Tests(unittest.TestCase):\n    def test_ok(self): self.assertTrue(True)\n', encoding='utf-8')
+    try:
+        data = call(runtime, 'run_commands', {'command': [sys.executable, '-m', 'unittest', 'test_ok'], 'background': True, 'timeout_seconds': 20}, 'start')['data']
+        assert store.record.run_runtime['pending_verification_jobs'] == [data['job_id']]
+        result = call(runtime, 'read_job', {'job_id': data['job_id'], 'wait_seconds': 5, 'output': True}, 'wait')
+        assert result['data']['status'] == 'succeeded'
+        assert result['data']['passed'] is True
+        assert result['observations'][0]['passed'] is True
+        assert not store.record.run_runtime['pending_verification_jobs']
+        manager.observe([{'kind': 'resource_changed', 'path': str(root / 'test_ok.py'), 'sha256': None}])
+        stale = call(runtime, 'read_job', {'job_id': data['job_id']}, 'stale')
+        assert not stale['data']['verification_current'] and not stale['observations']
+        task = manager.active_task()
+        task['status'] = 'cancelled'
+        manager._put(task)
+        manager.begin_task('新的开发任务')
+        different = call(runtime, 'read_job', {'job_id': data['job_id']}, 'different-task')
+        assert not different['data']['verification_current'] and not different['observations']
+    finally:
+        runtime.jobs.close()
+
+
+def test_job_recovery_does_not_replay_process(tmp_path):
+    _, _, _, store, runtime = development_env(tmp_path)
+    try:
+        started = runtime.jobs.start([sys.executable, '-c', 'import time; time.sleep(20)'], store.workspace, 25)
+        restored = CommandJobs(store, lambda x: x)
+        assert restored.wait(started['job_id'], .1)['status'] == 'owner_unavailable'
+        assert not restored.active
+    finally:
+        runtime.jobs.close()
+
+
+def test_long_run_passes_checkpoint_without_resetting_usage(tmp_path):
+    _, _, _, store, runtime = development_env(tmp_path)
+    responses = [Response(tool_calls=[ToolCall(f'find{i}', 'discover_tools', json.dumps({'query': 'read_files'}))], finish_reason='tool_calls') for i in range(24)]
+    model = FakeModel(*responses, Response(content='检查结束'))
+    result = Runner(model, runtime, max_rounds=30, max_tools=40).start('检查本地代码工具')
+    assert result['status'] == 'completed'
+    state = store.record.run_runtime
+    assert state['progress_checkpoint']['round'] == 20
+    assert state['usage']['model_calls'] == 25 and store.record.tool_count == 24
+    assert state['budget']['model_calls'] == 30

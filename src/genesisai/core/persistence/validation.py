@@ -224,3 +224,13 @@ def validate_record(data, expected_id=None):
         run_runtime["context_summary"], dict
     ):
         raise ValueError("会话字段 run_runtime.context_summary 无效")
+    for name in ("capability_routes", "discovered_tools", "pending_verification_jobs"):
+        if name in run_runtime and (not isinstance(run_runtime[name], list) or any(not isinstance(item, str) for item in run_runtime[name])):
+            raise ValueError(f"会话字段 run_runtime.{name} 无效")
+    if "constraints" in run_runtime:
+        constraints = run_runtime["constraints"]
+        if (not isinstance(constraints, dict) or set(constraints) - {"read_only", "network_forbidden"}
+                or any(type(value) is not bool for value in constraints.values())):
+            raise ValueError("会话字段 run_runtime.constraints 无效")
+    if "model_call_limit" in run_runtime and (type(run_runtime["model_call_limit"]) is not int or run_runtime["model_call_limit"] < 1):
+        raise ValueError("会话字段 run_runtime.model_call_limit 无效")

@@ -1,4 +1,4 @@
 name: search_codebase
 enabled: true
 category: kernel
-description: 在授权目录内按 name 或 content 搜索并返回行号、命中行、前后文及分页游标，或输出代码结构索引（类/函数/导入/TODO）
+description: 按 name/content 搜索，output_mode 可选 content/files/count，支持最多 40 行上下文和总输出限额。mode=index 分页索引类/函数/导入/TODO；续页使用 next_cursor，文件变化需重新开始。

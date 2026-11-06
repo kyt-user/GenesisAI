@@ -1,4 +1,4 @@
 name: run_commands
 enabled: true
 category: kernel
-description: background=true 返回 job_id，可用 read_job 和 stop_job 管理。在工作区执行受控命令数组或检查 Python 项目结构（不经过 shell 插值）
+description: 一次运行一个程序。command 是程序名和参数的数组，不能放多条命令整句。Windows 的 echo、dir 等内置命令须显式调用 cmd.exe。background=true 返回 job_id，可用 read_job 和 stop_job 管理。operation=inspect 检查 Python 项目结构。

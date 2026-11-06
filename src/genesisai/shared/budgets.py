@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from dataclasses import asdict, dataclass
 
@@ -24,43 +23,14 @@ PROFILES = {
     "web_quick": TaskProfile("web_quick", 8, 2, 4, 1),
     "web_normal": TaskProfile("web_normal", 12, 4, 8, 1),
     "web_deep": TaskProfile("web_deep", 20, 8, 12, 1),
-    "local_files": TaskProfile("local_files", 20, 0, 0, 1),
-    "creative": TaskProfile("creative", 25, 0, 0, 1),
+    "local_files": TaskProfile("local_files", 20, 4, 8, 1),
+    "creative": TaskProfile("creative", 25, 2, 4, 1),
 }
 
 
 def is_recall_request(text: str) -> bool:
     value = text.casefold()
     return any(word in value for word in ("复述", "再说一下", "刚才查到的", "重复刚才"))
-
-
-def select_initial_profile(text: str) -> str:
-    """只识别明确高成本或本地任务；普通请求仍从 direct_answer 开始。"""
-    value = text.casefold()
-    if any(word in value for word in ("深度调研", "深入调研", "全面调研", "deep research")):
-        return "web_deep"
-    if any(word in value for word in ("专题报告", "比较并整理", "对比报告", "研究报告")):
-        return "web_normal"
-    if any(word in value for word in (
-        "本地文件", "本地资料", "这个目录", "工作区文件", "代码", "仓库", "测试",
-        "修复", "bug", "报错", "重构", "git", "文件管理", "移动文件", "删除文件",
-        "pytest", "python", "pyproject", "pip", "ruff", "mypy", "skill",
-        "docx", "xlsx", "pptx", "pdf", "办公文档", "工作簿", "演示文稿",
-    )):
-        return "local_files"
-    if any(word in value for word in (
-        "写小说", "续写", "扩写", "角色", "章节", "故事", "剧情", "世界观",
-        "人物设定", "情节", "写作", "创作", "第一章", "下一章",
-    )):
-        return "creative"
-    if is_recall_request(text):
-        return "direct_answer"
-    if re.search(r"https?://", value) or any(word in value for word in (
-        "官网", "联网", "网上查", "网络查询", "搜索", "检索", "目前", "当前价格",
-        "今天", "近期", "最新", "售价", "多少钱",
-    )):
-        return "web_quick"
-    return "direct_answer"
 
 
 def initial_run_runtime(profile: str = "direct_answer", *, phase: str = "explore") -> dict:
@@ -72,6 +42,9 @@ def initial_run_runtime(profile: str = "direct_answer", *, phase: str = "explore
         "lifecycle": "ready" if phase == "explore" else ("complete" if phase == "done" else "recover"),
         "state_history": [],
         "protocols": [],
+        "capability_routes": [],
+        "constraints": {},
+        "capability_blocks": {},
         "context_summary": None,
         "context_report": {},
         "budget": selected.to_dict(),

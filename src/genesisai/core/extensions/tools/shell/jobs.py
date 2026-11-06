@@ -8,8 +8,11 @@ import threading
 import time
 
 from genesisai.shared.ids import uid
-from genesisai.shared.process_tree import owned_process, safe_environment
+from genesisai.shared.process_tree import owned_process
+from genesisai.core.extensions.tools.shell.commands import process_invocation
 from genesisai.shared.security import ToolError
+from genesisai.shared.run_control import cancellation_requested
+from genesisai.shared.time_limits import tool_deadline
 
 
 class CommandJobs:
@@ -38,7 +41,8 @@ class CommandJobs:
             info["status"] = "owner_unavailable"
         return info
 
-    def start(self, command, cwd, timeout):
+    def start(self, command, cwd, timeout, framework=None, task_id=None):
+        invocation, env = process_invocation(command, cwd)
         with self.lock:
             if len(self.active) >= 4:
                 raise ToolError("job_limit", "本会话最多同时运行四个作业")
@@ -51,11 +55,14 @@ class CommandJobs:
                 "started": time.time(),
                 "status": "running",
                 "exit_code": None,
+                "timeout_seconds": timeout,
+                "framework": framework,
+                "task_id": task_id,
             }
             owner = owned_process(
-                command,
+                invocation,
                 cwd=cwd,
-                env=safe_environment(),
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -157,12 +164,29 @@ class CommandJobs:
             path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
         )
         page = content[offset : offset + limit]
-        return {
+        result = {
             **info,
             "text": page,
             "next_offset": offset + len(page),
             "more": offset + len(page) < len(content),
         }
+        if info.get("framework") and info["status"] in {"succeeded", "failed", "timed_out", "stopped"}:
+            from genesisai.core.extensions.tools.shell.python_support import parse_test_summary
+            summary = parse_test_summary(info["framework"], content, "", info["exit_code"])
+            result.update(summary=summary, passed=info["status"] == "succeeded" and summary["passed"] > 0 and not summary["failed"] and not summary["errors"])
+        return result
+
+    def wait(self, job_id, seconds=0):
+        deadline = min(time.monotonic() + seconds, tool_deadline.get() or float("inf"))
+        while True:
+            info = self.status(job_id)
+            if info["status"] != "running" or time.monotonic() >= deadline or cancellation_requested():
+                return info
+            with self.lock:
+                active = self.active.get(job_id)
+            if not active:
+                return self.status(job_id)
+            active[1].join(timeout=min(0.05, max(0, deadline - time.monotonic())))
 
     def stop(self, job_id):
         with self.lock:

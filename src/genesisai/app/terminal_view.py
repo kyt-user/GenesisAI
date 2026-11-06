@@ -249,6 +249,10 @@ class CliView:
             used = usage.get(key, 0)
             table.add_row(label, f"{used} / {budget.get(key, '—')}（余 {max(0, budget.get(key, 0) - used) if isinstance(budget.get(key), int) else '—'}）")
         table.add_row("累计 Token（用量）", str(usage.get('total_tokens', 0)))
+        table.add_row("工具调用硬上限", f"{data.get('tool_count', 0)} / {(data.get('limits') or {}).get('tools', '—')}")
+        table.add_row("进度检查点", str((runtime.get('progress_checkpoint') or {}).get('round', '—')))
+        if runtime.get('capability_blocks'):
+            table.add_row("局部能力限制", self._value(str(runtime['capability_blocks'])))
         context = runtime.get('context_report') or {}
         table.add_row('上下文窗口', str(context.get('context_window', 400000)))
         table.add_row("当前请求（估算 Token）", f"{context.get('tokens_after', '—')} / {context.get('input_limit', '—')}")

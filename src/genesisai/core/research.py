@@ -9,6 +9,7 @@ import re
 from urllib.parse import urlsplit
 
 from genesisai.shared.budgets import PROFILES, initial_run_runtime
+from genesisai.shared.errors import SearchError
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.shared.results import error_result
 from genesisai.shared.web import canonicalize_url, normalized_text
@@ -54,7 +55,13 @@ class ResearchController:
         if current == profile:
             return
         self.state["profile"] = profile
-        self.state["budget"] = PROFILES[profile].to_dict()
+        # 切换流程不能降低现有能力额度，也不能重置实际消耗或用户的硬上限。
+        target = PROFILES[profile].to_dict()
+        current_budget = self.state["budget"]
+        for key in ("search_queries", "search_fetches", "retries_per_candidate"):
+            target[key] = max(target[key], current_budget[key])
+        target["model_calls"] = self.state.get("model_call_limit", max(target["model_calls"], current_budget["model_calls"]))
+        self.state["budget"] = target
         self.store.commit()
 
     def register_user_urls(self, text: str) -> None:
@@ -72,8 +79,14 @@ class ResearchController:
         except Exception:
             return None
         intent = _web_intent(name, args)
+        if intent and self.state.get("constraints", {}).get("network_forbidden"):
+            return error_result(call, "network_forbidden", "用户要求禁止联网；本次未发起网络请求。请使用已授权的本地资料。")
         if intent and self.state["profile"] == "direct_answer":
             self.switch_profile("web_quick")
+        if intent:
+            routes = self.state.setdefault("capability_routes", [])
+            if "web" not in routes:
+                routes.append("web")
         # 缓存读取和无效 URL 不消耗实际网络预算。
         if intent == "fetch":
             checked = self._check_fetch(call, args["url"])
@@ -81,8 +94,11 @@ class ResearchController:
                 return checked
         budget_key = {"query": "search_queries", "fetch": "search_fetches"}.get(intent)
         if budget_key and self.state["usage"][budget_key] >= self.state["budget"][budget_key]:
-            self.force_answer(f"{budget_key}_budget")
-            return error_result(call, "budget_exhausted", f"已达到 {budget_key} 硬预算")
+            limit = self.state["budget"][budget_key]
+            used = self.state["usage"][budget_key]
+            message = (f"当前未分配 {budget_key} 额度" if limit == 0 else f"{budget_key} 额度已用完（{used}/{limit}）")
+            self.state.setdefault("capability_blocks", {})[budget_key] = message
+            return error_result(call, "budget_exhausted", message + "；本次未发起网络请求。可继续其他已授权步骤或使用已有资料回答。")
         if intent == "query" and isinstance(args.get("query"), str):
             query = normalized_text(args["query"]).casefold()
             if query in self.state["completed_queries"]:
@@ -116,14 +132,22 @@ class ResearchController:
             self._after_query(call, result)
         elif intent == "fetch":
             self._after_fetch(call, result)
-        self._check_hard_limits()
+        elif result.get("ok") and str(name).startswith("mcp_"):
+            before = self.state["candidate_count"]
+            for link in (result.get("data") or {}).get("candidate_links", ()):
+                try:
+                    self._register_candidate(link["url"], source_type="mcp", title=link["title"],
+                                             query_call_id=call_id, tool_name=name)
+                except (ValueError, SearchError):
+                    continue
+            if self.state["candidate_count"] > before and self.state["profile"] == "direct_answer":
+                self.switch_profile("web_quick")
         self.store.commit()
         return result
 
     def note_model(self, tokens: int) -> None:
         self.state["usage"]["model_calls"] += 1
         self.state["usage"]["total_tokens"] += max(tokens, 0)
-        self._check_hard_limits()
         self.store.commit()
 
     def note_progress_round(self) -> None:
@@ -131,14 +155,15 @@ class ResearchController:
             return
         if self.state["usage"].get("search_queries", 0) == 0 and self.state["usage"].get("search_fetches", 0) == 0:
             return
-        mark = [self.state["candidate_count"], len(self.state["evidence_refs"]), self.state['usage']['observations']]
+        mark = [self.state["candidate_count"], len(self.state["evidence_refs"]), self.state['usage']['observations'],
+                len(self.store.record.sources), len(self.store.record.changes)]
         if mark == self.state.get("progress_mark"):
             self.state["stalled_rounds"] += 1
         else:
             self.state["stalled_rounds"] = 0
             self.state["progress_mark"] = mark
         if self.state["stalled_rounds"] >= 3:
-            self.force_answer("no_new_evidence")
+            self._source_unavailable("no_new_evidence")
         self.store.commit()
 
     def should_force_answer(self) -> bool:
@@ -149,6 +174,11 @@ class ResearchController:
         if self.state.get("phase") not in {"recover", "done"}:
             self.state["phase"] = "answer"
         self.state["stop_reason"] = self.state.get("stop_reason") or reason
+
+    def _source_unavailable(self, reason: str) -> None:
+        self.state.setdefault("capability_blocks", {})["web"] = reason
+        if self.state["profile"].startswith("web") and "coding" not in self.state.get("protocols", []):
+            self.force_answer(reason)
 
     def remaining(self) -> dict:
         budget, usage = self.state["budget"], self.state["usage"]
@@ -206,7 +236,7 @@ class ResearchController:
                 self.state["completed_queries"].append(query)
             diagnostics = self.state.get('search_diagnostics') or {}
             if diagnostics.get('all_providers_failed') and self._all_candidates_exhausted():
-                self.force_answer('search_service_unavailable')
+                self._source_unavailable('search_service_unavailable')
             return
         if result.get("ok"):
             before = set(self.state['candidates'])
@@ -235,7 +265,7 @@ class ResearchController:
             if diagnostics['repeated_candidates']:
                 data['guidance'] = '本次搜索没有新增候选。不要把重复首页当作目标页；优先读取现有相关候选或改用精确产品名和站点限定。仍无可用目标页时简洁说明检索未找到，勿要求用户提供内部预算。'
                 if self._all_candidates_exhausted():
-                    self.force_answer('external_source_unavailable')
+                    self._source_unavailable('external_source_unavailable')
             self.store.event('search_diagnostics', provider=diagnostics['provider'], new_candidates=added,
                              repeated_candidates=diagnostics['repeated_candidates'],
                              provider_errors=diagnostics['fallback_errors'])
@@ -277,7 +307,7 @@ class ResearchController:
             if candidate:
                 candidate["status"] = "retryable" if retryable and attempts < 2 else "failed"
             if self._all_candidates_exhausted() and self.state['usage'].get('search_queries', 0) >= self.state['budget'].get('search_queries', 0):
-                self.force_answer('external_source_unavailable')
+                self._source_unavailable('external_source_unavailable')
             return
         data = result.get("data") or {}
         refs = result.get("source_refs") or data.get("source_refs") or []
@@ -337,6 +367,8 @@ class ResearchController:
     def _register_candidate(self, raw_url: str, *, source_type: str, **metadata) -> str:
         url = canonicalize_url(raw_url)
         host = urlsplit(url).hostname or ""
+        if host == "localhost" or host.endswith(".localhost"):
+            raise ValueError("non-public address")
         try:
             if not ipaddress.ip_address(host).is_global:
                 raise ValueError("non-public address")
@@ -354,22 +386,3 @@ class ResearchController:
         if self.state['failed_resources'].get(url, {}).get('code') == 'candidate_not_registered':
             self.state['failed_resources'].pop(url, None)
         return url
-
-    def _check_hard_limits(self) -> None:
-        budget, usage = self.state["budget"], self.state["usage"]
-        checks = (
-            ("model_calls", "model_budget"),
-            ("search_queries", "search_query_budget"),
-            ("search_fetches", "search_fetch_budget"),
-        )
-        for key, reason in checks:
-            if key == "search_queries":
-                # 搜索耗尽不会耗尽独立的抓取预算。
-                continue
-            if key == "model_calls" and self.state["profile"] == "direct_answer" and self.state.get("counted_calls"):
-                # 只有普通无工具问题受 direct_answer 的三次模型硬限；一旦
-                # Agent 已进入目录/业务工具流程，先让它完成一次确定性加载。
-                continue
-            if usage[key] >= budget[key] and budget[key] > 0:
-                self.force_answer(reason)
-                return

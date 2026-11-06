@@ -432,6 +432,63 @@ def test_supported_price_claim_passes_body_validation(runtime_env):
     assert result['status'] == 'completed' and '4999' in result['answer'], (result, store.record.run_runtime)
 
 
+@pytest.mark.parametrize("outcome", ["verified", "unreadable", "single_quote"])
+def test_mcp_price_lead_can_be_read_once_with_approval(runtime_env, tmp_path, outcome):
+    from genesisai.core.extensions.mcp.bridge import McpBridge
+    from test_extensions_seams import FakeTransport, write_mcp_config
+
+    store, runtime = runtime_env
+    url = "https://example.com/model-price"
+
+    class News(FakeTransport):
+        def request(self, method, params):
+            if method == "tools/call":
+                return {"content": [{"type": "text", "text": "摘要报价 USD 9"}],
+                        "structuredContent": {"items": [{"links": {"original": url}}]}}
+            return super().request(method, params)
+
+    write_mcp_config(tmp_path)
+    bridge = McpBridge(tmp_path, runtime.registry, runtime.loader, transport_factory=News).configure({})
+    bridge.ensure_connected("fixture")
+
+    def draft(_):
+        runtime.set_permission("user")
+        return Response(content="价格 USD 9")
+
+    def fetch(value):
+        if outcome == "unreadable":
+            raise ToolError("fetch_failed", "HTTP 403")
+        return {"url": value, "title": "price", "text": "API price: USD 8", "truncated": False}
+
+    def final(_):
+        if outcome == "unreadable":
+            return Response(content="摘要报价 USD 9")  # Repeating the rejected amount must still fail validation.
+        ref, = store.record.run_runtime["evidence_refs"]
+        answer = f"正文报价 USD 8 [{ref}]"
+        if outcome == "single_quote":
+            answer = "[[PARTIAL]] " + answer + "；缺少其他模型的同口径报价。"
+        return Response(content=answer)
+
+    runtime.network.fetch = fetch
+    model = FakeModel(
+        Response(tool_calls=[tool_call("mcp_fixture_echo", {"text": "模型"}, "news")]),
+        draft, Response(tool_calls=[tool_call("fetch_web_content", {"url": url}, "read")]), final)
+    runner = Runner(model, runtime)
+    question = "目前使用 mcp_fixture_echo 查模型价格" + ("，哪个最划算？" if outcome == "single_quote" else "")
+    assert runner.start(question)["status"] == "awaiting_confirmation"
+    assert not store.record.run_runtime["evidence_refs"]
+    offered, = model.tools[2]
+    assert offered["function"]["name"] == "fetch_web_content"
+    assert offered["function"]["parameters"]["properties"]["url"]["enum"] == [url]
+    result = runner.confirm(True)
+    assert model.tools[-1] == []
+    assert result["status"] == ("completed" if outcome == "verified" else "partial")
+    assert "USD 9" not in result["answer"]
+    if outcome != "unreadable":
+        assert "USD 8" in result["answer"]
+    assert [a["tool"] for a in store.record.run_runtime["tool_activity"]] == ["mcp_fixture_echo", "fetch_web_content"]
+
+
 def test_price_claim_without_source_reference_is_rejected(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(
@@ -441,6 +498,31 @@ def test_price_claim_without_source_reference_is_rejected(runtime_env):
     result = runner.start('当前价格是多少')
     assert result['status'] == 'partial'
     assert '9999' not in json.dumps(store.record.messages, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("args", [{"url": "https://other.example/"}, {"query": "find price"}])
+def test_price_read_is_limited_to_a_registered_url(runtime_env, args):
+    store, runtime = runtime_env
+    model = FakeModel(Response(content="USD 9"),
+                      Response(tool_calls=[tool_call("fetch_web_content", args, "outside")]))
+    result = Runner(model, runtime).start("https://example.com/model 的价格是多少")
+    assert result["status"] == "partial" and "USD 9" not in result["answer"]
+    assert "outside" not in store.record.calls
+
+
+def test_no_remaining_read_budget_gives_partial_without_reopening_tools(runtime_env):
+    store, runtime = runtime_env
+
+    def draft(_):
+        state = store.record.run_runtime
+        state["usage"]["search_fetches"] = state["budget"]["search_fetches"]
+        return Response(content="USD 9")
+
+    model = FakeModel(draft, Response(content="USD 9"))
+    result = Runner(model, runtime).start("https://example.com/model 的价格是多少")
+    assert model.tools[-1] == []
+    assert result["status"] == "partial" and "价格" in result["answer"]
+    assert "USD 9" not in result["answer"]
 
 
 def test_explicit_web_intent_preloads_builtin_search_tools(runtime_env):

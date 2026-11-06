@@ -19,11 +19,11 @@ from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
 from genesisai.shared.budgets import (
     initial_run_runtime,
     is_recall_request,
-    select_initial_profile,
 )
 from genesisai.shared.ids import uid
 from genesisai.shared.run_control import cancellation_requested
-from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT
+from genesisai.shared.time_limits import (DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT,
+                                         DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS, PROGRESS_CHECKPOINT_ROUNDS)
 from genesisai.shared.messages import UserInput, content_text
 
 
@@ -43,8 +43,8 @@ class Runner(RecoveryMixin):
         model,
         runtime,
         *,
-        max_rounds=20,
-        max_tools=40,
+        max_rounds=DEFAULT_MAX_ROUNDS,
+        max_tools=DEFAULT_MAX_TOOLS,
         max_failures=3,
         seconds=DEFAULT_TASK_SECONDS,
         request_timeout=DEFAULT_REQUEST_TIMEOUT,
@@ -57,8 +57,8 @@ class Runner(RecoveryMixin):
             max_failures,
             seconds,
         )
-        if seconds <= 0 or request_timeout <= 0:
-            raise ValueError("任务时限和请求超时必须为正数")
+        if min(seconds, request_timeout, max_rounds, max_tools, max_failures) <= 0:
+            raise ValueError("任务时限、请求超时和调用上限必须为正数")
         self.request_timeout = request_timeout
         self.on_event = on_event or (lambda *args: None)
         self.cancel_requested = False
@@ -248,10 +248,12 @@ class Runner(RecoveryMixin):
             self.runtime.prepare_turn()
         except (OSError, ValueError) as exc:
             self.run_logger.error("project_index_failed", exc)
-        continuation = self.prompt.is_development_continuation(text, active_task)
-        profile = "local_files" if continuation else select_initial_profile(text)
+        route = self.prompt.route(text, active_task, previous_runtime)
+        continuation = route["development_continuation"]
+        profile = route["profile"]
         d.run_runtime = initial_run_runtime(profile)
-        protocols = self.prompt.protocols_for(text)
+        d.run_runtime.update(route)
+        protocols = route["protocols"]
         if continuation:
             inherited = previous_runtime.get("protocols") or []
             protocols = list(dict.fromkeys([*inherited, *protocols, "coding"]))
@@ -275,7 +277,9 @@ class Runner(RecoveryMixin):
                 "instruction": text.strip(),
             }
         d.run_runtime["protocols"] = protocols
-        if previous_runtime.get("evidence_refs"):
+        d.run_runtime["budget"]["model_calls"] = self.max_rounds
+        d.run_runtime["model_call_limit"] = self.max_rounds
+        if previous_runtime.get("evidence_refs") or (route.get("followup") and previous_runtime.get("candidates")):
             # 普通追问建立新 Run，但从上一 Run 搬运不可变候选、来源和证据索引。
             for key in (
                 "candidates",
@@ -288,7 +292,7 @@ class Runner(RecoveryMixin):
                     d.run_runtime[key] = json.loads(
                         json.dumps(previous_runtime[key], ensure_ascii=False)
                     )
-            d.run_runtime["reuse_evidence"] = True
+            d.run_runtime["reuse_evidence"] = bool(previous_runtime.get("evidence_refs"))
         d.run_runtime["execution_seconds_limit"] = self.seconds
         d.run_runtime["request_timeout_seconds"] = self.request_timeout
         d.run_runtime["objective"] = (
@@ -296,9 +300,7 @@ class Runner(RecoveryMixin):
             if continuation
             else (text or content_text(content, images=True))
         )
-        d.run_runtime["execution_requested"] = (
-            continuation or self.prompt.requests_development_execution(text, protocols)
-        )
+        d.run_runtime["execution_requested"] = route["execution_requested"]
         d.run_runtime["project_changed"] = False
         d.run_runtime["verification_succeeded"] = False
         if is_recall_request(text):
@@ -403,8 +405,31 @@ class Runner(RecoveryMixin):
         d.messages.append(
             dict(role="tool", tool_call_id=call["id"], content=self.runtime.model_content(call, result))
         )
-        d.failures = 0 if result["ok"] else d.failures + 1
+        code = (result.get("error") or {}).get("code")
+        if result["ok"]:
+            d.failures = 0
+            d.run_runtime.setdefault("correctable_errors", {}).pop(call["name"], None)
+        elif code in {"validation_error", "budget_exhausted", "task_constraint", "network_forbidden"}:
+            counters = d.run_runtime.setdefault("correctable_errors", {})
+            counters[call["name"]] = counters.get(call["name"], 0) + 1
+            if counters[call["name"]] > 2:
+                d.failures += 1
+        else:
+            d.failures += 1
         d.pending.pop(0)
+        if d.run_runtime.pop("source_read_paths", None):
+            d.run_runtime["response_issue"] = (
+                "补读机会已使用。请根据实际结果完整重写，只引用仍有效的来源；补读失败时说明缺口。"
+            )
+        if d.run_runtime.pop("price_read_candidates", None):
+            read_refs = result.get("source_refs") or (result.get("data") or {}).get("source_refs", [])
+            if result.get("ok") and set(read_refs).intersection(d.run_runtime["evidence_refs"]):
+                d.run_runtime["phase"] = "answer"
+                d.run_runtime["response_issue"] = "用已读取正文的 source_ref 核验金额。比较依据不足时以 [[PARTIAL]] 说明差什么。"
+            else:
+                d.run_runtime["phase"] = "recover"
+                d.run_runtime["stop_reason"] = "unsupported_evidence_claim"
+                d.run_runtime["response_issue"] = "补读未取得可引用正文。请以 [[PARTIAL]] 说明已有线索和缺口，略去未核实的金额。"
         if d.run_runtime.get("pending_question", {}).get("call_id") == call["id"]:
             d.run_runtime.pop("pending_question")
         if result.get("ok") and not d.pending and result.get("completion_candidate"):
@@ -623,9 +648,10 @@ class Runner(RecoveryMixin):
                     if state["evidence_refs"]:
                         self.research.force_answer("failure_limit")
                     else:
+                        from genesisai.shared.execution import failure_summary
                         return self.stop(
                             "limit_reached",
-                            "达到连续失败上限，且没有取得可用证据",
+                            self.run_logger.journal.clean(failure_summary(d)),
                             "failure_limit",
                         )
                 if d.pending:
@@ -640,23 +666,31 @@ class Runner(RecoveryMixin):
                         return outcome
                     continue
                 decision = self.completion.decide(state)
+                checkpoint = state.get("progress_checkpoint", {}).get("round", 0)
+                if d.rounds and d.rounds % PROGRESS_CHECKPOINT_ROUNDS == 0 and checkpoint != d.rounds:
+                    state["progress_checkpoint"] = {
+                        "round": d.rounds, "tools_used": d.tool_count,
+                        "remaining_rounds": max(0, limits["rounds"] - d.rounds),
+                        "remaining_seconds": max(0, round(d.deadline - time.time())),
+                        "instruction": "核对计划与实际进展，复用已有结果并优先完成验证；没有进展时调整方法。硬上限不会重置。",
+                    }
+                    self.store.event("progress_checkpoint", **state["progress_checkpoint"])
+                    self.store.commit()
                 final, recovery = decision == "answer", decision == "recover"
                 if final and self.machine.state not in {"verify", "recover"}:
                     self.machine.transition("verify", "answer_ready")
                 if d.rounds >= limits["rounds"]:
                     if state["evidence_refs"] or state.get("partial_response"):
-                        return self.status(
-                            "partial",
-                            state.get("partial_response")
-                            or "已达到模型轮次上限；已保存来源，请缩小问题后继续。",
-                        )
+                        state["stop_reason"] = "model_budget"
+                        return self._finish_answer(state.get("partial_response") or
+                            "已达到模型轮次上限；已保存来源，请缩小问题后继续。", terminal=True)
                     return self.stop(
                         "limit_reached", "达到模型轮次上限", "model_budget"
                     )
                 if (
                     not final
                     and not recovery
-                    and state["profile"].startswith("web")
+                    and limits["rounds"] > 1
                     and state["usage"]["model_calls"]
                     >= max(1, state["budget"]["model_calls"] - 1)
                 ):
@@ -666,6 +700,30 @@ class Runner(RecoveryMixin):
                 tool_definitions = (
                     [] if final or recovery else self.runtime.definitions()
                 )
+                source_paths = state.get("source_read_paths")
+                if source_paths:
+                    tool_definitions = self.runtime.definitions(names={"read_files"})
+                    if tool_definitions:
+                        tool_definitions[0]["function"]["parameters"] = {
+                            "type": "object", "properties": {"paths": {"type": "array",
+                                "items": {"type": "string", "enum": source_paths}, "minItems": 1, "maxItems": 3}},
+                            "required": ["paths"], "additionalProperties": False,
+                        }
+                    else:
+                        state.pop("source_read_paths", None)
+                        state["response_issue"] += " read_files 当前不可用，请只依据有效来源回答并说明缺口。"
+                        source_paths = None
+                price_urls = state.get("price_read_candidates")
+                if price_urls:
+                    if final or recovery:
+                        return self._price_gap()
+                    tool_definitions = [t for t in tool_definitions if t["function"]["name"] == "fetch_web_content"]
+                    if not tool_definitions:
+                        return self._price_gap()
+                    tool_definitions[0]["function"]["parameters"] = {
+                        "type": "object", "properties": {"url": {"type": "string", "enum": price_urls}},
+                        "required": ["url"], "additionalProperties": False,
+                    }
                 context = self.context(recovery=recovery, final=final, tools=tool_definitions)
                 response = self._call_model(context, tool_definitions)
                 if cancellation_requested():
@@ -693,11 +751,34 @@ class Runner(RecoveryMixin):
                         return outcome
                     continue
                 invalid = self._invalid_calls(calls, tool_definitions)
+                if source_paths and calls:
+                    try:
+                        args = json.loads(calls[0]["arguments"])
+                    except (TypeError, ValueError):
+                        args = None
+                    valid = (len(calls) == 1 and isinstance(args, dict) and set(args) == {"paths"}
+                             and isinstance(args["paths"], list) and 1 <= len(args["paths"]) <= 3
+                             and all(isinstance(path, str) and path in source_paths for path in args["paths"]))
+                    if invalid or not valid:
+                        state.pop("source_read_paths", None)
+                        state["response_issue"] = "失效文件补读调用无效，未执行。请用有效来源回答并明确缺口。"
+                        self.store.commit()
+                        continue
                 if invalid:
+                    if price_urls:
+                        return self._price_gap()
                     outcome = self._recover_tool_protocol(invalid)
                     if outcome is not None:
                         return outcome
                     continue
+                if price_urls and calls:
+                    try:
+                        args = json.loads(calls[0]["arguments"])
+                    except (TypeError, ValueError):
+                        args = None
+                    if len(calls) != 1 or not isinstance(args, dict) or set(args) != {"url"} or args["url"] not in price_urls:
+                        return self._price_gap()
+                state.pop("response_issue", None)
                 if state["phase"] == "answer" and calls:
                     continue
                 if calls:
@@ -713,6 +794,7 @@ class Runner(RecoveryMixin):
                     continue
                 if not response.content:
                     continue
+                state.pop("source_read_paths", None)
                 outcome = self._finish_answer(response.content)
                 if outcome is not None:
                     return outcome
@@ -727,28 +809,47 @@ class Runner(RecoveryMixin):
     def _serialized_tool_markup(text):
         return re.search(r"<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)", text or "", re.I)
 
-    def _finish_answer(self, answer_text):
+    def _finish_answer(self, answer_text, *, terminal=False):
         """Validate every proposed final answer against the same evidence and task gates."""
         d = self.store.record
         state = d.run_runtime
+        self.store.refresh_local_files()
+        if terminal:
+            # Exhausted recovery budgets must not deliver unchecked drafts or
+            # launch another recovery/tool cycle.
+            if (self._serialized_tool_markup(answer_text) or not self._answer_refs_valid(answer_text)
+                    or self._unsupported_price_claims(answer_text)):
+                answer_text = self._evidence_fallback('输出恢复已到上限，未能形成通过校验的完整回答。')
+            elif state.get('partial_response'):
+                endings = list(re.finditer(r'[。！？!?](?:[\]\)）"”]*)|\.(?=\s|$)', answer_text))
+                answer_text = answer_text[:endings[-1].end()] if endings else ''
+                answer_text += '\n模型输出达到上限，以上仅为已完成的部分；任务尚未形成完整说明。'
+            # Trimming can remove a citation after a sentence. Recheck the
+            # actual delivered text instead of starting another recovery cycle.
+            if not self._answer_refs_valid(answer_text) or self._unsupported_price_claims(answer_text):
+                answer_text = self._evidence_fallback('输出恢复已到上限，未能形成通过校验的完整回答。')
+            answer_text = '[[PARTIAL]] ' + answer_text.lstrip().removeprefix('[[PARTIAL]]').strip()
         if self._serialized_tool_markup(answer_text):
             return self._recover_serialized_tool_output()
-        if self.development.development_change_required(state):
+        if not terminal and self.development.development_change_required(state):
             return self.development.recover_tool_required(self)
         # 自验证：文件修改后自动运行测试。
         if (
             self._needs_verification or state.get("verification_required")
-        ) and self.development.should_auto_verify(state):
+        ) and not terminal and self.development.should_auto_verify(state):
             outcome = self.development.inject_verification_test(self)
             if outcome != "skip":
                 return outcome
         if self.machine.state in {"execute", "recover"}:
             self.machine.transition("verify", "model_answer")
         if not self._answer_refs_valid(answer_text):
-            return self._recover_bad_refs()
+            return self._recover_bad_refs(answer_text)
         unsupported_prices = self._unsupported_price_claims(answer_text)
         if unsupported_prices:
-            return self._recover_unsupported_prices(unsupported_prices)
+            return self._recover_unsupported_prices()
+        if (state["recovery_counts"].get("evidence_claim") and not self._price_claims(answer_text)
+                and not answer_text.lstrip().startswith("[[PARTIAL]]")):
+            return self._price_gap()
         self.store.verify_artifacts(current_run_only=True)
         EvidenceBundle(self.store).verify()
         d.messages.append(

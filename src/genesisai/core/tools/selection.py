@@ -1,6 +1,7 @@
 """Select schemas per turn and discover more by capability or exact name."""
 
 import re
+import json
 
 FORMAT_TERMS = {
     "xlsx": ("xlsx", "excel", "工作簿", "电子表格"),
@@ -9,40 +10,29 @@ FORMAT_TERMS = {
     "pptx": ("pptx", "ppt", "powerpoint", "幻灯片", "演示文稿"),
 }
 
+CAPABILITY_TERMS = {
+    "fetch_web_content": ("网络", "网页", "联网", "上网", "浏览", "网址", "抓取", "网页阅读", "网络查询"),
+    "search_codebase": ("搜代码", "查找代码", "代码搜索", "代码索引", "函数定位"),
+    "read_files": ("读取文件", "读文件", "文件内容"),
+    "run_commands": ("执行命令", "终端", "运行测试", "跑测试"),
+}
+
+
+def allowed_by_constraints(item, state):
+    constraints = state.get("constraints", {})
+    return not ((constraints.get("network_forbidden") and item.spec.network)
+                or (constraints.get("read_only") and item.spec.side_effect))
+
 
 def task_routes(state):
     profile = state.get("profile", "direct_answer")
-    routes = {"base", profile, *state.get("protocols", [])}
-    text = str(state.get("objective", "")).casefold()
-    if re.search(r"\b(?:local|files?|directory|workspace)\b", text):
-        routes.add("local_files")
-    if re.search(r"\b(?:tests?|testing|pytest)\b", text):
-        routes.add("testing")
-    if re.search(r"\b(?:web|online|internet)\b", text):
-        routes.add("web")
+    routes = {"base", profile, *state.get("protocols", []), *state.get("capability_routes", [])}
     if profile.startswith("web") or state.get("reuse_evidence"):
         routes.add("web")
-    if any(
-        word in text
-        for word in ("图片", "截图", "图像", "image", ".png", ".webp", ".jpg")
-    ):
-        routes.add("image")
-    if any(word in text for word in ("后台", "作业", "job_", "background job")) or state.get("background_jobs"):
+    if state.get("background_jobs"):
         routes.add("jobs")
-    if "mcp" in text:
-        routes.add("mcp")
     if state.get("output_refs"):
         routes.add("tool_output")
-    if any(word in text for word in ("技能", "skill")):
-        routes.add("skill")
-    if any(
-        word in text
-        for word in ("历史", "记忆", "之前", "上次", "上一轮", "之前的", "memory")
-    ):
-        routes.add("memory")
-    for fmt, words in FORMAT_TERMS.items():
-        if any(word in text for word in words):
-            routes.add(fmt)
     return routes
 
 
@@ -50,19 +40,33 @@ def select_tools(available, state, skill_tools=()):
     if state.get("history_lookup"):
         return [item for item in available if item.spec.history_lookup]
     routes = task_routes(state)
-    explicit = set(state.get("discovered_tools", ())) | set(skill_tools)
+    protected = set(skill_tools) | {call["name"] for call in state.get("pending_tools", [])}
+    if state.get("explicit_discovery"):
+        protected.add(state["explicit_discovery"])
+    protected.update(item.get("tool") for item in state.get("tool_activity", [])[-6:] if item.get("tool") != "discover_tools")
+    protected.update(item.name for item in available if "base" in item.spec.routes)
     words = set(re.findall(r"[a-z][a-z0-9_]+", str(state.get("objective", "")).lower()))
-    return [
-        item
-        for item in available
-        if item.name in explicit
-        or item.name in words
-        or routes.intersection(item.spec.routes)
-    ]
+    discovered = list(reversed(state.get("discovered_tools", ())))
+    ranks = {name: i for i, name in enumerate(discovered)}
+    candidates = [item for item in available if allowed_by_constraints(item, state) and (
+        item.name in protected or item.name in ranks or item.name in words or routes.intersection(item.spec.routes))]
+    # 基础、活动 Skill、最近使用和待执行工具保留；其余按定义字符预算选择。
+    ordered = sorted(candidates, key=lambda item: (item.name not in protected, ranks.get(item.name, len(ranks)), item.name))
+    remaining = 24000
+    selected = set()
+    for item in ordered:
+        size = len(json.dumps(item.definition(), ensure_ascii=False))
+        if item.name in protected or size <= remaining:
+            selected.add(item.name)
+            remaining -= size
+    return [item for item in available if item.name in selected]
 
 
 def discover(available, query, limit):
     words = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", query.casefold())
+    words.extend(name for name, aliases in CAPABILITY_TERMS.items() if any(alias in query for alias in aliases))
+    # 中文没有空格时，用短片段补召回；精确工具名仍有最高权重。
+    fragments = {word[i:i+2] for word in words if re.fullmatch(r"[\u3400-\u9fff]+", word) for i in range(len(word)-1)}
     words.extend(
         fmt
         for fmt, aliases in FORMAT_TERMS.items()
@@ -85,6 +89,7 @@ def discover(available, query, limit):
             else 0
             for word in words
         )
+        score += min(3, sum(fragment in fields for fragment in fragments))
         if score:
             scored.append((-score, item.name, item.description))
     return [

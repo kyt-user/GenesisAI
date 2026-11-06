@@ -19,7 +19,7 @@ from rich.console import Console
 from genesisai.shared.messages import Response, ToolCall
 from genesisai.app.terminal_view import CliView
 from genesisai.core.prompt.context_budgeter import ContextBudgeter
-from genesisai.shared.budgets import select_initial_profile
+from genesisai.core.prompt.task_protocols import select_initial_profile
 from genesisai.core.prompt.composer import PromptComposer
 from genesisai.core.persistence.session import Session
 from genesisai.shared.security import Access

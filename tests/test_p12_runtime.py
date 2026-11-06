@@ -419,7 +419,7 @@ def test_cached_new_spans_count_as_progress_but_duplicates_do_not(runtime_env):
     assert store.record.run_runtime['usage']['observations'] == before + 1
 
 
-def test_followup_keeps_full_previous_pages_when_under_capacity(runtime_env):
+def test_followup_archives_previous_pages_even_when_under_capacity(runtime_env):
     store, runtime = runtime_env
     runner = Runner(FakeModel(Response(content='之前的答案')), runtime)
     runner.start('产品规格')
@@ -429,6 +429,8 @@ def test_followup_keeps_full_previous_pages_when_under_capacity(runtime_env):
     runner.start('它的价格呢')
     context = runner.model.contexts[0]
     previous = next(json.loads(m.content) for m in context if m.tool_call_id == 'fixture')
-    assert len(previous['data']['text']) == 4000
+    assert len(previous['data']['text']) < 4000 and previous['body_omitted']
+    original = json.loads(runtime.memory.read(previous['history_ref'])['text'])
+    assert json.loads(original['content'])['data']['text'] == 'Z' * 4000
     assert any(m.content == '之前的答案' for m in context)
 

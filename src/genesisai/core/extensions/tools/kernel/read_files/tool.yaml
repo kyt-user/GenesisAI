@@ -1,4 +1,4 @@
 name: read_files
 enabled: true
 category: kernel
-description: 读取一个或多个授权文件正文，支持行范围或偏移分页；可一次读取多文件
+description: 读取授权文件正文；path/paths 使用统一范围，files 可为每个文件指定独立行范围或字符偏移。max_output_chars 限制总正文，remaining_requests 可直接作为后续 files 继续读取。

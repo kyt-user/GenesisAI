@@ -1,9 +1,11 @@
 """Built-in providers. New sources register without changing the assembler."""
 
 import json
+import sys
 from pathlib import Path
 from genesisai.core.extensions.rules import RulesLoader
 from genesisai.core.prompt.providers import ContextBlock
+from genesisai.shared.execution import execution_facts
 
 
 def runtime_context(request):
@@ -21,7 +23,13 @@ def runtime_context(request):
         project_id=record.project_id,
         workspace_id=record.workspace_id,
         permission_mode=record.permission_mode,
+        platform=sys.platform,
         previous_outcome=record.last_run_outcome,
+        recent_execution=session.get_logger().journal.clean(execution_facts(
+            record,
+            (record.last_run_outcome or {}).get("tool_activity", [])
+            + record.run_runtime.get("tool_activity", []),
+        )),
         stale_files=stale,
         search_diagnostics=record.run_runtime.get("search_diagnostics", {}),
         failed_resources=record.run_runtime.get("failed_resources", {}),
@@ -31,6 +39,8 @@ def runtime_context(request):
         "所有相对路径以 workspace 为基准。不要用工具重新探测工作区。"
         "\n权限由运行时执行。失效文件快照必须重新读取；历史执行结果仍可查阅。"
         "\n历史图片只有引用时，用 read_image(image_ref) 重新加载后再作视觉判断。"
+        "\nrecent_execution 来自工具账本。executor_started 只表示执行器已进入实现，不代表子进程启动或运行成功；"
+        "只能根据 error、exit_code、passed 描述实际结果，不得把猜测或未执行的调用写成验证成功。"
         "\n" + json.dumps(state, ensure_ascii=False)
     )
     yield ContextBlock(

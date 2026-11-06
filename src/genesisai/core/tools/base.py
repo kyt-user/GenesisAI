@@ -70,9 +70,9 @@ class Tool:
             if validator is None:
                 raise SchemaConfigError(f"Schema 配置无效：不支持的类型 '{expected}'")
             if not validator(args[name]):
-                raise SchemaValidationError(f"字段 '{name}' 必须是 {expected} 类型")
+                raise SchemaValidationError(f"字段 '{name}' 必须是 {expected} 类型，实际为 {type(args[name]).__name__}；请修正参数后重试")
             if "enum" in definition and args[name] not in definition["enum"]:
-                raise SchemaValidationError(f"字段 '{name}' 不在允许的选项中")
+                raise SchemaValidationError(f"字段 '{name}' 不在允许的选项中；允许值：{definition['enum']}")
             self._validate_bounds(args[name], definition, name)
 
     def _validate_schema(self) -> None:
@@ -123,13 +123,13 @@ class Tool:
     def _validate_bounds(cls, value, definition, name):
         if isinstance(value, str):
             if len(value) < definition.get("minLength", 0) or len(value) > definition.get("maxLength", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 长度超限")
+                raise SchemaValidationError(f"字段 '{name}' 长度超限：实际 {len(value)}，允许 {definition.get('minLength', 0)}..{definition.get('maxLength', '不限')}")
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             if value < definition.get("minimum", -float("inf")) or value > definition.get("maximum", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 数值超限")
+                raise SchemaValidationError(f"字段 '{name}' 数值超限：实际 {value}，允许 {definition.get('minimum', '不限')}..{definition.get('maximum', '不限')}；请修正后重试")
         elif isinstance(value, list):
             if len(value) < definition.get("minItems", 0) or len(value) > definition.get("maxItems", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 项数超限")
+                raise SchemaValidationError(f"字段 '{name}' 项数超限：实际 {len(value)}，允许 {definition.get('minItems', 0)}..{definition.get('maxItems', '不限')}")
             item_schema = definition.get("items", {})
             for item in value:
                 if item_schema.get("type") == "string" and not isinstance(item, str):

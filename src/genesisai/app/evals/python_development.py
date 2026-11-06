@@ -177,7 +177,12 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
     inspection = ((store.record.calls.get('inspect') or {}).get('result') or {}).get('data') or {}
     run_calls = [(item.get('result') or {}).get('data') or {} for item in store.record.calls.values() if (item.get('call') or {}).get('name') == 'run_commands']
     test_commands = [data.get("command", []) for data in run_calls if "summary" in data]
-    diff_checked = any((data.get("command") or [""])[:1] == ["git"] for data in run_calls)
+    diff_checked = any(
+        Path((data.get("command") or [""])[0]).stem.casefold() == "git"
+        and data["command"][1:] == ["diff"] and data.get("exit_code") == 0
+        and "src/taskboard/service.py" in data.get("stdout", "")
+        for data in run_calls
+    )
     checks = {
         "runner_completed": result["status"] == "completed",
         "plan_ready": bool(task and task["plan_ready"]),

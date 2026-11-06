@@ -7,7 +7,8 @@ from pathlib import Path
 import re
 
 from genesisai.shared.security import ToolError
-from genesisai.core.extensions.tools.shell.process import run_process, validate_command
+from genesisai.core.extensions.tools.shell.process import run_process
+from genesisai.core.extensions.tools.shell.commands import resolve_command
 from genesisai.core.extensions.tools.shell.python_support import (
     automatic_frontend_command,
     automatic_test_command,
@@ -68,7 +69,7 @@ class Implementation:
                 detection = {"test_framework": "cargo", "test_detection_reason": "发现 Cargo.toml"}
             elif not command:
                 raise ToolError("test_command_unknown", "无法识别测试入口，请显式提供 command")
-        return operation, validate_command(command), root, args.get("timeout_seconds", 120), detection
+        return operation, resolve_command(command, root), root, args.get("timeout_seconds", 120), detection
 
     def prepare(self, context, args):
         operation, command, root, timeout, detection = self._resolve(context, args)
@@ -82,14 +83,19 @@ class Implementation:
         operation, command, root, timeout, detection = self._resolve(context, args)
         if operation == "inspect":
             return inspect_python_project(root)
-        if args.get("background"):
-            job = context.runtime.jobs.start(command, str(root), timeout)
-            context.store.record.run_runtime["background_jobs"] = True
-            return job
         is_test = detection is not None or _test_entrypoint(command) is not None
+        framework = (detection or {}).get("test_framework") or _test_entrypoint(command)
+        if args.get("background"):
+            task = context.runtime.tasks.active_task() or {}
+            job = context.runtime.jobs.start(command, str(root), timeout, framework=framework if is_test else None, task_id=task.get("id"))
+            context.store.record.run_runtime["background_jobs"] = True
+            if is_test:
+                state = context.store.record.run_runtime
+                state["pending_verification_jobs"] = [*state.get("pending_verification_jobs", []), job["job_id"]]
+                state["verification_required"] = True
+            return job
         result = run_process(context, command, root, timeout, kind="test" if is_test else "shell")
         if is_test:
-            framework = (detection or {}).get("test_framework") or _test_entrypoint(command)
             result.update(
                 framework=framework,
                 selected_automatically=detection is not None,
