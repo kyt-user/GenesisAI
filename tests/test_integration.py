@@ -76,7 +76,7 @@ def test_A15_provider_parsing_and_rate_limit():
     def duck(request):
         return httpx.Response(200,text='<a class="result__a" href="https://example.com/">Example</a>')
     client=httpx.Client(transport=httpx.MockTransport(duck))
-    assert DuckDuckGoSearchProvider(client=client).search(SearchQuery('example'))[0].title=='Example'
+    assert DuckDuckGoSearchProvider(client=client).search(SearchQuery('example')).hits[0].title=='Example'
     client=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(429)))
     with pytest.raises(SearchError) as error:
         BraveSearchProvider('fake',client=client).search(SearchQuery('example'))
@@ -109,7 +109,7 @@ def test_bing_rss_parser():
     import httpx
     from genesisai.core.extensions.tools.web.providers.bing import BingSearchProvider
     client=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,content=b'<rss><channel><item><title>Python</title><link>https://www.python.org/</link><description>Official</description></item></channel></rss>')))
-    hit=BingSearchProvider(client).search(SearchQuery('python'))[0]
+    hit=BingSearchProvider(client).search(SearchQuery('python')).hits[0]
     assert hit.provider=='bing_rss' and hit.url=='https://www.python.org/'
 
 
@@ -140,12 +140,12 @@ def test_default_model_uses_project_config(monkeypatch):
     class Client:
         def __init__(self,**kwargs):
             captured.update(kwargs)
-            self.client=type('OpenAI',(),{'base_url':'https://api.deepseek.com'})()
+            self.base_url='https://api.deepseek.com'
     monkeypatch.setattr('genesisai.model.providers.deepseek.DeepSeekClient',Client)
     monkeypatch.setenv('DEEPSEEK_API_KEY','configured-for-test')
     client,remote=config.build_model()
     assert captured['model']=='deepseek-v4-flash' and remote
-    assert captured['generation']=={'temperature':0.6,'max_tokens':2048}
+    assert captured['generation']=={'temperature':0.6,'max_tokens':8192}
 
 
 def test_model_yaml_rejects_unknown_and_invalid_generation(tmp_path):

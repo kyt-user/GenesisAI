@@ -23,6 +23,7 @@ from genesisai.shared.messages import Response, ToolCall
 from genesisai.shared.security import Access
 from genesisai.core.persistence.session import Session
 from genesisai.core.persistence.files import atomic_json
+from genesisai.app.evals.plan_steps import complete_plan
 
 
 CASE_FIELDS = frozenset({"id", "name", "expectations"})
@@ -66,7 +67,8 @@ class ScriptedModel:
         self.calls += 1
         if not self.responses:
             raise AssertionError("仿真模型响应已耗尽")
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        return item(messages) if callable(item) else item
 
     def stream_chat(self, messages, tools=None, **kwargs):
         yield self.chat(messages, tools)
@@ -149,18 +151,23 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
     )
     responses = [
         _tool("plan", "plan", {
-            "steps": ["检查 Python 项目与失败测试", "修复标签规范化逻辑", "检查 Git 差异并运行完整测试"],
-            "acceptance": ["原有测试文件保持不变", "pytest 全部通过", "任务状态为 verified"],
+            'operation': 'update', 'expected_revision': 0,
+            'upsert': [
+                {'id': 'inspect', 'kind': 'step', 'text': '检查 Python 项目与失败测试'},
+                {'id': 'fix', 'kind': 'step', 'text': '修复标签规范化逻辑'},
+                {'id': 'validate', 'kind': 'acceptance', 'text': 'pytest 全部通过且原测试文件不变', 'requires_verification': True},
+            ],
             "non_goals": ["不修改公共 API", "不执行 Git 写操作"],
         }),
-        _tool("inspect", "run_commands", {"operation": "inspect", "cwd": "."}),
-        _tool("reproduce", "run_commands", {"operation": "run", "cwd": ".", "timeout_seconds": 60}),
+        _tool("inspect", "inspect_project", {"cwd": "."}),
+        _tool("reproduce", "run_commands", {"cwd": ".", "timeout_seconds": 60}),
         _tool("read", "read_files", {"path": "src/taskboard/service.py"}),
         _tool("patch", "editor", {
             "operation": "patch", "path": "src/taskboard/service.py", "patch": patch, "expected_sha256": expected_sha,
         }),
-        _tool("diff", "run_commands", {"operation": "run", "command": ["git", "diff"], "cwd": "."}),
-        Response(content="实现已完成，准备交付。"),
+        _tool("diff", "run_commands", {"command": ["git", "diff"], "cwd": "."}),
+        _tool("verify", "run_commands", {"cwd": ".", "timeout_seconds": 60}),
+        lambda messages: complete_plan(runtime)(messages),
         Response(content="已完成标签规范化修复；pytest 已通过，测试文件未修改。"),
     ]
     store, runtime = _runtime(workspace, case_root)
@@ -194,7 +201,7 @@ def _run_development_loop(fixture: Path, output: Path) -> dict:
         ),
         "failure_reproduced": len(test_commands) >= 2,
         "diff_checked": diff_checked,
-        "automatic_verification_survived_diff": bool(task and task["status"] == "verified"),
+        "explicit_verification_survived_diff": bool(task and task["status"] == "completed" and task['verification_passed']),
         "external_tests_passed": external.returncode == 0,
         "tests_unchanged": (workspace / "tests" / "test_service.py").read_bytes() == original_test,
         "fixture_unchanged": inventory(fixture) == baseline,
@@ -211,12 +218,19 @@ def _run_resume_and_drift(fixture: Path, output: Path) -> dict:
     store, runtime = _runtime(workspace, case_root)
     first = runtime.tasks
     task = first.begin_task("继续实现 Python 项目", run_id="run_before_restart")
-    first.set_plan(steps=["检查实现", "运行测试"], acceptance=["测试通过"])
+    store.record.run_id = 'run_before_restart'
+    store.commit()
+    first.update_plan(expected_revision=0, upsert=[
+        {'id': 'inspect', 'kind': 'step', 'text': '检查实现'},
+        {'id': 'test', 'kind': 'acceptance', 'text': '测试通过', 'requires_verification': True},
+    ])
     target = workspace / "src" / "taskboard" / "service.py"
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     first.observe([{'kind':'resource_read','path':str(target),'sha256':digest}])
     restarted = TaskService(Session(store.root,store.id))
     before = restarted.begin_task("继续实现 Python 项目", run_id="run_after_restart")
+    restarted.session.record.run_id = 'run_after_restart'
+    restarted.session.commit()
     restarted.observe([{'kind':'verification','passed':True}])
     restarted.finish('completed','已完成首次验收')
     with target.open("a", encoding="utf-8") as stream:
@@ -238,7 +252,9 @@ def _run_failed_gate(fixture: Path, output: Path) -> dict:
     target = workspace / "src" / "taskboard" / "service.py"
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     responses = [
-        _tool("failed_plan", "plan", {"steps": ["尝试修复产品代码"], "acceptance": ["pytest 通过"]}),
+        _tool("failed_plan", "plan", {'operation': 'update', 'expected_revision': 0, 'upsert': [
+            {'id': 'fix', 'kind': 'step', 'text': '尝试修复产品代码'},
+            {'id': 'test', 'kind': 'acceptance', 'text': 'pytest通过', 'requires_verification': True}]}),
         _tool("failed_read", "read_files", {"path": "src/taskboard/service.py"}),
         _tool("failed_patch", "editor", {
             "operation": "patch",
@@ -246,10 +262,11 @@ def _run_failed_gate(fixture: Path, output: Path) -> dict:
             "patch": '@@ -1,1 +1,1 @@\n-"""Task creation domain logic."""\n+"""Task creation domain logic used in tests."""',
             "expected_sha256": digest,
         }),
-        Response(content="修改完成。"),
+        _tool("failed_verify", "run_commands", {"cwd": ".", "timeout_seconds": 60}),
         Response(content="测试仍未通过。"),
         Response(content="尚未找到修复。"),
         Response(content="当前改动未能通过验收。"),
+        Response(content="任务仍未完成，保留真实失败记录。"),
     ]
     store, runtime = _runtime(workspace, case_root)
     result = Runner(ScriptedModel(responses), runtime, max_rounds=16, seconds=120).start(
@@ -258,7 +275,7 @@ def _run_failed_gate(fixture: Path, output: Path) -> dict:
     manager = TaskService(store)
     task = manager.active_task()
     contents = json.dumps(task, ensure_ascii=False)
-    checks = {'runner_not_completed': result['status'] == 'partial', 'not_verified': task['status'] == 'needs_verification', 'verification_retried_with_bound': sum((1 for item in store.record.calls.values() if (item.get('call') or {}).get('name') == 'run_commands' and 'summary' in ((item.get('result') or {}).get('data') or {}))) == 3, 'failed_result_recorded': any(o['kind']=='verification' and o['passed'] is False for o in task['observations']), 'secret_redacted': 'should-not-leak' not in contents and '[REDACTED]' in contents, 'fixture_unchanged': inventory(fixture) == baseline}
+    checks = {'runner_not_completed': result['status'] == 'partial', 'not_verified': task['status'] == 'needs_verification', 'unchanged_revision_not_retested': sum((1 for item in store.record.calls.values() if (item.get('call') or {}).get('name') == 'run_commands' and 'summary' in ((item.get('result') or {}).get('data') or {}))) == 1, 'failed_result_recorded': any(o['kind']=='verification' and o['passed'] is False for o in task['observations']), 'secret_redacted': 'should-not-leak' not in contents and '[REDACTED]' in contents, 'fixture_unchanged': inventory(fixture) == baseline}
     return {
         "id": "failed_acceptance_gate", "status": "passed" if all(checks.values()) else "failed",
         "checks": checks, "runner_status": result["status"], "task": task,

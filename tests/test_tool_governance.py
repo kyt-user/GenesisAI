@@ -182,21 +182,27 @@ def test_successful_proposal_needs_no_extra_model_request(env):
     assert store.record.messages[-1]["content"] == "结论"
 
 
-def test_completion_proposal_cannot_skip_required_changes(tmp_path):
+def test_completion_proposal_requires_execution_evidence(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     model = FakeModel(
         *[
             response(call("attempt_completion", {"result": "任务已完成"}, f"p{i}"))
-            for i in range(2)
+            for i in range(4)
         ]
     )
     result = Runner(model, runtime).start("开始")
     assert result["status"] == "partial"
-    assert store.record.run_runtime["stop_reason"] == "tool_required"
+    assert store.record.run_runtime["stop_reason"] == "recovery_stalled"
 
 
 def test_registered_proposal_runs_real_verifier(tmp_path):
-    workspace, _, _, store, runtime = development_env(tmp_path)
+    from genesisai.app.evals.plan_steps import complete_plan
+    workspace, manager, _, store, runtime = development_env(tmp_path, planned=False)
+    manager.begin_task('创建 main.py 并验证', new_task=True)
+    manager.update_plan(expected_revision=0, upsert=[
+        {'id': 'code', 'kind': 'step', 'text': '创建 main.py'},
+        {'id': 'accept', 'kind': 'acceptance', 'text': '真实验证通过', 'requires_verification': True},
+    ])
 
     class Submit:
         def prepare(self, context, args):
@@ -213,6 +219,10 @@ def test_registered_proposal_runs_real_verifier(tmp_path):
         completion_field="answer",
         routes=("coding",),
     )
+    runtime.development.register_verifier('python_syntax', lambda workspace, state, available: {
+        'name': 'run_commands',
+        'arguments': {'command': [sys.executable, '-m', 'py_compile', 'main.py'], 'verification': 'static'},
+    })
     model = FakeModel(
         response(
             call(
@@ -222,6 +232,7 @@ def test_registered_proposal_runs_real_verifier(tmp_path):
             )
         ),
         response(call("custom_submit", {}, "submit")),
+        complete_plan(runtime),
         Response(content="验证通过"),
     )
     result = Runner(model, runtime).start("开始")
@@ -236,23 +247,11 @@ def test_registered_proposal_runs_real_verifier(tmp_path):
 
 def test_stalled_stdio_mcp_closes_owned_server(env, tmp_path):
     from dataclasses import replace
-    from genesisai.core.extensions.mcp.bridge import McpBridge
+    from genesisai.core.extensions.mcp.bridge import McpBridge, McpServerSpec
 
     _, _, store, runtime = env
-    config = {
-        "servers": {
-            "slow": {
-                "command": sys.executable,
-                "args": ["-c", "import sys,time; sys.stdin.readline(); time.sleep(30)"],
-            }
-        }
-    }
-    (tmp_path / "mcp.json").write_text(json.dumps(config), encoding="utf8")
-    bridge = McpBridge(tmp_path, runtime.registry, runtime.loader).configure({})
-    descriptor = runtime.registry.get("connect_mcp")
-    runtime.registry.register(
-        replace(descriptor, spec=replace(descriptor.spec, timeout_seconds=1))
-    )
+    servers = [McpServerSpec("slow", "stdio", sys.executable, ("-c", "import sys,time; sys.stdin.readline(); time.sleep(30)"), request_timeouts={"first_response": 1})]
+    bridge = McpBridge(tmp_path, runtime.registry, runtime.loader).configure({}, servers=servers)
     before = time.monotonic()
     result = runtime.execute(call("connect_mcp", {"server": "slow"}, "connect"))
     assert time.monotonic() - before < 3

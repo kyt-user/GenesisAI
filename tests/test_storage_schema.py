@@ -15,7 +15,7 @@ def test_new_session_has_database_schema_and_no_json_session(tmp_path):
         == SCHEMA_VERSION
     )
     assert not (session.root / "sessions").exists()
-    assert session.record.tool_runtime == {"active_skills": []}
+    assert session.record.tool_runtime == {"active_skills": {}}
 
 
 def test_load_is_idempotent_and_history_is_immutable(tmp_path):

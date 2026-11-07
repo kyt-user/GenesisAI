@@ -1,3 +1,4 @@
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 from session_helpers import persisted_sessions
 """CLI 展示层及预留命令的行为验证。"""
 
@@ -77,12 +78,12 @@ def test_confirmation_card_keeps_target_and_actions_visible():
 def test_tools_view_shows_all_runtime_layers():
     view, stream = recording_view()
     view.render_tools({
-        "enabled": [{"name": "read_files", "category": "kernel", "description": "读取"}],
-        "disabled": [{"name": "fetch_web_content", "category": "kernel", "description": "搜索", "reason": "已禁用"}],
+        "builtin": [{"name": "read_files", "category": "kernel", "description": "读取", "enabled": True}],
+        "external": [{"name": "fetch_web_content", "category": "mcp", "description": "搜索", "reason": "已禁用", "enabled": False}],
     })
 
     output = stream.getvalue()
-    assert all(label in output for label in ("Enabled", "Disabled"))
+    assert all(label in output for label in ("内置", "外挂"))
     assert "fetch_web_content（已禁用）" in output
     assert "read_files" in output
 
@@ -97,6 +98,47 @@ def test_local_inspection_commands_do_not_call_model(tmp_path, monkeypatch):
 
     assert main(["--workspace", str(tmp_path / "work")]) == 0
     assert model.contexts == []
+
+
+def test_capability_commands_inspect_and_handle_errors_without_model(tmp_path, monkeypatch):
+    import genesisai.app.cli as cli
+    model = FakeModel()
+    view, stream = recording_view()
+    monkeypatch.setattr(cli, "Console", lambda **kwargs: view.console)
+    monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
+    commands = iter(["/capabilities", "/capabilities protocol", "/capabilities show missing", "/exit"])
+    monkeypatch.setattr(Console, "input", lambda *args, **kwargs: next(commands))
+    assert main(["--workspace", str(tmp_path / "work")]) == 0
+    assert model.contexts == []
+    output = stream.getvalue()
+    assert "builtin" in output and "external" in output
+    assert "当前作用域不存在此能力草稿" in output
+
+
+def test_create_command_builds_tests_and_requires_approval_in_auto_mode(tmp_path, monkeypatch):
+    import genesisai.app.cli as cli
+    from genesisai.core.capabilities.store import CapabilityStore
+    from test_capability_lifecycle import tool_package, reference, draft_args
+    package = tool_package()
+    def next_step(name):
+        def reply(messages):
+            session = persisted_sessions()[0]
+            library = CapabilityStore(application_home(), session["project_id"])
+            item = library.list()[0]
+            args = {"id": item["id"], "expected_revision": item["revision"]} if name == "freeze_capability" else reference(item)
+            return response(call(name, args, name))
+        return reply
+    model = FakeModel(response(call("create_tool", draft_args(package, tmp_path / "work"), "create")),
+                      next_step("freeze_capability"), next_step("test_capability"), next_step("register_capability"), Response(content="能力已验收注册"))
+    monkeypatch.setattr(cli, "build_model", lambda path: (model, False))
+    commands = iter(["/permissions auto", "/create_tool 将整数翻倍并测试，完成后让我验收", "/approve", "/exit"])
+    monkeypatch.setattr(Console, "input", lambda *args, **kwargs: next(commands))
+    assert main(["--workspace", str(tmp_path / "work")]) == 0
+    session = persisted_sessions()[0]
+    library = CapabilityStore(application_home(), session["project_id"])
+    assert len(library.active()) == 1
+    assert library.active()[0]["package"]["name"] == "double_value"
+    assert not (tmp_path / "work" / "output.txt").exists()
 
 
 def test_help_and_dispatch_remove_retired_commands(tmp_path, monkeypatch):
@@ -137,7 +179,7 @@ def test_new_command_creates_fresh_session_and_preserves_old_one(tmp_path, monke
     new = next(item for item in payloads if any(message.get("content") == "new question" for message in item["messages"]))
     assert any(message.get("content") == "old answer" for message in old["messages"])
     assert all(message.get("content") not in {"old question", "old answer"} for message in new["messages"])
-    assert new["tool_runtime"] == {"active_skills": []}
+    assert new["tool_runtime"] == {"active_skills": {}}
     assert old["id"] != new["id"]
     assert old["output"] == new["output"] == str(work.resolve())
 
@@ -270,7 +312,7 @@ def test_new_session_resets_session_and_dispatches_full_tool_set(tmp_path, monke
     assert tool_names(model.tool_definitions[0]) == tool_names(model.tool_definitions[1])
     payloads = persisted_sessions()
     new = next(item for item in payloads if any(message.get("content") == "new task" for message in item["messages"]))
-    assert new["tool_runtime"] == {"active_skills": []}
+    assert new["tool_runtime"] == {"active_skills": {}}
 
 
 def test_other_plain_text_cannot_approve_pending_call(tmp_path, monkeypatch):
@@ -320,7 +362,7 @@ def test_auto_mode_allows_public_search(tmp_path, monkeypatch):
         name = "fixture"
 
         def search(self, query, limit=5):
-            return [{"title": "Apple", "url": "https://public.test/", "snippet": "result"}]
+            return SearchPage([{"title": "Apple", "url": "https://public.test/", "snippet": "result"}])
 
     def runtime_factory(store, access, **kwargs):
         return RealToolRuntime(store, access, providers=[Provider()], **kwargs)
@@ -350,7 +392,7 @@ def test_remote_model_and_public_search_permissions_are_separate(tmp_path, monke
         name = "fixture"
 
         def search(self, query, limit=5):
-            return []
+            return SearchPage([])
 
     def runtime_factory(store, access, **kwargs):
         return RealToolRuntime(store, access, providers=[Provider()], **kwargs)

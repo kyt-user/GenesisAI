@@ -1,4 +1,4 @@
 name: pdf_create
 enabled: true
 category: office
-description: 创建基础分页文字 PDF 并重新打开验证
+description: 创建自动换行和分页的基础文字PDF，不裁切行尾；覆盖须overwrite和expected_sha256

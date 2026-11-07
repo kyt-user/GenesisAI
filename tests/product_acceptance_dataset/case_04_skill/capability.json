@@ -1,0 +1,67 @@
+{
+  "kind": "skill",
+  "name": "project_check",
+  "description": "Run real project checks and report the result",
+  "scope": "project",
+  "definition": {
+    "entry": "SKILL.md",
+    "stages": {
+      "run": {
+        "depends_on": [],
+        "required_tools": [
+          "run_commands"
+        ],
+        "optional_tools": []
+      }
+    }
+  },
+  "files": {
+    "SKILL.md": {
+      "path": "capability_assets/SKILL.md"
+    }
+  },
+  "tests": [
+    {
+      "name": "pytest and artifact",
+      "input": {
+        "prompt": "按照已加载的 Skill 执行 pytest 并生成 check.txt",
+        "stage": "run"
+      },
+      "fixtures": {
+        "test_example.py": {
+          "path": "capability_assets/test_example.py"
+        }
+      },
+      "expect": {
+        "type": "object",
+        "properties": {
+          "artifacts": {
+            "type": "object",
+            "properties": {
+              "check.txt": {
+                "properties": {
+                  "sha256": {
+                    "const": "5a7d6e6666b6fca58b97594f22f8b7b95b98dc0763de9cb698181cf074b3b660"
+                  },
+                  "kind": {
+                    "const": "text"
+                  }
+                },
+                "required": [
+                  "sha256",
+                  "kind"
+                ]
+              }
+            },
+            "required": [
+              "check.txt"
+            ]
+          }
+        },
+        "required": [
+          "artifacts"
+        ]
+      }
+    }
+  ]
+}

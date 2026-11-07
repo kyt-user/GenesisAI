@@ -2,7 +2,21 @@ provider: deepseek
 model: deepseek-v4-flash
 generation:
   temperature: 0.6
-  max_tokens: 2048
+  max_tokens: 8192
+
+# 请求分层时限（秒）；total 只在显式配置时限制持续生成。
+request_timeouts:
+  connect: 30
+  first_token: 300
+  idle: 300
+  total: null
+
+# 同一次模型调用的临时故障按时长恢复；0 关闭重试。
+retry:
+  budget_seconds: 600
+  initial_delay_seconds: 1
+  max_delay_seconds: 30
+  jitter_ratio: 0.2
 
 # 应用保守默认值，并非供应商模型规格；按实际模型容量修改。
 context:
@@ -15,8 +29,11 @@ context:
   summary_max_tokens: 2048
   strategy: agentic
   # 图片输入的应用限制；需选择已确认支持图片的模型。
-  max_images: 4
+  # 不固定图片数量；可按供应商限制显式设置，每批仍受字节和上下文预算约束。
+  max_images: null
   max_image_bytes: 10485760
   max_image_pixels: 32000000
   image_max_side: 1536
   max_request_image_bytes: 12582912
+  # 待提交附件原图与预览的内存配额，与一次模型请求的传输预算分别计算。
+  max_pending_image_bytes: 134217728

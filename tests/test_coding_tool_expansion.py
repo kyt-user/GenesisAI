@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 
 import pytest
 
@@ -99,7 +100,7 @@ def test_background_job_survives_worker_and_requires_stop_approval(env):
         assert result["ok"] and result["observations"] == [], result
         job = result["data"]["job_id"]
         read = runtime.execute(
-            call("read_job", {"job_id": job, "output": True, "limit": 3}, "read")
+            call("read_job", {"job_id": job, "output": True, "limit": 3, "wait_seconds": .5}, "read")
         )
         assert read["data"]["text"] == "rea" and read["data"]["status"] == "running"
         stop = call("stop_job", {"job_id": job}, "stop")
@@ -154,14 +155,24 @@ def test_real_python_lsp(env, tmp_path, operation, expected):
     )
     cfg = {".py": {"command": [sys.executable, "-m", "pylsp"], "language": "python"}}
     (tmp_path / "lsp.json").write_text(json.dumps({"servers": cfg}), encoding="utf-8")
-    register_lsp(tmp_path, runtime.registry, runtime.loader)
+    runtime.lsp = register_lsp(tmp_path, runtime.registry, runtime.loader, state_root=runtime.store.root)
     args = {"operation": operation, "path": "nav.py", "line": 4, "column": 2}
     runtime.set_permission("user")
     req = call("lsp_query", args)
     assert runtime.execute(req)["preview"]["command"] == [sys.executable, "-m", "pylsp"]
     result = runtime.execute(req, runtime.store.record.calls[req["id"]]["digest"])
     assert result["ok"], result
+    deadline, attempt = time.monotonic() + 15, 0
+    while result['data']['status'] in {'queued', 'running'}:
+        assert time.monotonic() < deadline, result
+        time.sleep(.05)
+        attempt += 1
+        result = runtime.execute(call('read_lsp_result', {'query_id': result['data']['query_id']}, f'page{attempt}'))
+        assert result['ok'], result
+    assert result['data']['status'] == 'completed', result
     assert {item["line"] for item in result["data"]["locations"]} == expected
+    runtime.lsp.close()
+    runtime.close()
 
 
 def test_mcp_resources_only_pagination_and_read(env, tmp_path):
@@ -169,8 +180,8 @@ def test_mcp_resources_only_pagination_and_read(env, tmp_path):
 
     class Resources:
         def request(self, method, params):
-            if method == "initialize":
-                return {"capabilities": {"resources": {}}}
+            if method == "server/discover":
+                return {"supportedVersions": ["2026-07-28"], "capabilities": {"resources": {}}}
             if method == "resources/list":
                 return (
                     {"resources": [{"uri": "mem:a"}], "nextCursor": "b"}
@@ -188,15 +199,13 @@ def test_mcp_resources_only_pagination_and_read(env, tmp_path):
         def close(self):
             pass
 
-    (tmp_path / "mcp.json").write_text(
-        '{"servers":{"mem":{"command":"fixture"}}}', encoding="utf-8"
-    )
+    from genesisai.core.extensions.mcp import McpServerSpec
     bridge = McpBridge(
         tmp_path,
         runtime.registry,
         runtime.loader,
         transport_factory=lambda _: Resources(),
-    ).configure({})
+    ).configure({}, servers=[McpServerSpec("mem", "stdio", "fixture")])
     result = runtime.execute(call("connect_mcp", {"server": "mem"}))
     assert result["data"]["tools"] == [] and result["data"]["resources"]
 
@@ -213,7 +222,7 @@ def test_mcp_resources_only_pagination_and_read(env, tmp_path):
 
 
 def test_mcp_validates_nested_constraints_and_propagates_tool_error(env, tmp_path):
-    from test_extensions_seams import FakeTransport, write_mcp_config
+    from test_extensions_seams import FakeTransport, fixture_servers
 
     _, _, store, runtime = env
 
@@ -246,10 +255,9 @@ def test_mcp_validates_nested_constraints_and_propagates_tool_error(env, tmp_pat
                 }
             return super().request(method, params)
 
-    write_mcp_config(tmp_path)
     bridge = McpBridge(
         tmp_path, runtime.registry, runtime.loader, transport_factory=Failing
-    ).configure({})
+    ).configure({}, servers=fixture_servers())
     bridge.connect("fixture")
     bad = runtime.execute(call("mcp_fixture_update", {"items": ["invalid"]}))
     assert bad["error"]["code"] == "validation_error"
@@ -318,7 +326,7 @@ def test_batch_reports_concurrent_change_after_first_write(env):
 
 def test_background_timeout_and_restore(env):
     from time import monotonic, sleep
-    from genesisai.core.extensions.tools.shell.jobs import CommandJobs
+    from genesisai.core.jobs.service import JobService
 
     root, _, store, runtime = env
     args = [sys.executable, "-u", "-c", "import time; print('started'); time.sleep(30)"]
@@ -326,10 +334,10 @@ def test_background_timeout_and_restore(env):
     try:
         deadline = monotonic() + 5
         while (
-            runtime.jobs.status(job)["status"] == "running" and monotonic() < deadline
+            runtime.jobs.status(job)["status"] in {"queued", "running"} and monotonic() < deadline
         ):
             sleep(0.05)
-        restored = CommandJobs(store, str)
+        restored = JobService(store, str)
         assert restored.status(job)["status"] == "timed_out"
         assert "started" in restored.output(job)["text"]
     finally:

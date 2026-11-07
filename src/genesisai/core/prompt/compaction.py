@@ -33,12 +33,34 @@ def estimate_tokens(value):
 def image_placeholder(part):
     return {
         "type": "text",
-        "text": f"[历史图片 {part['name']}，image_ref={part['image_ref']}；本次未附带像素，需要查看时调用 read_image(image_ref)。]",
+        "text": f"[图片 {part['name']}，image_ref={part['image_ref']}；本次未附带像素，不能视为已查看。用 read_image(image_ref, crop/max_side) 分批查看或读取原图区域。]",
     }
 
 
-def project_images(messages, max_images, max_bytes, *, history=False):
-    """Keep the latest user images and current tool image batch; bound older ones."""
+def protected_units(units):
+    """The current request and latest tool observations remain actionable."""
+    latest_user = max((i for i, unit in enumerate(units) if unit[0]['role'] == 'user'), default=-1)
+    latest_tool = max((i for i, unit in enumerate(units) if i > latest_user and unit[0].get('tool_calls')), default=-1)
+    latest_batch = max((i for i, unit in enumerate(units) if i > latest_user and any(
+        image_parts(m.get('content')) or (m.get('metadata') or {}).get('image_projection') for m in unit)), default=-1)
+    return {i for i in (latest_user, latest_tool, latest_batch) if i >= 0}
+
+
+def restore_images(messages, original):
+    """Recover image slots from exact transcript refs before resizing a request."""
+    sources = {p['image_ref']: p for m in original for p in image_parts(m.get('content'))}
+    values = copy.deepcopy(messages)
+    for message in values:
+        metadata = message.get('metadata') or {}
+        for slot in metadata.pop('image_projection', []):
+            if slot['image_ref'] not in sources:
+                raise ValueError('图片投影无法在完整会话中找到原始引用')
+            message['content'][slot['index']] = copy.deepcopy(sources[slot['image_ref']])
+    return values
+
+
+def project_images(messages, max_images, max_bytes, *, history=False, max_tokens=None):
+    """Budget pixels, not asset availability; prioritize explicitly requested views."""
     values = copy.deepcopy(messages)
     last_user = max(
         (i for i, m in enumerate(values) if m["role"] == "user"), default=-1
@@ -62,22 +84,23 @@ def project_images(messages, max_images, max_bytes, *, history=False):
         for j, p in enumerate(m["content"])
         if p.get("type") == "image"
     ]
-    keep = {(i, j) for i, j, p in slots if i in protected}
-    count = len(keep)
-    size = sum(p["byte_size"] for i, j, p in slots if (i, j) in keep)
-    if count > max_images or size > max_bytes:
-        raise ValueError(
-            "当前轮次必要图片超过数量或总大小限制，请减少图片或调整 context 图片预算"
-        )
-    for i, j, p in reversed(slots):
-        if (i, j) in keep:
-            continue
-        if not history and count < max_images and size + p["byte_size"] <= max_bytes:
+    ordered = ([slot for slot in slots if slot[0] in latest_batch]
+               + [slot for slot in slots if slot[0] == last_user]
+               + ([] if history else [slot for slot in reversed(slots) if slot[0] not in protected]))
+    keep, count, size, tokens = set(), 0, 0, 0
+    for i, j, p in ordered:
+        cost = image_tokens(p)
+        if ((max_images is None or count < max_images) and size + p['byte_size'] <= max_bytes
+                and (max_tokens is None or tokens + cost <= max_tokens)):
             keep.add((i, j))
             count += 1
-            size += p["byte_size"]
-        else:
+            size += p['byte_size']
+            tokens += cost
+    for i, j, p in slots:
+        if (i, j) not in keep:
             values[i]["content"][j] = image_placeholder(p)
+            metadata = values[i]['metadata'] = values[i].get('metadata') or {}
+            metadata.setdefault('image_projection', []).append({'index': j, 'image_ref': p['image_ref']})
     return values
 
 
@@ -242,17 +265,15 @@ def execution_facts(messages):
     return list({fact["call_id"]: fact for fact in facts}.values())
 
 
-def project(messages, target_tokens, preserve_recent_tokens, summarize=None):
+def project(messages, target_tokens, preserve_recent_tokens, summarize=None, *, summary_max_tokens=2048):
     """Fold chronological prefixes; keep the latest request and complete tool batches."""
     original = messages
-    messages = project_images(messages, 1000000, 2**63, history=True)
+    messages = project_images(messages, None, 2**63, history=True)
     units = message_units(messages)
     if not units:
         return [], {"strategy": "basic", "folded": False}
-    latest_user = max(
-        (i for i, unit in enumerate(units) if unit[0]["role"] == "user"), default=-1
-    )
-    current = units[latest_user] if latest_user >= 0 else []
+    protected = protected_units(units)
+    current = [m for i in sorted(protected) for m in units[i]]
     tail_budget = min(
         preserve_recent_tokens, max(0, (target_tokens - estimate_tokens(current)) // 2)
     )
@@ -288,10 +309,10 @@ def project(messages, target_tokens, preserve_recent_tokens, summarize=None):
             try:
                 generated = summarize(
                     [shorten(m, 600) for m in fragment],
-                    max(128, min(2048, target_tokens // 6)),
+                    max(128, min(summary_max_tokens, target_tokens // 6)),
                 )
                 if generated and generated.strip():
-                    narrative = generated.strip()[:6000]
+                    narrative = generated.strip()
                     strategy = "agentic"
             except Exception:
                 strategy = "basic_fallback"
@@ -319,18 +340,13 @@ def project(messages, target_tokens, preserve_recent_tokens, summarize=None):
         ]
 
     flatten = lambda chunk: [m for unit in chunk for m in unit]
-    if 0 <= latest_user < cut:
-        projected = [
-            *summary(flatten(units[:latest_user])),
-            *copy.deepcopy(current),
-            *summary(flatten(units[latest_user + 1 : cut])),
-            *copy.deepcopy(flatten(units[cut:])),
-        ]
-    else:
-        projected = [
-            *summary(flatten(units[:cut])),
-            *copy.deepcopy(flatten(units[cut:])),
-        ]
+    projected, start = [], 0
+    for index in sorted(i for i in protected if i < cut):
+        projected.extend(summary(flatten(units[start:index])))
+        projected.extend(copy.deepcopy(units[index]))
+        start = index + 1
+    projected.extend(summary(flatten(units[start:cut])))
+    projected.extend(copy.deepcopy(flatten(units[cut:])))
     if estimate_tokens(projected) > target_tokens:
         raise ValueError(
             "当前请求、执行证据和完整工具批次仍超过上下文目标；请缩小输入或提高 context 容量"

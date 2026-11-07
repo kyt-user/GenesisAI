@@ -1,4 +1,5 @@
 """Real-use regressions; all pages and prices here are synthetic fixtures."""
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 import json
 from dataclasses import asdict
 
@@ -19,11 +20,15 @@ def call(name, args, cid):
 
 
 def seed_page(runtime, url="https://example.com/product"):
+    counter = runtime.store.root / 'fixture-network-count.txt'
+    counter.write_text('0')
     class Network:
-        calls = 0
+        @property
+        def calls(self):
+            return int(counter.read_text())
 
         def fetch(self, url):
-            self.calls += 1
+            counter.write_text(str(self.calls + 1))
             return dict(url=url, title="Fixture product A", text="Product A specifications without price. " * 30, truncated=False)
 
     runtime.network = Network()
@@ -44,12 +49,12 @@ def test_cached_success_never_crashes_or_requests_approval(runtime_env):
     assert len(store.record.run_runtime['evidence_refs']) == 1
 
 
-def test_invalid_url_is_rejected_before_approval(runtime_env):
+def test_new_public_url_can_request_approval(runtime_env):
     _, runtime = runtime_env
     runtime.set_permission("user")
     result = runtime.execute(call("fetch_web_content", {"url": "https://example.com/unknown"}, "bad"))
-    assert not result.get("pending")
-    assert result["error"]["code"] == "candidate_not_registered"
+    assert result["pending"]
+    runtime.reject(call("fetch_web_content", {"url": "https://example.com/unknown"}, "bad"))
 
 
 @pytest.mark.parametrize('prompt', ['其售价多少', '多少钱', '哪个版本便宜', '国行价格呢'])
@@ -64,7 +69,7 @@ def test_price_followup_can_search_without_magic_words(runtime_env, prompt):
         name = "fixture"
 
         def search(self, query, limit=5):
-            return [{"url": "https://example.com/buy", "title": "Product A price", "snippet": "Fixture"}]
+            return SearchPage([{"url": "https://example.com/buy", "title": "Product A price", "snippet": "Fixture"}])
 
     runtime.providers = [Provider()]
     runner.model = FakeModel(Response(tool_calls=[tool_call("fetch_web_content", {"query": "Product A price"}, "price")]), Response(content="价格尚未核实"))
@@ -83,20 +88,24 @@ def test_invalid_outer_results_are_protocol_errors(runtime_env, monkeypatch, pay
 
 
 def query_provider(runtime):
+    counter = runtime.store.root / 'fixture-provider-count.txt'
+    counter.write_text('0')
     class Provider:
         name = 'fixture'
-        calls = 0
+        @property
+        def calls(self):
+            return int(counter.read_text())
 
         def search(self, query, limit=5):
-            self.calls += 1
-            return [{'url': 'https://example.com/buy', 'title': 'Fixture purchase page', 'snippet': 'Not evidence'}]
+            counter.write_text(str(self.calls + 1))
+            return SearchPage([{'url': 'https://example.com/buy', 'title': 'Fixture purchase page', 'snippet': 'Not evidence'}])
 
     provider = Provider()
     runtime.providers = [provider]
     return provider
 
 
-def waiting_runner(runtime):
+def waiting_runner(runtime, *, seconds=None):
     runtime.set_permission("user")
     provider = query_provider(runtime)
     model = FakeModel(
@@ -104,7 +113,7 @@ def waiting_runner(runtime):
         Response(tool_calls=[tool_call('fetch_web_content', {'query': 'product A versions'}, 'q2')]),
         Response(content='[[PARTIAL]] 尚未取得价格正文'),
     )
-    runner = Runner(model, runtime)
+    runner = Runner(model, runtime, seconds=seconds)
     assert runner.start('多少钱')['status'] == 'awaiting_confirmation'
     return runner, provider
 
@@ -131,32 +140,23 @@ def test_switching_mode_changes_all_tool_approvals(runtime_env):
     assert provider.calls == 2
 
 
-def test_wait_does_not_consume_execution_time(runtime_env, monkeypatch):
-    import genesisai.agent.loop as runner_module
-    now = time.time()
-    monkeypatch.setattr(runner_module.time, 'time', lambda: now)
+def test_wait_does_not_consume_execution_time(runtime_env):
     store, runtime = runtime_env
-    runner, provider = waiting_runner(runtime)
+    runner, provider = waiting_runner(runtime, seconds=600)
     deadline = store.record.deadline
-    now += 200
+    store.record.run_runtime['confirmation_paused_at'] -= 200
     assert runner.confirm(True)['status'] == 'awaiting_confirmation'
-    assert store.record.deadline == pytest.approx(deadline + 200)
+    assert deadline + 200 <= store.record.deadline < deadline + 210
     assert provider.calls == 1
 
 
-def test_expired_approval_is_repreviewed_even_with_session_allow(runtime_env, monkeypatch):
-    import genesisai.agent.loop as runner_module
-    now = time.time()
-    monkeypatch.setattr(runner_module.time, 'time', lambda: now)
+def test_unchanged_approval_remains_valid_after_long_wait(runtime_env):
     _, runtime = runtime_env
     runner, provider = waiting_runner(runtime)
-    now += 901
+    runtime.store.record.run_runtime['confirmation_paused_at'] -= 901
     runtime.set_permission("auto")
     result = runner.confirm(True)
-    assert result['status'] == 'awaiting_confirmation'
-    assert '过期' in result['answer']
-    assert provider.calls == 0
-    assert runner.confirm(True)['status'] == 'partial'
+    assert result['status'] == 'partial'
     assert provider.calls == 2
 
 
@@ -231,17 +231,24 @@ def test_readable_sources_and_price_table(runtime_env, width):
 def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     store, runtime = runtime_env
     events = []
+    counter, urls = store.root / 'fixture-r1-count.txt', store.root / 'fixture-r1-urls.txt'
+    counter.write_text('0'); urls.write_text('')
     class Provider:
         name = 'fixture'
-        calls = 0
+        @property
+        def calls(self):
+            return int(counter.read_text())
         def search(self, query, limit=5):
-            self.calls += 1
+            counter.write_text(str(self.calls + 1))
             url = 'https://example.com/product' if self.calls == 1 else 'https://example.com/buy'
-            return [{'url': url, 'title': 'Fixture product A', 'snippet': 'candidate only'}]
+            return SearchPage([{'url': url, 'title': 'Fixture product A', 'snippet': 'candidate only'}])
     class Network:
-        urls = []
+        @property
+        def urls(self):
+            return urls.read_text().splitlines()
         def fetch(self, url):
-            self.urls.append(url)
+            with urls.open('a') as stream:
+                stream.write(url + '\n')
             text = 'Product A: synthetic specifications.' if url.endswith('/product') else 'Product A: China mainland, 256GB, starting at CNY 4999. 512GB CNY 5999.'
             return dict(url=url, title='Fixture product A', text=text, truncated=False)
     provider, network = Provider(), Network()
@@ -265,8 +272,8 @@ def test_r1_complete_product_price_followup_and_reuse(runtime_env):
     )
     result = runner.start('其售价多少')
     assert result['status'] == 'completed' and '4999' in result['answer']
-    assert store.record.calls['r1bad']['result']['error']['code'] == 'candidate_not_registered'
-    assert not store.record.calls['r1bad']['executed']
+    assert store.record.calls['r1bad']['result']['ok']
+    assert store.record.calls['r1bad']['executed']
     runner.model = FakeModel(answer('中国大陆 256GB 起售价 CNY 4999'))
     assert runner.start('再说一下起售价')['status'] == 'completed'
     assert provider.calls == 2
@@ -316,12 +323,13 @@ def test_frozen_parameters_cannot_change_after_approval(runtime_env):
     assert provider.calls == 1  # only the later, independent q2
 
 
-def test_repeated_bad_url_cannot_issue_network(runtime_env):
+def test_unapproved_public_url_cannot_issue_network(runtime_env):
     _, runtime = runtime_env
     runtime.set_permission("user")
     for i in range(3):
         result = runtime.execute(call('fetch_web_content', {'url': 'https://example.com/missing'}, f'bad{i}'))
-        assert not result.get('pending') and result['error']['code'] == 'candidate_not_registered'
+        assert result['pending']
+        runtime.reject(call('fetch_web_content', {'url': 'https://example.com/missing'}, f'bad{i}'))
 
 
 @pytest.mark.parametrize('reason', ['deadline', 'failure_limit', 'search_fetch_budget'])
@@ -396,7 +404,7 @@ def test_failed_public_page_is_bounded_and_partial(runtime_env):
     ), runtime)
     result = runner.start('产品 A 多少钱')
     assert result['status'] == 'partial'
-    assert store.record.calls['f2']['result']['error']['code'] == 'retry_exhausted'
+    assert store.record.calls['f2']['result']['error']['code'] == 'http_error'
     assert store.record.run_runtime['usage']['search_fetches'] == 1
 
 

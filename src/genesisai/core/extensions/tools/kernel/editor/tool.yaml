@@ -1,4 +1,4 @@
 name: editor
 enabled: true
 category: kernel
-description: 单一编辑内核：新建/唯一文本替换(replace)/单文件或多文件补丁(patch)/移动/删除/复制文件与创建目录（operation 区分）
+description: 单一编辑内核：新建/唯一文本替换(replace)/单文件或多文件补丁(patch)/移动/删除/复制/创建目录。大正文可用 content_ref/patch_ref/old_text_ref/new_text_ref 的 path 与 sha256 引用；来源存元数据，文本内容原样保留。补丁先预检全批，再逐文件提交并记录结果。

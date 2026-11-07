@@ -1,4 +1,4 @@
 name: chapter_outline
 enabled: true
 category: novel
-description: 为指定章节生成或更新大纲摘要
+description: 按章节块提取段落和人物事实候选，返回覆盖范围、源哈希和next；不是完整语义大纲的保证

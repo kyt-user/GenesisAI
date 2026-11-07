@@ -1,3 +1,4 @@
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 import json
 from pathlib import Path
 
@@ -81,14 +82,14 @@ def test_search_codebase_matches_filename_even_if_content_is_unsupported(runtime
     assert any(Path(path).name == "needle.bin" for path in result["data"]["skipped"])
 
 
-def test_list_files_stops_at_repository_scan_cap(runtime):
+def test_list_files_reaches_files_beyond_old_scan_cap(runtime):
     for index in range(1000):
         (runtime[0] / f"bulk-{index:04}.txt").write_text("x", encoding="utf-8")
     result = runtime[3].execute(tool_call("list_files", {"path": ".", "offset": 999}, "scan_cap"))
 
     assert result["ok"]
-    assert result["truncated"]
-    assert len(result["data"]["files"]) == 1
+    assert not result["truncated"]
+    assert len(result["data"]["files"]) == 3
     assert result["data"]["next_offset"] is None
 
 
@@ -102,18 +103,20 @@ def test_editor_copy_rejects_directory_source(runtime):
     assert not (runtime[1] / "folder-copy").exists()
 
 
-def test_fetch_web_content_caps_provider_results_at_five(runtime):
+def test_fetch_web_content_uses_requested_result_count(runtime):
     class Provider:
         name = "many"
 
         def search(self, query, limit=5):
-            return [{"title": str(index), "url": f"https://example.com/{index}"} for index in range(10)]
+            values = [{"title": str(index), "url": f"https://example.com/{index}"} for index in range(10)]
+            end = query.offset + limit
+            return SearchPage(values[query.offset:end], end if end < len(values) else None)
 
     runtime[3].providers = [Provider()]
-    result = runtime[3].execute(tool_call("fetch_web_content", {"query": "bounded"}, "many"))
+    result = runtime[3].execute(tool_call("fetch_web_content", {"query": "bounded", 'result_count': 8}, "many"))
 
     assert result["ok"]
-    assert len(result["data"]["hits"]) == 5
+    assert len(result["data"]["hits"]) == 8 and result['data']['next_offset'] == 8
 
 
 def test_unexpected_implementation_error_does_not_expose_message(runtime):

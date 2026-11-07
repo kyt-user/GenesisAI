@@ -13,6 +13,8 @@ class SessionRecord:
     status: str = "idle"
     messages: list = field(default_factory=list)
     calls: dict = field(default_factory=dict)
+    job_receipts: dict = field(default_factory=dict)
+    authorizations: list = field(default_factory=list)
     sources: dict = field(default_factory=dict)
     artifacts: dict = field(default_factory=dict)
     pending: list = field(default_factory=list)
@@ -27,7 +29,7 @@ class SessionRecord:
     history: list = field(default_factory=list)
     changes: list = field(default_factory=list)
     permission_mode: str = "user"
-    tool_runtime: dict = field(default_factory=lambda: {"active_skills": []})
+    tool_runtime: dict = field(default_factory=lambda: {"active_skills": {}})
     run_runtime: dict = field(default_factory=initial_run_runtime)
     context_checkpoint: dict | None = None
     context_estimate_factor: float = 1.0

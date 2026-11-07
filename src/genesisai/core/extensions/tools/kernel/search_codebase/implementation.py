@@ -5,10 +5,13 @@ import hashlib
 import json
 import re
 import time
+from collections import deque
+from contextlib import ExitStack
 from pathlib import Path
 
 from genesisai.shared.security import ToolError
-from genesisai.core.extensions.tools.filesystem.shared import MAX_BYTES, extract, read_text_document, walk
+from genesisai.core.extensions.tools.filesystem.shared import extract, read_text_document, walk
+from genesisai.core.extensions.tools.filesystem import text_ranges
 from genesisai.core.memory.project_index import python_structure
 
 
@@ -23,7 +26,6 @@ _CODE_EXTENSIONS = {
     ".py": "python", ".js": "javascript", ".jsx": "javascript",
     ".ts": "typescript", ".tsx": "typescript", ".mjs": "javascript", ".cjs": "javascript",
 }
-_MAX_FILE_SIZE = 200_000
 
 
 def _index_python(text):
@@ -50,8 +52,8 @@ def _index_javascript(text):
 
 def _find_todos(text):
     return [
-        {"tag": m.group(1).upper(), "note": m.group(2).strip()[:120], "line": text[:m.start()].count("\n") + 1}
-        for m in _TODO.finditer(text)
+        {"tag": m.group(1).upper(), "note": m.group(2).strip(), "line": number}
+        for number, line in enumerate(text.splitlines(), 1) for m in _TODO.finditer(line)
     ]
 
 
@@ -93,12 +95,16 @@ class Implementation:
             str(target), [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in files]
         ], ensure_ascii=False).encode()).hexdigest()
         offset = args.get("file_offset", 0)
+        item_offset = 0
         if args.get("cursor"):
             try:
                 cursor = json.loads(args["cursor"])
                 if type(cursor.get("offset")) is not int or cursor["offset"] < 0:
                     raise ValueError()
                 offset = cursor["offset"]
+                item_offset = cursor.get("item_offset", 0)
+                if type(item_offset) is not int or item_offset < 0:
+                    raise ValueError()
             except (ValueError, AttributeError, TypeError) as exc:
                 raise ToolError("validation_error", "索引 cursor 无效，请使用 next_cursor 原值") from exc
             if cursor.get("snapshot") != snapshot:
@@ -116,32 +122,39 @@ class Implementation:
                 skipped.append({"path": str(f), "reason": str(exc)})
                 next_offset += 1
                 continue
-            clipped = len(text) > _MAX_FILE_SIZE
             total_lines = text.count("\n") + 1
-            if clipped:
-                text = text[:_MAX_FILE_SIZE]
             lang = _CODE_EXTENSIONS.get(f.suffix, "unknown")
             index = _index_python(text) if lang == "python" else (_index_javascript(text) if lang in ("javascript", "typescript") else {})
             todos = _find_todos(text)
-            entry = {"file": rel, "language": lang, "lines": total_lines, "indexed_characters": len(text), "content_truncated": clipped, **index}
+            entry = {"file": rel, "language": lang, "lines": total_lines, "indexed_characters": len(text), "content_truncated": False, **index}
             if todos:
                 entry["todos"] = todos
             size = len(json.dumps(entry, ensure_ascii=False))
             if size > remaining and results:
                 break
-            # 单文件符号过多仍返回可解释的覆盖边界，可再用 read_files 精确读取。
-            while size > remaining:
-                lists = [value for value in entry.values() if isinstance(value, list) and value]
-                if not lists:
-                    break
-                max(lists, key=len).pop()
-                entry["symbols_truncated"] = True
+            # Page symbols within a file, retaining the exact continuation position.
+            values = [(key, value) for key, items in entry.items() if isinstance(items, list) for value in items]
+            entry = {key: ([] if isinstance(value, list) else value) for key, value in entry.items()}
+            entry.update(item_offset=item_offset, total_items=len(values))
+            emitted = 0
+            for key, value in values[item_offset:]:
+                candidate_size = len(json.dumps(value, ensure_ascii=False))
                 size = len(json.dumps(entry, ensure_ascii=False))
-            partial_files |= clipped or entry.get("symbols_truncated", False) or bool(entry.get("parse_error"))
+                if size + candidate_size > remaining and emitted:
+                    break
+                entry[key].append(value)
+                emitted += 1
+            entry["symbols_truncated"] = item_offset + emitted < len(values)
+            size = len(json.dumps(entry, ensure_ascii=False))
+            partial_files |= entry["symbols_truncated"] or bool(entry.get("parse_error"))
             total_todos.extend({"file": rel, **t} for t in entry.get("todos", []))
             results.append(entry)
             remaining -= size
+            if entry["symbols_truncated"]:
+                item_offset += emitted
+                break
             next_offset += 1
+            item_offset = 0
         summary = {
             "files_indexed": len(results),
             "total_classes": sum(len(r.get("classes", [])) for r in results),
@@ -150,11 +163,11 @@ class Implementation:
             "total_todos": len(total_todos),
         }
         more = next_offset < len(files)
-        return {"summary": summary, "files": results, "todos": total_todos[:50], "skipped": skipped,
+        return {"summary": summary, "files": results, "todos": total_todos, "skipped": skipped,
                 "total_files": len(files), "file_offset": offset, "snapshot": snapshot,
                 "truncated": more or partial_files or bool(skipped), "partial_files": partial_files,
                 "next_file_offset": next_offset if more else None,
-                "next_cursor": json.dumps({"snapshot": snapshot, "offset": next_offset}) if more else None}
+                "next_cursor": json.dumps({"snapshot": snapshot, "offset": next_offset, "item_offset": item_offset}) if more else None}
 
     def _search(self, context, args, query, mode):
         if mode not in {"name", "content"}:
@@ -184,10 +197,6 @@ class Implementation:
                 raise ToolError("timeout", "资料扫描达到运行截止时间")
             if index < file_offset:
                 continue
-            if index == file_offset + 1000:
-                next_file = index
-                incomplete = True
-                break
             relative = path.relative_to(base) if path.is_relative_to(base) and base.is_dir() else Path(path.name)
             if len(relative.parts) > args.get("depth", 1000):
                 continue
@@ -195,38 +204,46 @@ class Implementation:
                 continue
             if not (fnmatch.fnmatch(path.name, pattern) or fnmatch.fnmatch(relative.as_posix(), pattern)):
                 continue
-            lines = []
             extracted = path.suffix.lower() in {".pdf", ".docx", ".xlsx"}
-            if mode == "content":
-                try:
-                    if path.stat().st_size > MAX_BYTES:
-                        raise ToolError("size_limit", "文件过大")
-                    if extracted:
-                        content, clipped = extract(path)
-                        incomplete |= clipped
-                    else:
-                        content = read_text_document(path)[0]
-                    lines = content.splitlines()
-                except Exception:
-                    skipped.append(str(path))
             def matches():
-                file_hits = []
-                for i, line in enumerate(lines):
-                    match = matcher(line)
-                    if match:
-                        if output_mode == "files":
-                            yield {"kind": "file"}
-                            return
-                        if output_mode == "count":
-                            file_hits.append(i)
-                            continue
-                        left = max(0, match.start() - 100)
-                        yield {"line": i + 1, "column": match.start() + 1,
-                               "kind": "extracted" if extracted else "source", "text": line[left:left + 400],
-                               "before": [s[:240] for s in lines[max(0, i-radius):i]],
-                               "after": [s[:240] for s in lines[i+1:i+1+radius]]}
+                file_hits = 0
+                if mode == "content":
+                    with ExitStack() as stack:
+                        try:
+                            if extracted:
+                                content, _ = extract(path)
+                                source_lines = iter(content.splitlines(keepends=True))
+                            else:
+                                info = text_ranges.metadata(path)
+                                source_lines = stack.enter_context(path.open(encoding=info["encoding"], newline=""))
+                        except (ToolError, OSError, UnicodeError, ValueError):
+                            skipped.append(str(path))
+                            source_lines = iter(())
+                        previous, upcoming = deque(maxlen=radius), deque()
+                        upcoming.extend(next(source_lines, None) for _ in range(radius + 1))
+                        number, char_offset = 0, 0
+                        while upcoming and upcoming[0] is not None:
+                            raw = upcoming.popleft()
+                            line = raw.rstrip("\r\n")
+                            number += 1
+                            match = matcher(line)
+                            if match:
+                                file_hits += 1
+                                if output_mode == "files":
+                                    yield {"kind": "file"}
+                                    return
+                                if output_mode == "content":
+                                    left = max(0, match.start() - 100)
+                                    yield {"line": number, "column": match.start() + 1,
+                                           "kind": "extracted" if extracted else "source", "text": line[left:left + 400],
+                                           "before": [s[:240] for s in previous],
+                                           "after": [s.rstrip("\r\n")[:240] for s in upcoming if s is not None],
+                                           "read_request": {"path": str(path), "offset": char_offset + left, "limit": 8000}}
+                            previous.append(line)
+                            char_offset += len(raw)
+                            upcoming.append(next(source_lines, None))
                 if output_mode == "count" and file_hits:
-                    yield {"kind": "count", "matching_lines": len(file_hits)}
+                    yield {"kind": "count", "matching_lines": file_hits}
                     return
                 if matcher(path.name):
                     yield {"kind": "filename"}
@@ -249,7 +266,7 @@ class Implementation:
                 files[str(path)] = {"path": str(path), "size": path.stat().st_size}
             if more:
                 break
-        return {"matches": hits, "files": list(files.values()), "skipped": skipped[:50],
+        return {"matches": hits, "files": list(files.values()), "skipped": skipped,
                 "scan_truncated": incomplete, "truncated": incomplete or more,
                 "output_mode": output_mode,
                 "next_offset": offset + consumed if more else None, "next_file_offset": next_file}

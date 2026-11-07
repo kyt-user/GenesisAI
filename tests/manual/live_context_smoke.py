@@ -134,7 +134,6 @@ def main():
         report['elapsed_seconds'] = round(time.monotonic() - started, 2)
         report['passed'] = bool(report['checks']) and all(report['checks'].values()) and 'exception' not in report
         atomic_json(root / 'report.json', report)
-        model.client.close()
         print(json.dumps({'passed': report['passed'], 'checks': report['checks'],
                           'report': str(root / 'report.json')}, ensure_ascii=False), flush=True)
     return 0 if report['passed'] else 1

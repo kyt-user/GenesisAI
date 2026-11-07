@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from contextvars import ContextVar
 import os
+import re
 import signal
 import subprocess
 
@@ -12,9 +13,64 @@ import subprocess
 group_listener = ContextVar("process_group_listener", default=None)
 
 
-def safe_environment():
-    blocked = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')
-    return {key: value for key, value in os.environ.items() if not any(word in key.upper() for word in blocked)}
+_BASE_ENVIRONMENT = frozenset(name.casefold() for name in (
+    'PATH', 'PATHEXT', 'SystemRoot', 'WINDIR', 'SystemDrive', 'COMSPEC',
+    'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA',
+    'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+    'TERM', 'COLORTERM', 'NO_COLOR', 'COLUMNS', 'LINES', 'OS',
+    'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS', 'ProgramFiles', 'ProgramFiles(x86)',
+    'CommonProgramFiles', 'CommonProgramFiles(x86)', 'ProgramData',
+    # Explicit non-secret configuration used by trusted document/media workers.
+    'GENESISAI_DOCUMENT_MAX_EXPANDED_BYTES', 'GENESISAI_DOCUMENT_MAX_ENTRIES',
+    'GENESISAI_DOCUMENT_MAX_COMPRESSION_RATIO', 'GENESISAI_OCR_MAX_PAGE_PIXELS',
+    'GENESISAI_WHISPER_MODEL',
+))
+_ENVIRONMENT_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*')
+_PRIVATE_ENVIRONMENT = frozenset({'genesisai_result_path'})
+
+
+def validate_environment_mapping(env_from):
+    from genesisai.shared.security import ToolError
+    if (not isinstance(env_from, dict) or any(not isinstance(key, str) or not isinstance(value, str)
+            or not _ENVIRONMENT_NAME.fullmatch(key) or not _ENVIRONMENT_NAME.fullmatch(value)
+            or key.casefold() in _PRIVATE_ENVIRONMENT
+            for key, value in env_from.items())
+            or (os.name == 'nt' and len({name.casefold() for name in env_from}) != len(env_from))):
+        raise ToolError('validation_error', 'env_from 必须为互不冲突的子进程变量名到宿主变量名映射')
+    return dict(env_from)
+
+
+def mapped_environment(env_from, *, source=None):
+    from genesisai.shared.security import ToolError
+    source = os.environ if source is None else source
+    mapping = validate_environment_mapping(env_from)
+    lookup = {key.casefold(): value for key, value in source.items()} if os.name == 'nt' else source
+    values = {}
+    for target, origin in mapping.items():
+        key = origin.casefold() if os.name == 'nt' else origin
+        if key not in lookup:
+            raise ToolError('missing_environment', '宿主环境变量未配置：' + origin)
+        value = lookup[key]
+        if not isinstance(value, str) or '\0' in value:
+            raise ToolError('validation_error', '环境变量值无效：' + origin)
+        values[target] = value
+    return values
+
+
+def environment_preview(env_from):
+    import hashlib
+    mapping = validate_environment_mapping(env_from)
+    values = mapped_environment(mapping)
+    return {'env_from': mapping, 'environment_digests': {
+        target: hashlib.sha256(value.encode('utf-8')).hexdigest() for target, value in values.items()}}
+
+
+def safe_environment(env_from=None, *, source=None):
+    """Minimal process environment plus explicitly authorized name mappings."""
+    source = os.environ if source is None else source
+    values = {key: value for key, value in source.items() if key.casefold() in _BASE_ENVIRONMENT}
+    values.update(mapped_environment({} if env_from is None else env_from, source=source))
+    return values
 
 
 def kill_group(pid):

@@ -6,6 +6,11 @@ content:
   instructions:
     - 先识别真实文件类型，再加载对应 DOCX、XLSX、PPTX 或 PDF 工具
     - 修改现有 DOCX/XLSX 时使用 docx_edit/xlsx_edit，不用 create 工具重建来代替局部修改
+    - 读取结果为 items 和 coverage，沿 next 参数读取剩余部分；next 绑定源哈希，文档变化后重新开始
+    - XLSX 先列出工作表再按 sheet/range 读取，公式和样式位置可单独分页查询；DOCX 可选择正文、段落、表格、页眉或页脚
+    - PDF扫描页可显式加载pdf_ocr进行本地识别；识别结果需核对原页。加密PDF由用户在终端/pdf-unlock隐藏输入密码后读取副本，密码不进入对话或工具参数
+    - 长文档工具返回job_id时，通过read_job等待并收取结果，不重复提交原操作
+    - DOCX/PPTX 追加使用 create 的 source 参数保留原包；覆盖既有产物必须显式 overwrite 和 expected_sha256，保留前态备份
     - 输出文件默认使用输出目录内的相对路径。自动审批时可按用户要求指定宿主绝对路径
     - 新产物必须重新打开验证，并报告 artifact_ref、哈希和限制
     - 重新读取产物时优先使用创建或修改工具返回的完整 path；也可直接使用输出文件名

@@ -1,0 +1,4 @@
+name: write_job_input
+enabled: true
+category: kernel
+description: 向当前会话已明确启用 pipe/pty 的命令作业写入输入、关闭管道输入或调整终端尺寸。返回持久 input_id；accepted 表示排队接受，sent 才表示发送完成。用 read_job(job_id,input_id) 查询；结果未知时禁止重发。密钥使用 secret_from_env 传宿主变量名。

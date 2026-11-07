@@ -1,0 +1,4 @@
+name: memory_maintenance
+enabled: true
+category: kernel
+description: 查看、提交或取消后台索引和记忆维护；维护只重建派生数据，不删除用户文件；返回maintenance_id后用status分页查询，wait_seconds可有界等待

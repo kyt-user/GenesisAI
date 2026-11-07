@@ -1,4 +1,12 @@
 name: repository_analysis
 description: 分析仓库入口、依赖、构建、测试、目录职责和风险
 entry: SKILL.md
-tools: [list_files, search_codebase, read_files, run_commands]
+stages:
+  run:
+    depends_on: []
+    required_tools:
+    - list_files
+    - search_codebase
+    - read_files
+    - run_commands
+    optional_tools: []

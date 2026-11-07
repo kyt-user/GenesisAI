@@ -1,0 +1,4 @@
+name: pdf_ocr
+enabled: true
+category: office
+description: 本地 RapidOCR 识别授权扫描 PDF；按页和页内字符分页，next 绑定源哈希；无需云服务，模型缺失明确报错，识别结果需核对原页

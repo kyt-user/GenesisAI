@@ -89,7 +89,7 @@ def test_build_model_from_settings_defaults_qwen_base_url():
 
     assert client.model == "qwen-plus"
     assert remote is True
-    assert "dashscope.aliyuncs.com" in str(client.client.base_url)
+    assert "dashscope.aliyuncs.com" in str(client.base_url)
 
 
 def test_build_model_rejects_unknown_settings_provider():

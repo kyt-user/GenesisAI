@@ -39,17 +39,3 @@ def execution_facts(record, activities, *, limit=6):
             error={k: error[k] for k in ("code", "message") if k in error},
         ))
     return _bounded(facts)
-
-
-def failure_summary(record):
-    facts = execution_facts(record, record.run_runtime.get("tool_activity", []), limit=3)
-    lines = ["达到连续失败上限，已停止继续调用工具。实际调用记录："]
-    for item in facts:
-        args = json.dumps(item["arguments"], ensure_ascii=False)
-        error = item["error"]
-        lines.append(f'- {item["tool"]} {args[:700]}：{error.get("code", item["state"])}；'
-                     f'{str(error.get("message", ""))[:700]}')
-    lines.append("启动入口无法解析不代表已验证整个执行通道失效；安装情况和环境配置仍需核实。"
-                 if any(f["error"].get("code") == "command_not_found" for f in facts)
-                 else "已有文件读取和执行记录仍保留在会话中，可继续排查。")
-    return "\n".join(lines)

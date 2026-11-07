@@ -1,7 +1,7 @@
 """One worker owns the runner. Only the terminal thread changes the FIFO."""
 
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Empty, SimpleQueue
 from threading import Lock
@@ -59,6 +59,24 @@ class RunQueue:
         self.stage = ''
         self.preview = ''
         self._message = []
+        self._after_stop = deque()
+
+    def defer_until_stopped(self, action):
+        """Apply a user control on the terminal thread after the runner releases state."""
+        if self.future is None:
+            raise RuntimeError('没有正在执行的任务')
+        result = Future()
+        self._after_stop.append((action, result))
+        self.control.cancel()
+        return result
+
+    def _finish_controls(self):
+        while self._after_stop:
+            action, result = self._after_stop.popleft()
+            try:
+                result.set_result(action())
+            except BaseException as exc:
+                result.set_exception(exc)
 
     def emit(self, kind, value):
         with self._output_lock:
@@ -135,6 +153,8 @@ class RunQueue:
                 self.pending.appendleft(item)
             self.paused = bool(self.pending)
             raise
+        finally:
+            self._finish_controls()
         self.paused = bool(self.pending) and (stopped or result['status'] not in {'completed', 'awaiting_confirmation', 'awaiting_input'})
         return result
 
@@ -142,3 +162,4 @@ class RunQueue:
         if self.control:
             self.control.cancel()
         self.worker.shutdown(wait=True)
+        self._finish_controls()

@@ -10,7 +10,6 @@ import time
 
 import httpx
 import pytest
-from openai import OpenAI
 from rich.console import Console
 
 from genesisai.agent.loop import Runner
@@ -41,6 +40,20 @@ def events(runtime, event=None):
     records = [json.loads(line) for line in runtime.logger.journal.path.read_text(encoding='utf-8').splitlines()]
     assert all(r['session_id'] == runtime.store.id and r['event_id'] and r['timestamp'] for r in records)
     return [r for r in records if event is None or r['event'] == event]
+
+
+def test_transport_exception_causes_are_recorded_and_redacted(runtime_factory):
+    _, rt = runtime_factory()
+    rt.logger.add_secret('fixture-transport-secret')
+    inner = OSError('proxy failed: fixture-transport-secret')
+    outer = RuntimeError('connection error')
+    outer.__cause__ = inner
+    inner.__cause__ = outer  # Malformed exception chains must not hang logging.
+    rt.logger.error('model_error', outer)
+    detail = events(rt, 'model_error')[0]['payload']['error']
+    assert detail['causes'] == [{'type': 'OSError', 'message': 'proxy failed: [REDACTED]'}]
+    assert 'fixture-transport-secret' not in rt.logger.journal.path.read_text(encoding='utf-8')
+    rt.close()
 
 
 def test_full_long_input_model_response_tool_io_and_definitions(runtime_factory):
@@ -102,7 +115,10 @@ def test_tool_failure_and_cancelled_pending_results(runtime_factory):
     failed = rt.execute(call('read_files', {'path':'missing.md'}, 'missing'))
     assert failed['ok'] is False
     assert events(rt, 'tool_execution')[-1]['payload']['result'] == failed
-    assert events(rt, 'tool_error')[0]['payload']['error']['type'] == 'FileNotFoundError'
+    worker_logs = list(rt.jobs.root.glob('*/logs/*.jsonl'))
+    errors = [json.loads(line) for path in worker_logs for line in path.read_text(encoding='utf-8').splitlines()
+              if json.loads(line)['event'] == 'tool_error']
+    assert len(errors) == 1 and errors[0]['payload']['error']['type'] == 'FileNotFoundError'
     runner = Runner(FakeModel(response(call('editor', {'operation':'create','path':'x.md','content':'x'}, 'write'))), rt)
     assert runner.start('hello')['status'] == 'awaiting_confirmation'
     assert runner.cancel()['status'] == 'cancelled'
@@ -177,7 +193,7 @@ def test_credentials_redacted_without_truncating_regular_content(runtime_factory
     assert events(rt)[0]['payload']['body']['properties']['api_key'] == {'type':'string'}
 
 
-def test_provider_request_and_raw_response_with_defaults(runtime_factory):
+def test_provider_request_and_raw_response_with_defaults(runtime_factory, monkeypatch):
     _, rt = runtime_factory()
     captured = []
     def handler(request):
@@ -187,24 +203,20 @@ def test_provider_request_and_raw_response_with_defaults(runtime_factory):
             'choices':[{'index':0, 'finish_reason':'stop', 'message':{'role':'assistant', 'content':'ok', 'reasoning_content':'synthetic'}}],
             'usage':{'prompt_tokens':2,'completion_tokens':3,'total_tokens':5}})
     model = DeepSeekClient('fixture', api_key='sk-fixture-private', generation={'max_tokens':123})
-    model.client.close()
-    model.client = OpenAI(api_key='sk-fixture-private', base_url='https://fixture.invalid',
-                          http_client=httpx.Client(transport=httpx.MockTransport(handler)), max_retries=0)
-    try:
-        model.bind_logging(rt.logger)
-        model.chat(rt.context_budgeter.build('direct_answer'), tools=rt.definitions())
-        req = events(rt, 'provider_request')[0]['payload']['request']
-        assert req['messages'] == captured[0]['messages']
-        assert req['tools'] == captured[0]['tools']
-        assert req['max_tokens'] == 123
-        assert req['extra_body']['thinking'] == captured[0]['thinking']
-        assert events(rt, 'provider_response')[0]['payload']['response']['id'] == 'completion-fixture'
-        assert 'sk-fixture-private' not in rt.logger.journal.path.read_text(encoding='utf-8')
-    finally:
-        model.client.close()
+    from model_transport import mock_model_http
+    mock_model_http(monkeypatch, handler)
+    model.bind_logging(rt.logger)
+    model.chat(rt.context_budgeter.build('direct_answer'), tools=rt.definitions())
+    req = events(rt, 'provider_request')[0]['payload']['request']
+    assert req['messages'] == captured[0]['messages']
+    assert req['tools'] == captured[0]['tools']
+    assert req['max_tokens'] == 123
+    assert req['extra_body']['thinking'] == captured[0]['thinking']
+    assert events(rt, 'provider_response')[0]['payload']['response']['id'] == 'completion-fixture'
+    assert 'sk-fixture-private' not in rt.logger.journal.path.read_text(encoding='utf-8')
 
 
-def test_provider_stream_raw_chunks_and_complete_answer(runtime_factory):
+def test_provider_stream_raw_chunks_and_complete_answer(runtime_factory, monkeypatch):
     _, rt = runtime_factory()
     chunks = [
         {'id':'stream-fixture','object':'chat.completion.chunk','created':1,'model':'fixture',
@@ -216,17 +228,13 @@ def test_provider_stream_raw_chunks_and_complete_answer(runtime_factory):
     def handler(request):
         return httpx.Response(200, headers={'Content-Type':'text/event-stream'}, content=sse)
     model = DeepSeekClient('fixture', api_key='sk-stream-fixture')
-    model.client.close()
-    model.client = OpenAI(api_key='sk-stream-fixture', base_url='https://fixture.invalid',
-                          http_client=httpx.Client(transport=httpx.MockTransport(handler)), max_retries=0)
-    try:
-        result = Runner(model, rt)._call_model(rt.context_budgeter.build('direct_answer'), [])
-        assert result.content == 'first\nlast'
-        assert len(events(rt, 'provider_stream_chunk')) == 2
-        assert events(rt, 'provider_request')[0]['payload']['request']['stream'] is True
-        assert events(rt, 'model_output')[0]['payload']['response']['content'] == 'first\nlast'
-    finally:
-        model.client.close()
+    from model_transport import mock_model_http
+    mock_model_http(monkeypatch, handler)
+    result = Runner(model, rt)._call_model(rt.context_budgeter.build('direct_answer'), [])
+    assert result.content == 'first\nlast'
+    assert len(events(rt, 'provider_stream_chunk')) == 2
+    assert events(rt, 'provider_request')[0]['payload']['request']['stream'] is True
+    assert events(rt, 'model_output')[0]['payload']['response']['content'] == 'first\nlast'
 
 
 def test_shell_full_output_exceeds_tool_truncation(runtime_factory):
@@ -234,7 +242,10 @@ def test_shell_full_output_exceeds_tool_truncation(runtime_factory):
     result = rt.execute(call('run_commands', {'command':[sys.executable,'-c',"print('x'*13000+'TAIL_STDOUT')"]}))
     assert result['data']['truncated'] is True
     assert 'TAIL_STDOUT' not in result['data']['stdout']
-    assert events(rt, 'command_output')[0]['payload']['stdout'].endswith('TAIL_STDOUT\n')
+    from genesisai.core.jobs.storage import read_log
+    from pathlib import Path
+    reference = events(rt, 'job_output')[0]['payload']['output_refs']['stdout']
+    assert read_log(Path(reference['path']), 0, reference['size']).decode('utf-8').rstrip().endswith('TAIL_STDOUT')
 
 
 @pytest.mark.parametrize('ask', [False, True])
@@ -259,7 +270,7 @@ def test_cancel_started_command_reports_side_effect_once(runtime_factory, ask):
     Runner.check_available(rt.store.record)
 
 
-def test_fast_command_bounds_display_and_preserves_full_log(runtime_factory):
+def test_command_bounds_display_and_preserves_full_log(runtime_factory):
     from pathlib import Path
     from genesisai.app.run_queue import RunQueue
 
@@ -273,11 +284,16 @@ def test_fast_command_bounds_display_and_preserves_full_log(runtime_factory):
         display = []
         runs.drain(lambda kind, item: display.append(item['text']))
         assert len(display) == 1 and len(display[0]) < 4200 and '省略' in display[0]
-        chunks = [r['payload'] for r in events(rt, 'command_output_chunk')]
-        assert ''.join(c['text'] for c in chunks if c['stream'] == 'stdout') == 'x\n' * 20000
-        assert ''.join(c['text'] for c in chunks if c['stream'] == 'stderr') == 'stderr tail\n'
-        assert len(chunks) < 10
-        assert Path(data['log_path']).read_text(encoding='utf8').count('x\n') == 20000
+        # Output-intensive commands may outlive the foreground response window.
+        assert rt.jobs.wait(data['job_id'], 20)['status'] == 'succeeded'
+        data = rt.jobs.result(data['job_id'])
+        from genesisai.core.jobs.storage import read_log
+        refs = events(rt, 'job_output')[0]['payload']['output_refs']
+        assert refs == data['output_refs']
+        output = {name: read_log(Path(ref['path']), 0, ref['size']).decode('utf-8').replace('\r\n', '\n')
+                  for name, ref in refs.items()}
+        assert output['stdout'] == 'x\n' * 20000
+        assert output['stderr'] == 'stderr tail\n'
         assert data['truncated'] and len(data['stdout']) == 12000
     finally:
         runs.close()

@@ -1,0 +1,220 @@
+{
+  "recorded_at": "2026-11-07T01:49:17.102590+00:00",
+  "baseline_commit": "8312d2717e7d06cca3376a74a300c6511b9c6aaf",
+  "regression": {
+    "method": "Full suite on final production source, followed by focused reruns after test-harness-only synchronization fixes. This is not a claim that the initial full run had zero failures.",
+    "reports": [
+      {
+        "path": "temp/full-regression-final2.xml",
+        "sha256": "5fd21da697e8eaeb9fdf41a95a1d11904b0dbb2947027941f98382ab7eef86fb",
+        "counts": {
+          "passed": 1044,
+          "failed": 4,
+          "skipped": 10
+        },
+        "failures": [
+          "tests.test_capability_lifecycle::test_retest_invalidates_pending_and_active_acceptance",
+          "tests.test_capability_lifecycle::test_agent_build_test_pause_restore_and_accept",
+          "tests.test_capability_lifecycle::test_real_timeout_report_and_remote_schema_never_fetches",
+          "tests.test_mcp_http_transport::test_http_cancel_interrupts_real_stream"
+        ]
+      },
+      {
+        "path": "temp/final-background-lifecycle-verified.xml",
+        "sha256": "961d714fe83ece70fd5c44836e6433cbbaa360eb22f0df4a88a28650fa3dac3a",
+        "counts": {
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0
+        },
+        "failures": []
+      },
+      {
+        "path": "temp/final-mcp-http-verified.xml",
+        "sha256": "129ec2a41e5553f5a0712147e527f9827c255dc80d0ff4180b83dd6d273b29bc",
+        "counts": {
+          "passed": 17,
+          "failed": 0,
+          "skipped": 0
+        },
+        "failures": []
+      }
+    ],
+    "latest_unique_counts": {
+      "passed": 1048,
+      "failed": 0,
+      "skipped": 10
+    },
+    "closed_failures": [
+      "tests.test_capability_lifecycle::test_agent_build_test_pause_restore_and_accept",
+      "tests.test_capability_lifecycle::test_real_timeout_report_and_remote_schema_never_fetches",
+      "tests.test_capability_lifecycle::test_retest_invalidates_pending_and_active_acceptance",
+      "tests.test_mcp_http_transport::test_http_cancel_interrupts_real_stream"
+    ],
+    "skipped": [
+      "tests.test_integration::test_A11_symlink",
+      "tests.test_project_discovery_boundaries::test_compileall_cannot_reenter_skipped_links[False]",
+      "tests.test_project_discovery_boundaries::test_compileall_cannot_reenter_skipped_links[True]",
+      "tests.test_project_discovery_boundaries::test_html_validator_uses_the_same_link_boundary[False]",
+      "tests.test_project_discovery_boundaries::test_html_validator_uses_the_same_link_boundary[True]",
+      "tests.test_project_discovery_boundaries::test_automatic_pytest_cannot_load_skipped_root_configuration[pytest.ini-False]",
+      "tests.test_project_discovery_boundaries::test_automatic_pytest_cannot_load_skipped_root_configuration[conftest.py-False]",
+      "tests.test_project_discovery_boundaries::test_automatic_pytest_cannot_load_skipped_root_configuration[pytest.ini-True]",
+      "tests.test_project_discovery_boundaries::test_automatic_pytest_cannot_load_skipped_root_configuration[conftest.py-True]",
+      "tests.test_project_discovery_boundaries::test_unrelated_declared_runner_is_not_blocked_by_pytest_config_link"
+    ]
+  },
+  "real_qwen": [
+    {
+      "path": "temp/live_browser_18eabae07acf41d1/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "qwen_token_plan": true,
+        "completed": true,
+        "one_render": true,
+        "job_returned": true,
+        "same_job_collected": true,
+        "actual_marker": true,
+        "render_source_saved": true,
+        "only_fixture_requests": true,
+        "no_pending_jobs": true
+      },
+      "sha256": "00f3495946d4756cee96b7eb35bf9ff3c16c83a0850acdd4a8c804ccd515b1c8"
+    },
+    {
+      "path": "temp/live_capability_32ed600a26544a18/report_resume_00ca71ed65b44a1e.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "completed": true,
+        "single_draft": true,
+        "frozen": true,
+        "actual_tests_passed": true,
+        "at_least_two_cases": true,
+        "not_registered": true,
+        "independent_result": true,
+        "restored_session": true
+      },
+      "sha256": "49918861444cb18db6c38a566b55121476de70315be28e5f8ab0f66ab285c967"
+    },
+    {
+      "path": "temp/live_async_tools_7dfc626d231a45ba/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "qwen_token_plan": true,
+        "completed": true,
+        "queued_submission": true,
+        "same_job_collected": true,
+        "actual_marker_in_result": true,
+        "actual_marker_in_answer": true,
+        "no_replay": true,
+        "source_imported": true,
+        "original_preserved": true,
+        "no_pending_jobs": true
+      },
+      "sha256": "7df22c615c39c20abc26022f1f0ae970d76bd56ebb10b5b9d38806790460eaf3"
+    },
+    {
+      "path": "temp/live_price_2a4d5f20111648a9/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "completed": true,
+        "three_actual_operations": true,
+        "exact_tool_result": true,
+        "bound_sources_valid": true,
+        "final_reference": true,
+        "answer_amount": true,
+        "user_basis": true
+      },
+      "sha256": "6491be26167ee379f078657e379408ee6d1254e5147b5d4cf8e1a6627d127e28"
+    },
+    {
+      "path": "temp/live_interactive_jobs_fd91e782ce664678/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "qwen_token_plan": true,
+        "completed": true,
+        "one_command": true,
+        "same_job_input": true,
+        "one_persisted_input": true,
+        "input_sent": true,
+        "actual_result_collected": true,
+        "actual_result_answer": true,
+        "job_cited": true,
+        "original_preserved": true,
+        "no_pending_jobs": true
+      },
+      "sha256": "31998de067f318c0354f902fdf5001f59d578be126ff51a52e729f6d9ba731e1"
+    },
+    {
+      "path": "temp/live_image_batch_190b867844214a32/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "six_originals_retained": true,
+        "completed": true,
+        "observed_random_digits": true,
+        "actual_crop_tool": true,
+        "restored_completed": true,
+        "restored_digits": true,
+        "restored_actual_read": true,
+        "original_snapshot_unchanged": true,
+        "no_inline_media_in_log": true,
+        "no_inline_media_in_session": true,
+        "request_batches_at_most_two": true,
+        "omitted_refs_explicit": true
+      },
+      "sha256": "060e4271b93170f63cba382b550e1ffeb9b8571d64e644287a613443f92f0de7"
+    },
+    {
+      "path": "temp/live_memory_pages_f61f75d3a13f4460/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "completed": true,
+        "actual_two_pages": true,
+        "default_dynamic_page": true,
+        "larger_than_old_default": true,
+        "exact_cursor_and_length": true,
+        "actual_tail_read": true,
+        "observed_random_marker": true,
+        "original_unchanged_after_restore": true,
+        "no_recursive_output_preview": true
+      },
+      "sha256": "1fea5c67c6dfd8c1707b8fae2a973efeb638861a3afe6cbdc1f22f2532d6a07d"
+    },
+    {
+      "path": "temp/live_request_2a158e5e2bd7496a/report.json",
+      "provider": "qwen_token_plan",
+      "model": "qwen3.8-flash",
+      "checks": {
+        "stream_tool_call": true,
+        "non_stream_reply": true
+      },
+      "sha256": "cd2bc2c6d661a4fe4c25916282afb8c4b4e0d810388314c3da14ed5368dbc46d"
+    }
+  ],
+  "architecture": {
+    "files": 288,
+    "dependencies": 691,
+    "contracts_kept": 2,
+    "contracts_broken": 0
+  },
+  "packaging": {
+    "path": "temp/final-wheel-clean/genesisai-0.1.0-py3-none-any.whl",
+    "sha256": "a7d512efa30539519f85f8500b2b29103201d5f61c2cd6a5528dd69a4d6c0efd",
+    "declared_assets": 399,
+    "packaged_assets": 399,
+    "loaded_builtin_tools": 42,
+    "matches_final_source": true
+  },
+  "secret_scan": {
+    "text_files_scanned": 578,
+    "configured_secrets_checked": 2,
+    "findings": []
+  }
+}

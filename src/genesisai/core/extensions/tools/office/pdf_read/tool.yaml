@@ -1,4 +1,4 @@
 name: pdf_read
 enabled: true
 category: office
-description: 读取 PDF 页数、元数据和可提取页面文字
+description: 按页读取PDF可提取文字，next用于续页；空白/扫描页明确标记需OCR，加密密码须独立授权输入

@@ -60,6 +60,7 @@ class PromptComposer:
     }
 
     EXTRA_PROTOCOLS = {
+        "capability_builder": "protocols/capability_builder.prompt.yaml",
         "coding": "protocols/coding.prompt.yaml",
         "file_management": "protocols/file_management.prompt.yaml",
         "testing": "protocols/testing.prompt.yaml",
@@ -106,10 +107,7 @@ class PromptComposer:
                 names.append(name)
         if "web" in state.get("capability_routes", []) and "protocols/web_research.prompt.yaml" not in names:
             names.append("protocols/web_research.prompt.yaml")
-        if not final and not recovery:
-            names.extend(
-                ("tools/catalog_usage.prompt.yaml", "tools/skill_usage.prompt.yaml")
-            )
+        names.extend(("tools/catalog_usage.prompt.yaml", "tools/skill_usage.prompt.yaml"))
         names.append("tools/evidence_usage.prompt.yaml")
         names.append(
             "completion/recovery.prompt.yaml"
@@ -145,7 +143,7 @@ class PromptComposer:
             "进度检查点": state.get("progress_checkpoint"),
             "待完成验证作业": state.get("pending_verification_jobs", []),
             "沿用证据": state.get("reuse_evidence", False),
-            "工具能力状态": {} if final or recovery else state.get("capabilities", {}),
+            "工具能力状态": state.get("capabilities", {}),
             "输出恢复要求": state.get("response_issue"),
             "开发任务延续": bool(state.get("pending_intent")),
             "已要求实际执行": state.get("execution_requested", False),
@@ -158,7 +156,7 @@ class PromptComposer:
         )
         if final or recovery:
             parts.append(
-                "当前请求禁止调用任何工具。请立即交付简洁、可读、带真实 source_ref 的答案。"
+                "核对实际验收状态；尚需执行或补证据时继续调用已授权工具，只有事实支持完成时才交付。"
             )
         return ComposedPrompt(
             "\n\n".join(parts),

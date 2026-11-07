@@ -16,19 +16,13 @@ class Implementation:
         target = context.access.workspace_path(raw_path, must_exist=True)
         if not target.is_file():
             raise ToolError("invalid_path", "path 必须是文件")
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")
-        except (OSError, UnicodeError) as exc:
-            raise ToolError("read_error", f"无法读取文件：{exc}") from exc
-
-        offset = args.get("offset", 0)
-        limit = args.get("limit", 20000)
-        total = len(text)
-        excerpt = text[offset:offset + limit]
-
-        lines = text.split("\n")
-        word_count = len(text)
-        line_count = len(lines)
+        from genesisai.core.extensions.tools.filesystem import text_ranges
+        offset = args.get('offset', 0)
+        limit = min(args.get('limit', 50000), max(1, context.runtime.context_budgeter.read_page_tokens() * 3), 50000)
+        excerpt, info, next_offset = text_ranges.characters(target, offset, limit)
+        total, line_count = info['total_chars'], info['total_lines']
+        preview, _, _ = text_ranges.characters(target, 0, min(50000, limit), info)
+        lines = preview.splitlines()
 
         heading = ""
         for line in lines[:10]:
@@ -44,5 +38,7 @@ class Implementation:
             "line_count": line_count,
             "text": excerpt,
             "truncated": total > offset + limit,
-            "next_offset": offset + limit if total > offset + limit else None,
+            "next_offset": next_offset,
+            "encoding": info["encoding"],
+            "heading_is_preview": True,
         }

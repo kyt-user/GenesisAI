@@ -1,31 +1,28 @@
 """内核工具：单一编辑内核。吸收 file_create/file_patch/file_move/file_delete/file_copy/directory_create。"""
 
-import difflib
 import hashlib
+import os
 import re
 import shutil
 from pathlib import Path
 
-from genesisai.shared.changes import atomic_write_bytes, backup_file, current_sha, record_change
+from genesisai.shared.changes import atomic_write_bytes, atomic_write_stream, backup_file, current_sha, record_change
 from genesisai.core.tools.base import PartialToolResult
 from genesisai.shared.security import ToolError
 from genesisai.shared.ids import sha
 
-from genesisai.core.extensions.tools.filesystem.patching import apply_unified_patch
-from genesisai.core.extensions.tools.filesystem.shared import MAX_BYTES, encode_text_document, read_text_document
+from genesisai.core.extensions.tools.filesystem.staged_edit import stage
+from genesisai.core.extensions.tools.filesystem.shared import read_text_document
 from genesisai.core.extensions.tools.shell.static_validate import validate_html_text
 
 
-REPORT_SUFFIXES = frozenset({".md", ".txt", ".csv", ".json"})
-SOURCE_SUFFIXES = frozenset({
-    ".toml", ".yaml", ".yml", ".xml", ".ini", ".cfg",
-    ".py", ".pyi", ".java", ".kt", ".kts",
-    ".html", ".htm", ".css", ".scss",
-    ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx",
-    ".go", ".rs", ".c", ".h", ".cpp", ".hpp", ".cs",
-    ".php", ".rb", ".sql", ".sh", ".ps1", ".bat", ".cmd",
+REPORT_SUFFIXES = frozenset({".md", ".rst", ".adoc", ".txt", ".csv", ".json"})
+BINARY_SUFFIXES = frozenset({
+    ".exe", ".dll", ".so", ".dylib", ".zip", ".gz", ".7z", ".rar", ".tar",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".tiff",
+    ".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt",
+    ".mp3", ".mp4", ".wav", ".ogg", ".mov", ".avi", ".woff", ".woff2", ".ttf",
 })
-TEXT_SUFFIXES = REPORT_SUFFIXES | SOURCE_SUFFIXES
 OPERATIONS = frozenset({"create", "replace", "patch", "move", "delete", "copy", "mkdir"})
 
 
@@ -37,6 +34,24 @@ def _require(args, key):
 
 
 class Implementation:
+    @staticmethod
+    def _text(context, args, key, *, required=True):
+        reference = args.get(key + '_ref')
+        if reference is not None:
+            if key in args:
+                raise ToolError('validation_error', f'{key} 与 {key}_ref 只能提供一个')
+            path = context.access.read(reference['path'])
+            if sha(path) != reference['sha256'].casefold():
+                raise ToolError('file_changed', f'{key}_ref 文件与指定哈希不一致')
+            value = read_text_document(path)[0]
+            if sha(path) != reference['sha256'].casefold():
+                raise ToolError('file_changed', f'{key}_ref 在读取期间发生变化')
+        else:
+            value = args.get(key)
+        if value is None or (required and not value):
+            raise ToolError('validation_error', f'需要 {key} 或 {key}_ref')
+        return value
+
     @staticmethod
     def observe(args, payload):
         from genesisai.core.tools.observations import Observation
@@ -63,6 +78,7 @@ class Implementation:
 
     # --- create ---
     def _prepare_create(self, context, args):
+        self._create_body(context, args)
         scope = args.get("scope", "output")
         if scope not in {"output", "workspace"}:
             raise ToolError("validation_error", "scope 只能是 output 或 workspace")
@@ -71,46 +87,45 @@ class Implementation:
             raise ToolError("target_exists", "目标已存在；请使用补丁修改")
         return {'name': 'editor', 'operation': 'create', 'args': args, 'target': str(target), 'grants': context.store.record.grants, 'output': context.store.record.output}
 
-    def _execute_create(self, context, args):
+    def _create_body(self, context, args):
+        body = self._text(context, args, 'content', required=False)
         refs = args.get("source_refs", [])
         suffix = Path(args["path"]).suffix.lower()
-        if suffix not in TEXT_SUFFIXES:
-            raise ToolError("unsupported_format", "只支持文本、报告、配置和源码文件；不支持二进制或未知扩展名")
-        is_source = suffix in SOURCE_SUFFIXES
-        if is_source and refs:
-            raise ToolError("invalid_source", "源码文件不能附加报告来源；请将 source_refs 设为空数组")
+        is_source = suffix not in REPORT_SUFFIXES
+        if suffix in BINARY_SUFFIXES or "\0" in body:
+            raise ToolError("unsupported_format", "editor 创建文本；二进制格式请使用文件引用或专用处理器")
+        if any(ref not in context.store.record.sources for ref in refs):
+            raise ToolError("invalid_source", "产物来源必须是已登记引用")
         if not is_source:
-            embedded = set(re.findall(r"\b(src_[0-9a-f]{16})\b", args.get("content", "")))
+            embedded = set(re.findall(r"\b(src_[0-9a-f]{16})\b", body))
             if not embedded.issubset(refs) or any((ref not in context.store.record.sources for ref in refs)):
                 raise ToolError("invalid_source", "报告含未登记或未声明的来源")
-        body = args.get("content", "")
         if refs:
             context.store.verify_sources()
-            if suffix not in {".md", ".txt"}:
-                raise ToolError("invalid_source", "带来源报告请使用 Markdown 或 TXT")
-            body += "\n\n## 来源\n"
-            for ref in dict.fromkeys(refs):
-                source = context.store.record.sources[ref]
-                body += f"- [{ref}] {source['title']} — {source.get('url', source.get('path'))}\n"
+        return body, refs, suffix, is_source
+
+    def _execute_create(self, context, args):
+        body, refs, suffix, is_source = self._create_body(context, args)
         payload = body.encode("utf-8")
         scope = args.get("scope", "output")
         if scope == "output":
             path = context.access.create(args["path"], payload)
             if context.access.host_access or path.is_relative_to(context.access.workspace):
                 record_change(context.store, operation="create", path=path, after_sha=hashlib.sha256(payload).hexdigest())
-            artifact_refs = [context.store.artifact(path)]
+            artifact_refs = [context.store.artifact(path, refs)]
         else:
             path = context.access.workspace_path(args["path"])
             if path.exists():
                 raise ToolError("target_exists", "目标已存在；请使用补丁修改")
             atomic_write_bytes(path, payload)
             record_change(context.store, operation="create", path=path, after_sha=hashlib.sha256(payload).hexdigest())
-            artifact_refs = []
+            artifact_refs = [context.store.artifact(path, refs)] if refs else []
         validation = None
         if suffix in {".html", ".htm"}:
             validation = {"framework": "frontend_static", **validate_html_text(body, Path(args["path"]).as_posix())}
         return {
             "path": str(path),
+            "created": True,
             "kind": "source" if is_source else "report",
             "requires_verification": is_source,
             "validation": validation,
@@ -125,26 +140,20 @@ class Implementation:
         expected = args.get("expected_sha256")
         if expected and expected.casefold() != before:
             raise ToolError("patch_conflict", "文件哈希与 expected_sha256 不一致")
-        text, encoding, newline, bom = read_text_document(target)
         if args.get("operation") == "replace":
-            old = _require(args, "old_text").replace("\r\n", "\n").replace("\n", newline)
-            if "new_text" not in args:
-                raise ToolError("validation_error", "replace 需要 new_text")
-            start = text.find(old)
-            if start < 0 or text.find(old, start + 1) >= 0:
-                raise ToolError("patch_conflict", "old_text 必须在目标中恰好出现一次")
-            new = args["new_text"].replace("\r\n", "\n").replace("\n", newline)
-            updated = text[:start] + new + text[start + len(old):]
+            payload, after, diff = stage(target, operation='replace',
+                old_text=self._text(context, args, 'old_text'),
+                new_text=self._text(context, args, 'new_text', required=False))
         else:
-            updated = apply_unified_patch(text, _require(args, "patch"), newline)
-        payload = encode_text_document(updated, encoding, bom)
-        diff = "\n".join(difflib.unified_diff(text.splitlines(), updated.splitlines(),
-                                             fromfile=str(target), tofile=str(target), lineterm=""))
-        return target, before, hashlib.sha256(payload).hexdigest(), payload, diff
+            payload, after, diff = stage(target, operation='patch', patch=self._text(context, args, 'patch'))
+        if current_sha(target) != before:
+            payload.close()
+            raise ToolError('patch_conflict', '预检期间文件已改变')
+        return target, before, after, payload, diff
 
     def _prepare_patch(self, context, args):
         batch = args.get("patches")
-        if batch is not None and (args["operation"] != "patch" or any(key in args for key in ("patch", "path", "expected_sha256"))):
+        if batch is not None and (args["operation"] != "patch" or any(key in args for key in ("patch", "patch_ref", "path", "expected_sha256"))):
             raise ToolError("validation_error", "批量补丁请仅提供 patches")
         self.changes = [self._patch_values(context, entry) for entry in (batch or [args])]
         if len({change[0] for change in self.changes}) != len(self.changes):
@@ -163,7 +172,9 @@ class Implementation:
                 if current_sha(path) != before:
                     raise ToolError("patch_conflict", "预览后文件已改变")
                 backup = backup_file(context.store, path)
-                atomic_write_bytes(path, payload)
+                payload.seek(0)
+                atomic_write_stream(path, payload)
+                payload.close()
                 written = True
                 change = record_change(context.store, operation="patch", path=path, before_sha=before,
                                        after_sha=after, backup=backup)
@@ -229,8 +240,6 @@ class Implementation:
         source = context.access.read(_require(args, "source"))
         if not source.is_file():
             raise ToolError("invalid_source", "复制来源必须是文件")
-        if source.stat().st_size > MAX_BYTES:
-            raise ToolError("size_limit", "复制文件超过 8 MiB")
         return target, source
 
     def _prepare_copy(self, context, args):
@@ -239,7 +248,12 @@ class Implementation:
 
     def _execute_copy(self, context, args):
         target, source = self._copy_values(context, args)
-        path = context.access.create(args["path"], source.read_bytes())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        path = context.access.write(args["path"])
+        with source.open("rb") as incoming, path.open("xb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing, length=1024 * 1024)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
         if sha(path) != sha(source):
             raise ToolError("integrity_error", "复制文件哈希不一致")
         return {"path": str(path), "artifact_refs": [context.store.artifact(path)]}

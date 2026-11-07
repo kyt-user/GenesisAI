@@ -6,9 +6,10 @@ import json
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
+from genesisai.shared.security import ToolError
 
 
-IGNORED_PARTS = frozenset({".git", ".genesis", "node_modules"})
+from genesisai.core.extensions.tools.shell.python_support import project_files, _read_text, _cancel
 VOID_TAGS = frozenset({
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
     "meta", "param", "source", "track", "wbr",
@@ -64,6 +65,8 @@ def _balanced_javascript(source: str) -> bool:
     escaped = False
     index = 0
     while index < len(source):
+        if index % 65536 == 0:
+            _cancel()
         char = source[index]
         following = source[index + 1] if index + 1 < len(source) else ""
         if quote:
@@ -100,8 +103,12 @@ def validate_html_text(text: str, label: str = "index.html") -> dict:
     errors = []
     parser = StructureParser()
     try:
-        parser.feed(text)
+        for offset in range(0, len(text), 65536):
+            _cancel()
+            parser.feed(text[offset:offset + 65536])
         parser.close()
+    except ToolError:
+        raise
     except Exception as exc:
         return {"file": label, "errors": [f"{label}: HTML 解析失败（{type(exc).__name__}）"], "passed": False}
     if not text.lstrip().casefold().startswith("<!doctype html>"):
@@ -110,7 +117,7 @@ def validate_html_text(text: str, label: str = "index.html") -> dict:
         if required not in parser.tags:
             errors.append(f"{label}: 缺少 <{required}> 标签")
     if parser.stack:
-        errors.append(f"{label}: 未闭合标签 {', '.join(parser.stack[-5:])}")
+        errors.append(f"{label}: 未闭合标签 {', '.join(parser.stack)}")
     errors.extend(f"{label}: {message}" for message in parser.errors)
     for number, script in enumerate(parser.scripts, 1):
         if script.strip() and not _balanced_javascript(script):
@@ -119,22 +126,20 @@ def validate_html_text(text: str, label: str = "index.html") -> dict:
 
 
 def validate(root: Path) -> dict:
-    files = []
+    root = root.resolve()
+    inventory, coverage = project_files(root)
+    files = [name for name in inventory if Path(name).suffix.lower() in {'.htm', '.html'}]
     errors = []
-    for path in sorted(root.rglob("*.htm*")):
-        relative = path.relative_to(root)
-        if not path.is_file() or any(part in IGNORED_PARTS for part in relative.parts):
-            continue
-        files.append(relative.as_posix())
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as exc:
-            errors.append(f"{relative}: 不是可读 UTF-8 文本（{type(exc).__name__}）")
-            continue
-        errors.extend(validate_html_text(text, relative.as_posix())["errors"])
+    for name in files:
+        _cancel()
+        text = _read_text(root, name, coverage)
+        if text is not None:
+            errors.extend(validate_html_text(text, name)['errors'])
+    errors.extend(f"{item['path']}: {item['operation']}失败（{item['error']}）" for item in coverage['errors'])
     if not files:
-        errors.append("未发现 HTML 文件")
-    return {"files": files, "checked": len(files), "errors": errors, "passed": not errors}
+        errors.append('未发现 HTML 文件')
+    return {'files': files, 'checked': len(files), 'errors': errors, 'passed': not errors,
+            'coverage': {key: value for key, value in coverage.items() if key != 'directories'}}
 
 
 def main() -> int:

@@ -106,6 +106,8 @@ def run_onboarding(console, *, directory=None, initial: ProviderSettings | None 
         base_url=provider.base_url,
         generation=generation,
         context=dict(initial.context) if initial and initial.provider == provider.id and initial.model == model else {},
+        retry=dict(initial.retry) if initial and initial.provider == provider.id else {},
+        request_timeouts=dict(initial.request_timeouts) if initial and initial.provider == provider.id else {},
     )
     path = save_settings(settings, directory)
     console.print(f"[green]✓ 已保存[/green] [dim]{path}[/dim]")
@@ -141,6 +143,8 @@ def select_model_only(console, settings: ProviderSettings, *, directory=None):
         base_url=settings.base_url,
         generation=dict(settings.generation),
         context=dict(settings.context) if settings.model == model else {},
+        retry=dict(settings.retry),
+        request_timeouts=dict(settings.request_timeouts),
     )
     save_settings(updated, directory)
     return updated

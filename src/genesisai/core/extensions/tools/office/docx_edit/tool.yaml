@@ -1,4 +1,4 @@
 name: docx_edit
 enabled: true
 category: office
-description: 从 DOCX 原件生成有限文字替换副本并验证
+description: 按全文文字替换DOCX的段落/表格/页眉页脚；覆盖须overwrite和expected_sha256；复杂run样式可能归一化

@@ -1,4 +1,11 @@
 name: code_review
 description: 基于实际 diff 查找可定位、可复现的代码问题
 entry: SKILL.md
-tools: [run_commands, read_files, search_codebase]
+stages:
+  run:
+    depends_on: []
+    required_tools:
+    - run_commands
+    - read_files
+    - search_codebase
+    optional_tools: []

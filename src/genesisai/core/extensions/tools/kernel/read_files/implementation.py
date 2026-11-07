@@ -6,7 +6,8 @@
 from genesisai.shared.security import ToolError
 from genesisai.shared.ids import sha
 
-from genesisai.core.extensions.tools.filesystem.shared import extract, read_text_document
+from genesisai.core.extensions.tools.filesystem.shared import extract
+from genesisai.core.extensions.tools.filesystem import text_ranges
 
 
 class Implementation:
@@ -53,60 +54,29 @@ class Implementation:
             path = context.access.read(request["path"])
             digest = sha(path)
             if line_start is not None:
-                text, encoding, newline, bom = read_text_document(path)
-                lines = text.splitlines()
-                selected = lines[line_start - 1:line_end]
-                numbered = [f"{number}: {value}" for number, value in enumerate(selected, line_start)]
-                body = "\n".join(numbered)
-                requested_end = min(line_end, len(lines))
-                if len(body) > remaining:
-                    count, used = 0, 0
-                    for line in numbered:
-                        size = len(line) + bool(count)
-                        if used + size > remaining:
-                            break
-                        used += size
-                        count += 1
-                    if not count:
-                        # 保留整行语义；长行改用原文字符偏移继续读取。
-                        raw_offset = sum(len(line) for line in text.splitlines(keepends=True)[:line_start-1])
-                        remaining_requests.extend([{"path": request["path"], "offset": raw_offset, "limit": request.get("limit", 8000)}, *targets[index+1:]])
+                body, info, requested_end, next_character = text_ranges.lines(path, line_start, line_end, remaining)
+                if next_character is not None:
+                    if requested_end < line_start:
+                        remaining_requests.extend([{"path": request["path"], "offset": next_character, "limit": request.get("limit", 8000)}, *targets[index+1:]])
                         break
-                    body = "\n".join(numbered[:count])
-                    requested_end = line_start + count - 1
                     remaining_requests.append({**request, "line_start": requested_end + 1})
-                truncated = requested_end < len(lines)
-                entry = {
-                    "path": str(path),
-                    "text": body,
-                    "sha256": digest,
-                    "encoding": encoding,
-                    "newline": "CRLF" if newline == "\r\n" else "LF",
-                    "bom": bom,
-                    "line_start": line_start,
-                    "line_end": requested_end,
-                    "total_lines": len(lines),
-                    "next_offset": None,
-                    "truncated": truncated,
-                }
+                truncated = requested_end < info["total_lines"]
+                entry = {"path": str(path), "text": body, "sha256": digest,
+                         **info, "line_start": line_start, "line_end": requested_end,
+                         "next_offset": None, "truncated": truncated}
             else:
-                if path.suffix.lower() in {".pdf", ".docx", ".xlsx"}:
-                    text, truncated = extract(path)
+                if path.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx"}:
+                    from genesisai.core.extensions.tools.office.readers import text_page
+                    body, info, next_offset = text_page(path, path.suffix.lower()[1:], offset, limit)
+                    clipped = False
                 else:
-                    text, _, _, _ = read_text_document(path)
-                    truncated = False
-                body = text[offset: offset + limit]
-                truncated = truncated or len(text) > offset + limit
-                entry = {
-                    "path": str(path),
-                    "text": body,
-                    "sha256": digest,
-                    "offset": offset,
-                    "next_offset": offset + limit if len(text) > offset + limit else None,
-                    "truncated": truncated,
-                }
-                if entry["next_offset"] is not None:
-                    remaining_requests.append({**request, "offset": entry["next_offset"]})
+                    body, info, next_offset = text_ranges.characters(path, offset, limit)
+                    clipped = False
+                truncated = clipped or next_offset is not None
+                entry = {"path": str(path), "text": body, "sha256": digest, "offset": offset,
+                         **info, "next_offset": next_offset, "truncated": truncated}
+                if next_offset is not None:
+                    remaining_requests.append({**request, "offset": next_offset})
             refs.append(context.store.source(kind="file", path=str(path), sha256=digest, title=path.name))
             files.append(entry)
             truncated_any = truncated_any or truncated

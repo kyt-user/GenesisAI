@@ -21,7 +21,9 @@ def execute_memory_command(runtime, command):
         )
     if args[0] == "write" and len(args) == 2:
         payload = json.loads(Path(args[1]).read_text(encoding="utf-8-sig"))
-        return memory.write_note(**payload)
+        if not isinstance(payload, dict) or set(payload) != {'entries'}:
+            raise ValueError('write JSON 必须只包含 entries 事实条目数组')
+        return memory.write_notes(payload['entries'])
     if args[0] == "delete" and len(args) in {3, 4}:
         ref, revision = args[1], int(args[2])
         if len(args) != 4 or args[3] != "--confirm":
@@ -35,20 +37,19 @@ def execute_memory_command(runtime, command):
     if args[0] == "export" and len(args) == 2:
         return {"path": memory.export(args[1])}
     if args == ["rebuild"]:
-        return {
-            "project": runtime.project_index.refresh(force=True),
-            "search": memory.rebuild_search(),
-        }
+        return {'maintenance_id': runtime.maintenance.enqueue('rebuild'), 'state': 'queued'}
+    if args[0] == 'jobs' and len(args) <= 3:
+        return runtime.maintenance.status(args[1] if len(args) > 1 else None,
+                                           offset=int(args[2]) if len(args) > 2 else 0)
+    if args[0] == 'cancel' and len(args) == 2:
+        return runtime.maintenance.cancel(args[1])
     if args == ["diagnostic"]:
         return {
             "database": str(memory.database.path),
             "project_id": memory.project_id,
             "workspace_id": memory.workspace_id,
             "integrity": memory.database.rows("PRAGMA quick_check"),
-            "jobs": memory.database.rows(
-                "SELECT id,kind,state,payload FROM jobs WHERE workspace_id=? ORDER BY updated DESC LIMIT 10",
-                (memory.workspace_id,),
-            ),
+            "maintenance": runtime.maintenance.status(limit=10),
             "context": runtime.store.record.run_runtime.get("context_report", {}),
         }
     if args[0] == "backup" and len(args) == 2:
@@ -59,5 +60,5 @@ def execute_memory_command(runtime, command):
             "note": "附件应连同 assets 目录一起备份",
         }
     raise ValueError(
-        "用法：/memory list | search 关键词 | read 引用 [偏移] [版本] | write JSON路径 | delete 引用 版本 --confirm | export 新文件 | rebuild | diagnostic | backup 新文件"
+        "用法：/memory list | search 关键词 | read 引用 [偏移] [版本] | write JSON路径 | delete 引用 版本 --confirm | export 新文件 | rebuild | jobs [编号] [偏移] | cancel 编号 | diagnostic | backup 新文件"
     )

@@ -8,6 +8,7 @@ import sqlite3
 from genesisai.core.paths import ApplicationPaths
 
 SCHEMA_VERSION = 1
+INDEX_DIRTY_SCHEMA = 'CREATE TABLE IF NOT EXISTS index_dirty(workspace_id TEXT NOT NULL, path TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(workspace_id,path))'
 SCHEMA = """
 CREATE TABLE projects(id TEXT PRIMARY KEY, anchor TEXT UNIQUE NOT NULL, created REAL NOT NULL);
 CREATE TABLE workspaces(id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), path TEXT UNIQUE NOT NULL);
@@ -37,6 +38,16 @@ class Database:
         self.root = Path(root).resolve()
         self.path = ApplicationPaths(self.root).database
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Opening an initialized store must not queue behind a long derived-data
+        # writer: status readers and cross-instance cancellation need read access.
+        with self.transaction(readonly=True) as db:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version not in (0, SCHEMA_VERSION):
+                raise ValueError(f"Unsupported memory database version: {version}")
+            initialized = version == SCHEMA_VERSION and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='index_dirty'").fetchone()
+        if initialized:
+            return
         with self.transaction() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == 0:
@@ -47,6 +58,8 @@ class Database:
                 db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             elif version != SCHEMA_VERSION:
                 raise ValueError(f"Unsupported memory database version: {version}")
+            # New rebuildable coordination state, never a migration of history.
+            db.execute(INDEX_DIRTY_SCHEMA)
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=15)

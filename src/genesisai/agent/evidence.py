@@ -51,7 +51,7 @@ class EvidenceBundle:
     def verify(self) -> None:
         for item in self.items():
             source = self.store.record.sources.get(item['source_ref'])
-            if not source or source.get("kind") != "web":
+            if not source or source.get("kind") not in {"web", "private_web", "web_render"}:
                 raise ValueError("Evidence 指向不存在或未成功读取的来源")
             if source.get("url") != item["canonical_url"]:
                 raise ValueError("Evidence URL 与 Source Session 不一致")

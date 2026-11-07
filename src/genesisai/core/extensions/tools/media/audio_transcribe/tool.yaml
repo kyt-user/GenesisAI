@@ -1,0 +1,4 @@
+name: audio_transcribe
+enabled: true
+category: media
+description: 用本地 faster-whisper CPU int8 按时间片转写授权音频；需预装speech依赖及GENESISAI_WHISPER_MODEL本地模型目录，不下载模型、不调用云服务；沿next续读，识别文字需核对原音

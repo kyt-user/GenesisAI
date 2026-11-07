@@ -89,10 +89,11 @@ def test_stream_no_tools_disables_deepseek_thinking_and_keeps_override():
             )
         ])
 
-    model = object.__new__(DeepSeekClient)
+    from contextlib import nullcontext
+    model = DeepSeekClient('fixture', api_key='offline-fixture')
     model.model, model.generation = "fixture", {}
     model.reasoning_enabled, model.reasoning_effort = True, "low"
-    model.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    model._transport_request = lambda payload, clock: nullcontext(create(**payload))
 
     list(model.stream_chat([], tools=[], max_tokens=321))
 
@@ -170,11 +171,13 @@ def test_stream_assembles_fragmented_call_alongside_reasoning_and_usage():
         chunk(delta(None, None, 'files', '["main.py"]}'), 'tool_calls'),
         SimpleNamespace(choices=[], usage=SimpleNamespace(model_dump=lambda: {'total_tokens': 12})),
     ]
-    model = object.__new__(DeepSeekClient)
+    from contextlib import nullcontext
+    model = DeepSeekClient('fixture', api_key='offline-fixture')
     model.model, model.generation = 'fixture', {}
     model.reasoning_enabled, model.reasoning_effort = True, 'low'
-    model.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: iter(chunks))))
-    reasoning, text, response = model.stream_chat([], tools=[{'type': 'function'}])
+    model._transport_request = lambda payload, clock: nullcontext(iter(chunks))
+    reasoning, text, activity1, activity2, response = model.stream_chat([], tools=[{'type': 'function'}])
+    assert activity1 == activity2 == ('tool_call', '')
     assert reasoning == ('reasoning', 'private') and text == '正在读取。'
     call, = response.tool_calls
     assert (call.id, call.name, call.arguments) == ('c1', 'read_files', '{"paths":["main.py"]}')

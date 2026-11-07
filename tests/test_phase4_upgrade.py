@@ -124,12 +124,10 @@ class TestCreativeProfile:
         assert select_initial_profile("这个角色需要扩展") == "creative"
         assert select_initial_profile("创建一个世界观") == "creative"
 
-    def test_creative_profile_has_high_budget(self):
-        from genesisai.shared.budgets import PROFILES
-        profile = PROFILES["creative"]
-        assert profile.model_calls >= 25
-        assert "token_budget" not in profile.to_dict()
-        assert 'seconds' not in profile.to_dict()
+    def test_creative_profile_has_no_hidden_execution_budget(self):
+        from genesisai.shared.budgets import initial_run_runtime
+        assert initial_run_runtime("creative")["budget"] == {"model_calls": None, "tools": None, "total_tokens": None}
+
 
 
 # ---------------------------------------------------------------------------
@@ -345,8 +343,9 @@ class TestSelfVerification:
         assert runner.development.should_auto_verify({"profile": "direct_answer", "protocols": ["coding"], "verification_rounds": 0})
         # direct_answer without coding should NOT auto-verify
         assert not runner.development.should_auto_verify({"profile": "direct_answer", "protocols": [], "verification_rounds": 0})
-        # Max rounds reached should NOT auto-verify
-        assert not runner.development.should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 3})
+        # New changes require verification regardless of the number of prior rounds.
+        assert runner.development.should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 100, "change_revision": 4, "verified_revision": 3})
+        assert not runner.development.should_auto_verify({"profile": "local_files", "protocols": [], "verification_rounds": 100, "change_revision": 4, "verified_revision": 4})
 
     def test_verification_rounds_tracked_in_state(self, tmp_path):
         """verification_rounds field is properly initialized and tracked."""

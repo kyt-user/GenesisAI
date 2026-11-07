@@ -31,7 +31,7 @@ def compare_context_usage(runner, model):
         details = {'model_call_id': uid('context_probe'), 'purpose': 'context_usage_comparison', 'variant': label}
         logger = runner.run_logger
         model.bind_logging(logger, **details)
-        options = {'max_tokens': 128, 'timeout': 60}
+        options = {'max_tokens': 128, 'request_timeouts': {'total': 60}}
         logger.log_model_input(runner.store.record.rounds, messages, [], options=options, **details)
         started = time.monotonic()
         response = model.chat(messages, tools=[], **options)
@@ -121,7 +121,6 @@ def main():
         store.get_logger().error('live_acceptance_error', exc)
     finally:
         runtime.close()
-        model.client.close()
         report['passed'] = bool(report['checks']) and all(report['checks'].values()) and 'exception_type' not in report
         atomic_json(root / 'report.json', report)
         print(json.dumps({'passed': report['passed'], 'checks': report['checks'], 'report': str(root / 'report.json')}, ensure_ascii=False), flush=True)

@@ -1,4 +1,4 @@
 name: consistency_check
 enabled: true
 category: novel
-description: 检查章节文本中的角色名一致性和潜在矛盾
+description: 按块登记证据并查询跨章事实表和可能差异；返回覆盖范围、事实分页和next，不把未扫描章节当作一致

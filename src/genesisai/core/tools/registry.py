@@ -12,21 +12,23 @@ from genesisai.core.tools.base import ToolDescriptor, ToolSpec
 
 
 TOOL_FIELDS = frozenset({"name", "enabled", "category", "description"})
-# 内核收敛后仅保留内核工具包（kernel）与保留为工具包的 office/novel；
+# 内置工具包包含 kernel、office、novel 与本地 media；
 # mcp 为运行期动态注册（无 tool.yaml）。
-TOOL_CATEGORIES = frozenset({"kernel", "office", "novel", "mcp"})
-ON_DISK_CATEGORIES = frozenset({"kernel", "office", "novel"})
+TOOL_CATEGORIES = frozenset({"kernel", "office", "novel", "media", "mcp"})
+ON_DISK_CATEGORIES = frozenset({"kernel", "office", "novel", "media"})
 TOOL_NAME = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent.parent
 CATEGORY_PATHS = {
     "kernel": PACKAGE_ROOT / "core" / "extensions" / "tools" / "kernel",
     "office": PACKAGE_ROOT / "core" / "extensions" / "tools" / "office",
     "novel": PACKAGE_ROOT / "core" / "extensions" / "tools" / "novel",
+    "media": PACKAGE_ROOT / "core" / "extensions" / "tools" / "media",
 }
 CATEGORY_MODULES = {
     "kernel": "genesisai.core.extensions.tools.kernel",
     "office": "genesisai.core.extensions.tools.office",
     "novel": "genesisai.core.extensions.tools.novel",
+    "media": "genesisai.core.extensions.tools.media",
 }
 
 
@@ -56,6 +58,8 @@ class ToolRegistry:
         """注册非 tool.yaml 来源的动态工具（如 MCP）；refresh 后仍保留。"""
         if not isinstance(descriptor, ToolDescriptor):
             raise RegistryError("动态工具描述符无效")
+        if descriptor.source not in {"builtin", "external"} or descriptor.scope not in {"application", "user", "project"}:
+            raise RegistryError("工具来源或作用域无效")
         if descriptor.name in self._items and descriptor.name not in self._dynamic:
             raise RegistryError(f"动态工具与内置工具重名：{descriptor.name}")
         self._dynamic[descriptor.name] = descriptor

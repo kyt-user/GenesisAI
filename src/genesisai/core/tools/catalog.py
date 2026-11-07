@@ -42,18 +42,20 @@ class ToolCatalog:
         return [item for item in self.registry.values() if self._disabled_reason(item) is None]
 
     def inventory(self) -> dict[str, list[dict]]:
-        """CLI 用清单：将工具分为启用与禁用两组。"""
-        groups: dict[str, list[dict]] = {"enabled": [], "disabled": []}
+        """来源是一级分类；可用性是每项独立的运行状态。"""
+        groups: dict[str, list[dict]] = {"builtin": [], "external": []}
         for descriptor in self.registry.values():
             reason = self._disabled_reason(descriptor)
             entry = {
                 "name": descriptor.name,
                 "category": descriptor.category,
                 "description": descriptor.description,
+                "source": descriptor.source,
+                "scope": descriptor.scope,
+                "provider": descriptor.provider,
+                "enabled": reason is None,
             }
             if reason:
                 entry["reason"] = reason
-                groups["disabled"].append(entry)
-            else:
-                groups["enabled"].append(entry)
+            groups[descriptor.source].append(entry)
         return groups

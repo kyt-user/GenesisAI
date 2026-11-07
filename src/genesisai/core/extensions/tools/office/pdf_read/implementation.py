@@ -3,5 +3,5 @@
 from genesisai.core.extensions.tools.office.helpers import pdf_read
 class Implementation:
     def prepare(self, context, args): return None
-    def execute(self, context, args): return pdf_read(context, args["path"])
+    def execute(self, context, args): return pdf_read(context, args)
 

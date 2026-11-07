@@ -3,5 +3,5 @@
 from genesisai.core.extensions.tools.office.helpers import pptx_read
 class Implementation:
     def prepare(self, context, args): return None
-    def execute(self, context, args): return pptx_read(context, args["path"])
+    def execute(self, context, args): return pptx_read(context, args)
 

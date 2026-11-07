@@ -1,4 +1,4 @@
 name: xlsx_read
 enabled: true
 category: office
-description: 读取 XLSX 工作表、值、公式、合并区域和结构摘要
+description: 分页列出全部工作表；指定sheet和range读取单元格，view可查formulas/styles/merges；next用于续页，公式未重算

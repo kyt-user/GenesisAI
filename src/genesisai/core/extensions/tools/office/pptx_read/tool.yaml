@@ -1,4 +1,4 @@
 name: pptx_read
 enabled: true
 category: office
-description: 读取 PPTX 幻灯片顺序、文字、备注和对象数量
+description: 按页读取PPTX文字与备注，next用于续页，页面长文本可按text_offset继续；不含图像OCR

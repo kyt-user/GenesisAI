@@ -22,6 +22,7 @@ _BEARER = re.compile(r"(?i)(Bearer\s+)[A-Za-z0-9._~+/=-]+")
 
 
 class IOJournal:
+    _secret_lock = threading.RLock()
     def __init__(self, store):
         self.store = store
         self.path = store.root / "logs" / f"{store.id}.jsonl"
@@ -34,19 +35,20 @@ class IOJournal:
 
     def add_secret(self, value):
         if isinstance(value, str) and value:
-            self._secrets.add(value)
+            with self._secret_lock:
+                self._secrets = self._secrets | {value}
 
     def clean(self, value):
+        if isinstance(value, bytes):
+            return {'sha256': hashlib.sha256(value).hexdigest(), 'byte_size': len(value)}
         if is_dataclass(value) and not isinstance(value, type):
             value = asdict(value)
         if isinstance(value, dict):
-            if isinstance(value.get('data'), bytes):
-                value = {**value, 'data': {'sha256': hashlib.sha256(value['data']).hexdigest(), 'byte_size': len(value['data'])}}
             return {str(k): "[REDACTED]" if _SECRET_KEY.fullmatch(str(k)) and isinstance(v, str) else self.clean(v) for k, v in value.items()}
         if isinstance(value, (list, tuple)):
             return [self.clean(item) for item in value]
         if isinstance(value, Path):
-            return str(value)
+            return self.clean(str(value))
         if isinstance(value, str):
             value = re.sub(r'data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+',
                            lambda m: '[图片载荷 sha256=' + hashlib.sha256(m[0].encode()).hexdigest() + ']', value)
@@ -59,7 +61,8 @@ class IOJournal:
         return self.clean(str(value))
 
     def write(self, event, *, round_num=None, event_run_id=..., **payload):
-        record = self.clean({'schema_version': 1, 'event_id': uuid4().hex, 'timestamp': datetime.now(timezone.utc).isoformat(), 'session_id': self.store.id, 'run_id': getattr(self.store.record, 'run_id') if event_run_id is ... else event_run_id, 'round_num': getattr(self.store.record, 'rounds', 0) if round_num is None else round_num, 'event': event, 'payload': payload})
+        # Envelope IDs are protocol metadata; redact only user/tool payloads.
+        record = {'schema_version': 1, 'event_id': uuid4().hex, 'timestamp': datetime.now(timezone.utc).isoformat(), 'session_id': self.store.id, 'run_id': getattr(self.store.record, 'run_id') if event_run_id is ... else event_run_id, 'round_num': getattr(self.store.record, 'rounds', 0) if round_num is None else round_num, 'event': event, 'payload': self.clean(payload)}
         line = json.dumps(record, ensure_ascii=False, allow_nan=False) + "\n"
         with self._lock, self.path.open("a", encoding="utf-8", newline="\n") as stream:
             stream.write(line)
@@ -69,8 +72,17 @@ class IOJournal:
 
     @staticmethod
     def exception(exc):
+        # SDK connection exceptions hide the transport cause in __cause__.
+        # Keep that chain for diagnosis; write() applies the usual redaction.
+        causes, seen = [], {id(exc)}
+        cause = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            causes.append({"type": type(cause).__name__, "message": str(cause)})
+            cause = cause.__cause__ or (None if cause.__suppress_context__ else cause.__context__)
         return {
             "type": type(exc).__name__, "message": str(exc),
+            "causes": causes,
             "status_code": getattr(exc, "status_code", None),
             "request_id": getattr(exc, "request_id", None),
             "body": getattr(exc, "body", None),

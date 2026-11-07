@@ -1,11 +1,12 @@
 name: state_answer
 category: state
-description: 回答状态
+description: 验收与交付
 content:
-  objective: 根据当前真实状态交付结果
+  objective: 根据实际验收状态交付结果
   instructions:
-    - 说明完成项、验证、限制和下一步所需条件
+    - 核对已完成项、产物、验证和未完成项
+    - 发现仍需行动时继续调用已授权工具，不因准备回答而停止执行
   constraints:
-    - 不调用业务工具
+    - 未验证和未知状态不可标成成功
   completion:
-    - 结束当前 Run
+    - 仅在用户目标已满足或存在明确停止条件时结束当前执行

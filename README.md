@@ -47,7 +47,7 @@ provider: deepseek
 model: deepseek-v4-flash
 generation:
   temperature: 0.6
-  max_tokens: 2048
+  max_tokens: 8192
 ```
 
 当前只维护 OpenAI 兼容模型协议。Provider 的端点、环境变量名、超时和兼容差异由 `src/genesisai/model/` 中的代码固定。DeepSeek 密钥写入工作区根目录或 GenesisAI 根目录的 `.env`：
@@ -82,15 +82,18 @@ genesis
 
 `--session` 只从统一历史目录读取当前格式的会话，不转换历史格式。清理已有用户数据前必须确认范围。模型终端配置保存于 `~/.genesisai/config.json`（可通过 `--config-dir` 指定）。
 
-新会话默认使用用户审批。读取本地授权文件直接执行。写入、网络请求、运行命令、启动或调用 MCP 服务都逐次审批。
+新会话默认使用用户审批。读取本地授权文件直接执行。写入、网络请求、运行命令、启动或调用 MCP 服务在有效范围授权内执行，其他调用单独审批。
 
 ```text
 /permissions
 /permissions user
 /permissions auto
+/authorizations
 ```
 
 自动审批允许已启用的工具直接执行，内置文件工具可用绝对路径读写工作区外的宿主文件，命令以当前系统账号运行。可用 `--permissions user` 或 `--permissions auto` 指定启动模式。恢复会话时使用该会话保存的模式，`/new` 回到用户审批。
+
+删除操作及外挂能力注册始终需要明确确认；外挂验收绑定当前测试版本。用 `/authorize JSON` 创建会话或当前任务的授权，`/revoke auth_...` 撤销；单次确认不按固定时间过期，但参数或资源变化必须重新确认。命令和外挂环境默认隔离，用 `env_from` 显式映射宿主变量。语法及边界见[范围授权与环境隔离](docs/范围授权与环境隔离.md)。
 
 ## 连续会话
 
@@ -105,7 +108,9 @@ genesis
 | `/help`、`/status`、`/history`、`/model`        | 查看使用方法和当前状态                   |
 | `/`、`/sessions`、`/new`、`/resume`、`/cancel`、`/exit` | 选择历史会话、创建会话或管理当前运行 |
 | `/answer 文字或编号`                                    | 回答当前任务的澄清问题                   |
-| `/tools`                                              | 查看启用与禁用的工具                     |
+| `/tools`                                              | 按内置／外挂查看工具及可用状态           |
+| `/capabilities` | 查看内置与外挂的 Tool、Skill、MCP，以及草稿和报告 |
+| `/create_tool 需求`、`/create_skill 需求`、`/create_mcp 需求` | 让 Agent 构建、测试并提交用户验收 |
 | `/queue`、`/queue resume`、`/queue clear` | 查看、继续或清空本次交互的排队消息 |
 | `/pet` | 选择或切换毛球、雷伊桌宠，任务运行中也可使用 |
 | `/skills list\|search\|show\|load\|unload`                | 管理按需 Skill                           |
@@ -128,16 +133,16 @@ genesis
 
 ## 架构约束
 
-- 模型客户端只由一个 `Runner` 驱动，不创建子 Agent。
+- 主会话使用单个 `Runner`；显式测试 Skill 时，顺序运行独立测试会话，不共享生产工具服务。
 - 每轮按任务和已加载 Skill 选择工具定义，模型可通过 `discover_tools` 查找其他可用能力。
-- Prompt、Tool 和 Skill 使用严格 YAML 必要字段，均无版本字段。
-- 历史、任务、索引、附件、日志与备份由应用维护；项目 MCP、Skill、Workflow 位于应用目录的 `projects/<project_id>/`。
+- 内置 Prompt、Tool 和 Skill 使用严格 YAML；外挂使用统一 JSON 能力包，能力库管理不可变修订和测试报告。
+- 历史、任务、索引、附件、日志与备份由应用维护；外挂 Tool、Skill、MCP 位于应用目录的 `capabilities/`，Workflow 与 LSP 配置位于 `projects/<project_id>/`。
 - 项目知识携带来源、状态与版本；源码变化使依赖结论失效，原始历史仍可按引用查阅。用户项目只读取可选的 `AGENTS.md`。
 - Git V1 只读；Shell 直接执行参数数组，不经过命令解释器。
 
 ## Python 小项目开发循环
 
-代码任务按“策划 → 计划 → 执行 → 验收 → 修正”循环运行。Python 项目会识别 `pyproject.toml`、源码布局、项目虚拟环境和测试框架；`run_commands` 可自动选择 pytest、unittest，或在没有测试时执行语法编译检查。文件发生修改后，即使随后读取 Git diff，Runner 仍保留待验证状态并在交付前运行测试。只有最近一次代码修改之后的真实验证通过，应用任务记录才能标记为 `verified`。
+代码任务按“策划 → 计划 → 执行 → 验收 → 修正”循环运行。Python 项目会识别 `pyproject.toml`、源码布局、项目虚拟环境和测试框架；`run_commands` 可自动选择 pytest、unittest，或在没有测试时执行语法编译检查。代码变更后，Runner 保留待验收状态，由项目验证器或模型按风险选择测试、构建、静态检查；普通文档可使用内容和差异核对，不会自动强制运行项目全套测试。run_commands 的 verification=build/static 记录显式检查的真实退出状态，要求验证的验收项仍须绑定当前修改版本。
 
 从零创建 `.py`、`.java`、`.html` 等源码文件以及开发任务短回复延续的补全方案已纳入主线。
 

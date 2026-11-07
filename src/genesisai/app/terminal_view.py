@@ -171,10 +171,10 @@ class CliView:
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold", no_wrap=True)
         table.add_column(style="white")
-        styles = {"enabled": "bright_green", "disabled": "red"}
-        labels = {"enabled": "Enabled", "disabled": "Disabled"}
+        styles = {"builtin": "bright_green", "external": "cyan"}
+        labels = {"builtin": "内置", "external": "外挂"}
         total = 0
-        for group in ("enabled", "disabled"):
+        for group in ("builtin", "external"):
             entries = snapshot.get(group, [])
             total += len(entries)
             if entries:
@@ -229,7 +229,11 @@ class CliView:
         table.add_row("Profile", str(runtime.get("profile", "—")))
         table.add_row("阶段", str(runtime.get("phase", "—")))
         table.add_row('任务时限', f"{runtime.get('execution_seconds_limit', '—')} 秒")
-        table.add_row('单次请求超时', f"{runtime.get('request_timeout_seconds', '—')} 秒")
+        timeouts = runtime.get('request_timeouts', {})
+        for key, label in [('connect', '请求连接时限'), ('first_token', '首个有效输出时限'),
+                           ('idle', '请求空闲时限'), ('total', '请求总时限')]:
+            value = timeouts.get(key)
+            table.add_row(label, '不限' if key == 'total' and value is None else f"{value if value is not None else '—'} 秒")
         table.add_row("停止原因", str(runtime.get("stop_reason") or "—"))
         table.add_row("Skill", self._value(snapshot.skill_name))
         table.add_row("Git", self._value(snapshot.git_state))

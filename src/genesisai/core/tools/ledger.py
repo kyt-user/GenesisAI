@@ -14,13 +14,12 @@ class CallLedger:
             raise ToolError("duplicate_call_id", "调用 ID 已用于其他参数")
         return prior
 
-    def prepare(self, call: dict, preview: dict, digest_value: str, expires: float) -> None:
+    def prepare(self, call: dict, preview: dict, digest_value: str) -> None:
         self.store.record.calls[call['id']] = {
             "call": call,
             "state": "prepared",
             "preview": preview,
             "digest": digest_value,
-            "expires": expires,
         }
         self.store.commit()
 

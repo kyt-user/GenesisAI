@@ -9,7 +9,7 @@ from genesisai.core.persistence.session import Session
 from genesisai.core.tools.tool_runtime import ToolRuntime
 from genesisai.core.extensions.rules import RulesLoader
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
-from genesisai.core.extensions.mcp import McpBridge, McpError, load_servers
+from genesisai.core.extensions.mcp import McpBridge, McpError, McpServerSpec
 
 
 def tool_call(name, args, call_id="c"):
@@ -38,19 +38,37 @@ def build_runtime(workspace):
 def test_use_skill_returns_instruction_body(tmp_path):
     runtime = build_runtime(tmp_path)
 
-    result = runtime.execute(tool_call("use_skill", {"name": "bug_fix"}, "skill"))
+    result = runtime.execute(tool_call("use_skill", {"name": "bug_fix", "stage": "run"}, "skill"))
 
     assert result["ok"]
     assert result["data"]["name"] == "bug_fix"
     assert result["data"]["content"].strip()
     assert "read_files" in result["data"]["tools"]
     assert runtime.registry.get("use_skill").category == "kernel"
+    assert runtime.store.record.tool_runtime["active_skills"] == {"bug_fix": "run"}
+    removed = runtime.execute(tool_call("use_skill", {"name": "bug_fix", "stage": "run", "operation": "unload"}, "unload"))
+    assert removed["ok"] and not runtime.store.record.tool_runtime["active_skills"]
+
+
+def test_more_than_two_skills_survive_persistence_and_context(tmp_path):
+    from dataclasses import replace
+    runtime = build_runtime(tmp_path)
+    template = runtime.skills.items["bug_fix"]
+    names = ["workflow_" + str(index) for index in range(6)]
+    for name in names:
+        runtime.skills.items[name] = replace(template, name=name)
+    runtime.store.record.tool_runtime["active_skills"] = {name: "run" for name in names}
+    runtime.store.commit()
+    restored = Session(runtime.store.root, runtime.store.id)
+    assert restored.record.tool_runtime["active_skills"] == {name: "run" for name in names}
+    from genesisai.core.prompt.context_sources import skills_context
+    assert [block.source for block in skills_context({"runtime": runtime, "session": restored})] == ["skill:" + name for name in names]
 
 
 def test_use_skill_unknown_is_rejected(tmp_path):
     runtime = build_runtime(tmp_path)
 
-    result = runtime.execute(tool_call("use_skill", {"name": "not_a_skill"}, "missing"))
+    result = runtime.execute(tool_call("use_skill", {"name": "not_a_skill", "stage": "run"}, "missing"))
 
     assert not result["ok"]
     assert result["error"]["code"] == "unknown_skill"
@@ -93,6 +111,21 @@ def test_rules_absent_is_noop(tmp_path):
     assert RulesLoader(workspace, home=tmp_path / "none").inject() is None
 
 
+def test_long_rules_are_complete_and_directory_rules_are_scoped(tmp_path):
+    nested = tmp_path / "src" / "module"
+    nested.mkdir(parents=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    (tmp_path / "AGENTS.md").write_text("root" + "x" * 9000 + "TAIL", encoding="utf-8")
+    (tmp_path / "src" / "AGENTS.md").write_text("source rules", encoding="utf-8")
+    (nested / "AGENTS.md").write_text("module rules", encoding="utf-8")
+    (other / "AGENTS.md").write_text("not in scope", encoding="utf-8")
+    blocks = RulesLoader(tmp_path, home=tmp_path / "none").load([nested / "new.py"])
+    assert len(blocks) == 3 and blocks[0]["text"].endswith("TAIL")
+    assert blocks[-1]["text"] == "module rules"
+    assert "not in scope" not in str(blocks)
+
+
 # --- Workflows 缝 ----------------------------------------------------------
 
 
@@ -118,6 +151,13 @@ def test_workflows_missing_directory_is_empty(tmp_path):
     assert registry.diagnostics == []
 
 
+def test_long_workflow_has_no_silent_tail_truncation(tmp_path):
+    (tmp_path / "workflows").mkdir()
+    text = "x" * 15000 + "FINAL ACCEPTANCE"
+    (tmp_path / "workflows" / "release.md").write_text(text, encoding="utf-8")
+    assert WorkflowRegistry(tmp_path).expand("release") == text
+
+
 # --- MCP 缝 ----------------------------------------------------------------
 
 
@@ -133,8 +173,8 @@ class FakeTransport:
         self.calls.append((method, params))
         if self.fail:
             raise McpError("boom")
-        if method == "initialize":
-            return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}}
+        if method == "server/discover":
+            return {"supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}}}
         if method == "tools/list":
             return {
                 "tools": [
@@ -160,31 +200,27 @@ class FakeTransport:
         pass
 
 
-def write_mcp_config(workspace, *, read_only=True):
-    (workspace / ".genesis").mkdir(exist_ok=True)
-    (workspace / "mcp.json").write_text(
-        json.dumps({"servers": {"fixture": {"command": "noop", "read_only": read_only}}}),
-        encoding="utf-8",
-    )
+def fixture_servers(*, read_only=True):
+    return [McpServerSpec("fixture", "stdio", "noop", read_only=read_only)]
 
 
 def test_mcp_registers_and_executes_through_pipeline(tmp_path):
     runtime = build_runtime(tmp_path)
-    write_mcp_config(tmp_path)
-    transports = []
+    marker = tmp_path / 'transports.txt'
 
     def factory(spec):
         transport = FakeTransport(spec)
-        transports.append(transport)
+        with marker.open('a', encoding='utf-8') as stream:
+            stream.write(spec.name + '\n')
         return transport
 
     bridge = McpBridge(tmp_path, runtime.registry, runtime.loader, transport_factory=factory)
-    bridge.configure({})
+    bridge.configure({}, servers=fixture_servers())
     runtime.set_permission("user")
     connect = tool_call("connect_mcp", {"server": "fixture"}, "connect")
-    assert runtime.execute(connect)["pending"] and not transports
+    assert runtime.execute(connect)["pending"] and not marker.exists()
     assert runtime.execute(connect, approved=runtime.store.record.calls['connect']['digest'])['ok']
-    assert len(transports) == 1
+    assert not bridge.transports
 
     assert "mcp_fixture_echo" not in {item["function"]["name"] for item in runtime.definitions()}
     runtime.discover_tools("mcp_fixture_echo", 1)
@@ -203,9 +239,9 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
     pending = tool_call("mcp_fixture_echo", {"text": "again"}, "mcp2")
     assert runtime.execute(pending)["pending"]
     bridge.close()
-    assert len(transports) == 1
+    assert not bridge.transports
     assert runtime.execute(pending, approved=runtime.store.record.calls['mcp2']['digest'])['ok']
-    assert len(transports) == 2
+    assert len(marker.read_text(encoding='utf-8').splitlines()) == 3  # Discovery and each call use independent hosts.
 
     # refresh（每次下发都会触发）必须保留动态注册。
     runtime.catalog.refresh()
@@ -214,12 +250,11 @@ def test_mcp_registers_and_executes_through_pipeline(tmp_path):
 
 def test_mcp_write_server_maps_permission(tmp_path):
     runtime = build_runtime(tmp_path)
-    write_mcp_config(tmp_path, read_only=False)
 
     bridge = McpBridge(
         tmp_path, runtime.registry, runtime.loader, transport_factory=lambda spec: FakeTransport(spec)
     )
-    bridge.configure({})
+    bridge.configure({}, servers=fixture_servers(read_only=False))
     bridge.ensure_connected("fixture")
 
     descriptor = runtime.registry.get("mcp_fixture_echo")
@@ -227,25 +262,24 @@ def test_mcp_write_server_maps_permission(tmp_path):
     assert descriptor.spec.side_effect is True
 
 
-def test_mcp_invalid_config_is_reported(tmp_path):
+def test_mcp_definitions_are_explicit_and_invalid_specs_are_rejected(tmp_path):
     runtime = build_runtime(tmp_path)
     (tmp_path / ".genesis").mkdir(exist_ok=True)
     (tmp_path / "mcp.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(McpError):
-        load_servers(tmp_path)
     bridge = McpBridge(
         tmp_path, runtime.registry, runtime.loader, transport_factory=lambda spec: FakeTransport(spec)
     )
-    bridge.configure({})
+    bridge.configure({}, servers=[])
     assert bridge.servers == []
-    assert bridge.diagnostics
+    assert "connect_mcp" not in runtime.registry
+    with pytest.raises(McpError):
+        bridge.configure({}, servers=[{}])
 
 
 def test_mcp_read_only_requires_json_boolean(tmp_path):
-    write_mcp_config(tmp_path, read_only="false")
     with pytest.raises(McpError, match="read_only"):
-        load_servers(tmp_path)
+        fixture_servers(read_only="false")
 
 
 def test_mcp_subprocess_gets_only_explicit_secret_env(monkeypatch):
@@ -255,18 +289,18 @@ def test_mcp_subprocess_gets_only_explicit_secret_env(monkeypatch):
     monkeypatch.setenv("PARENT_API_KEY", "parent")
     command = (
         "import json,os; input(); "
-        "print(json.dumps({'id':1,'result':[os.getenv('PARENT_API_KEY'),os.getenv('MCP_TOKEN')]}))"
+        "print(json.dumps({'jsonrpc':'2.0','id':1,'result':{'resultType':'complete','values':[os.getenv('PARENT_API_KEY'),os.getenv('MCP_TOKEN')]}}))"
     )
-    spec = McpServerSpec("fixture", sys.executable, ("-c", command), {"MCP_TOKEN": "explicit"})
+    spec = McpServerSpec("fixture", "stdio", sys.executable, ("-c", command), {"MCP_TOKEN": "explicit"})
     transport = StdioTransport(spec)
     try:
-        assert transport.request("probe", {}) == [None, "explicit"]
+        assert transport.request("probe", {})["values"] == [None, "explicit"]
     finally:
         transport.close()
 
 
 @pytest.mark.parametrize("invalid_tool", [
-    {"name": "ECHO", "inputSchema": {"type": "object"}},
+    {"name": "echo", "inputSchema": {"type": "object"}},
     {"name": "broken", "inputSchema": {"type": "object", "properties": []}},
 ])
 def test_mcp_catalog_validation_precedes_registration(tmp_path, invalid_tool):
@@ -278,10 +312,9 @@ def test_mcp_catalog_validation_precedes_registration(tmp_path, invalid_tool):
             return result
 
     runtime = build_runtime(tmp_path)
-    write_mcp_config(tmp_path)
     bridge = McpBridge(tmp_path, runtime.registry, runtime.loader, transport_factory=BrokenCatalog)
     cache = {}
-    bridge.configure(cache)
+    bridge.configure(cache, servers=fixture_servers())
     with pytest.raises(McpError):
         bridge.ensure_connected("fixture")
     assert not cache and not bridge.transports
@@ -291,7 +324,6 @@ def test_mcp_catalog_validation_precedes_registration(tmp_path, invalid_tool):
 
 def test_mcp_connection_failure_is_isolated(tmp_path):
     runtime = build_runtime(tmp_path)
-    write_mcp_config(tmp_path)
 
     bridge = McpBridge(
         tmp_path,
@@ -299,7 +331,7 @@ def test_mcp_connection_failure_is_isolated(tmp_path):
         runtime.loader,
         transport_factory=lambda spec: FakeTransport(spec, fail=True),
     )
-    bridge.configure({})
+    bridge.configure({}, servers=fixture_servers())
     with pytest.raises(McpError):
         bridge.ensure_connected("fixture")
 

@@ -9,7 +9,6 @@ from genesisai.model.openai_compatible import OpenAICompatibleClient
 class QwenClient(OpenAICompatibleClient):
     provider = "qwen"
     DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    DEFAULT_TIMEOUT = 60
     DEFAULT_THINKING = None
     DEFAULT_REASONING_EFFORT = None
     API_KEY_ENV = "DASHSCOPE_API_KEY"
@@ -22,8 +21,7 @@ class QwenClient(OpenAICompatibleClient):
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
-        max_retries: int = 0,
+        request_timeouts: dict | None = None,
     ):
         resolved_key = resolve_api_key(self.provider, api_key)
         if not resolved_key:
@@ -37,8 +35,7 @@ class QwenClient(OpenAICompatibleClient):
             model=model,
             base_url=resolved_url,
             api_key=resolved_key,
-            timeout=timeout,
-            max_retries=max_retries,
+            request_timeouts=request_timeouts,
             generation=generation,
         )
 

@@ -30,10 +30,14 @@ def ooxml_features(path):
     """列出有限编辑可能无法无损保留的 OOXML 特性。"""
     with zipfile.ZipFile(path) as archive:
         names = [name.casefold() for name in archive.namelist()]
+        import xml.etree.ElementTree as ET
+        external = any(link.get('TargetMode') == 'External'
+                       for name in archive.namelist() if name.endswith('.rels')
+                       for link in ET.fromstring(archive.read(name)))
     features = []
     if any(name.endswith("vbaproject.bin") for name in names):
         features.append("macros")
-    if any("externallinks/" in name or "externalLink".casefold() in name for name in names):
+    if external or any("externallinks/" in name or "externalLink".casefold() in name for name in names):
         features.append("external_links")
     if any("embeddings/" in name or "oleobject" in name for name in names):
         features.append("embedded_objects")
@@ -56,136 +60,213 @@ def artifact(context, path, kind, *, limitations=None):
     return {"path": str(path), "artifact_refs": [ref], "format": kind, "sha256": sha(path), "verified": True, "verification": "structural_reopen", "rendering": "not_available", "limitations": limitations or []}
 
 
-def docx_read(context, value):
-    path, ref = source(context, value, "docx")
-    Document = require("docx").Document
-    document = Document(path)
-    return {"source_ref": ref, "paragraphs": [{"style": p.style.name if p.style else None, "text": p.text} for p in document.paragraphs[:2000]], "tables": [[[cell.text for cell in row.cells] for row in table.rows[:200]] for table in document.tables[:50]], "headers": [p.text for section in document.sections for p in section.header.paragraphs], "footers": [p.text for section in document.sections for p in section.footer.paragraphs], "complex_features": ooxml_features(path)}
+def read_document(context, args, kind):
+    from genesisai.core.extensions.tools.office.readers import units, page
+    path, ref = source(context, args['path'], kind)
+    digest = sha(path)
+    if args.get('expected_sha256') is not None and args['expected_sha256'] != digest:
+        raise ToolError('document_changed', '文档已变化，请重新开始分页')
+    result = page(units(path, kind, **{k: args[k] for k in ('section', 'sheet', 'range', 'view') if k in args}),
+                  **{k: args[k] for k in ('offset', 'text_offset', 'limit', 'max_chars') if k in args})
+    if sha(path) != digest:
+        raise ToolError('document_changed', '读取期间文档已变化')
+    if result['next']:
+        result['next'] = {**args, **result['next'], 'expected_sha256': digest}
+    result.update(source_ref=ref, sha256=digest, format=kind, rendering='not_available',
+                  ocr='not_available', formulas_not_recalculated=kind == 'xlsx')
+    if kind != 'pdf': result['complex_features'] = ooxml_features(path)
+    result['coverage']['scope'] = {'docx': args.get('section', 'body'), 'xlsx': args.get('sheet', 'sheet_catalog'),
+                                  'pptx': 'slide_text_and_notes', 'pdf': 'extractable_page_text'}[kind]
+    return result
+
+
+def docx_read(context, args):
+    return read_document(context, args, 'docx')
+
+
+def write_target(context, args, kind):
+    target = context.access.write(args['path'], overwrite=args.get('overwrite', False))
+    if target.suffix.casefold() != '.' + kind:
+        raise ToolError('format_mismatch', '输出扩展名必须是 .' + kind)
+    before = sha(target) if target.exists() else None
+    if args.get('overwrite') and (before is None or args.get('expected_sha256') != before):
+        raise ToolError('patch_conflict', '覆盖需要存在的目标及正确的 expected_sha256')
+    if not args.get('overwrite') and args.get('expected_sha256') is not None:
+        raise ToolError('validation_error', 'expected_sha256 只能用于显式覆盖')
+    return target, before
+
+
+def preview_write(context, args, kind):
+    target, before = write_target(context, args, kind)
+    result = {'target': str(target), 'before_sha256': before, 'overwrite': args.get('overwrite', False)}
+    if args.get('source'):
+        source_path = context.access.read(args['source'])
+        result.update(source=str(source_path), source_sha256=sha(source_path))
+    return result
+
+
+def save_document(context, args, kind, writer, *, limitations=()):
+    import os
+    from tempfile import NamedTemporaryFile
+    from genesisai.shared.changes import backup_file, record_change
+    target, before = write_target(context, args, kind)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with NamedTemporaryFile(dir=target.parent, suffix='.' + kind, prefix='.genesis-office-', delete=False) as stream:
+        temporary = Path(stream.name)
+    try:
+        writer(temporary)
+        if detect_file_type(temporary) != kind:
+            raise ToolError('artifact_invalid', '临时产物格式验证失败')
+        # Reopen the actual generated package before publishing any bytes.
+        if kind == 'docx': require('docx').Document(temporary)
+        elif kind == 'xlsx': require('openpyxl').load_workbook(temporary, read_only=True).close()
+        elif kind == 'pptx': require('pptx').Presentation(temporary)
+        else: require('pypdf', 'pdf').PdfReader(temporary)
+        if (sha(target) if target.exists() else None) != before:
+            raise ToolError('patch_conflict', '写入期间目标已变化，未覆盖')
+        backup = backup_file(context.store, target) if before is not None else None
+        if before is None:
+            # Windows rename fails if a target appeared; POSIX link likewise
+            # publishes atomically without overwriting a concurrent creation.
+            if os.name == 'nt': os.rename(temporary, target)
+            else: os.link(temporary, target)
+        else:
+            os.replace(temporary, target)
+        change = record_change(context.store, operation='office_write', path=target, before_sha=before,
+                               after_sha=sha(target), backup=backup)
+        result = artifact(context, target, kind, limitations=list(limitations))
+        result.update(change_id=change['id'], before_sha256=before)
+        return result
+    finally:
+        temporary.unlink(missing_ok=True)  # Only this operation's generated temporary file.
 
 
 def docx_create(context, args):
-    Document = require("docx").Document
-    target = context.access.write(args["path"])
-    if target.suffix.casefold() != ".docx": raise ToolError("format_mismatch", "输出扩展名必须是 .docx")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    document = Document()
-    if args.get("title"): document.add_heading(args["title"], level=0)
-    for value in args.get("paragraphs", []): document.add_paragraph(value)
-    rows = args.get("table") or []
+    Document = require('docx').Document
+    if args.get('source'):
+        source_path, ref = source(context, args['source'], 'docx')
+        reject_complex_edit(source_path)
+        document = Document(source_path)
+    else:
+        document = Document()
+    if args.get('title'): document.add_heading(args['title'], level=0)
+    for value in args.get('paragraphs', []): document.add_paragraph(value)
+    rows = args.get('table') or []
     if rows:
         width = max(len(row) for row in rows)
         table = document.add_table(rows=len(rows), cols=width)
         for r, row in enumerate(rows):
             for c, value in enumerate(row): table.cell(r, c).text = str(value)
-    document.save(target)
-    return artifact(context, target, "docx")
+    return save_document(context, args, 'docx', document.save)
 
 
 def docx_edit(context, args):
     source_path, ref = source(context, args["source"], "docx")
     reject_complex_edit(source_path)
     Document = require("docx").Document
-    target = context.access.write(args["path"])
-    if target.suffix.casefold() != ".docx": raise ToolError("format_mismatch", "输出扩展名必须是 .docx")
     document = Document(source_path)
     replaced = 0
-    for paragraph in document.paragraphs:
+    def paragraphs(container):
+        yield from container.paragraphs
+        for table in container.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    yield from paragraphs(cell)
+    seen = set()
+    containers = [document, *(s.header for s in document.sections), *(s.footer for s in document.sections)]
+    for paragraph in (p for container in containers for p in paragraphs(container)):
+        if paragraph._p in seen: continue
+        seen.add(paragraph._p)
         if args["find"] in paragraph.text:
             paragraph.text = paragraph.text.replace(args["find"], args["replace"])
             replaced += 1
     if not replaced: raise ToolError("not_found", "DOCX 中没有找到目标文字")
-    target.parent.mkdir(parents=True, exist_ok=True); document.save(target)
-    result = artifact(context, target, "docx", limitations=["目标段落内的复杂 run 样式可能被归一化"])
+    result = save_document(context, args, "docx", document.save, limitations=["目标段落内的复杂 run 样式可能被归一化"])
     result.update(source_ref=ref, replacements=replaced); return result
 
 
-def xlsx_read(context, value):
-    path, ref = source(context, value, "xlsx")
-    load_workbook = require("openpyxl").load_workbook
-    book = load_workbook(path, data_only=False, read_only=False)
-    try:
-        sheets = {}
-        for sheet in list(book)[:20]:
-            values = [[cell.value for cell in row] for row in sheet.iter_rows(max_row=min(sheet.max_row or 1, 1000), max_col=min(sheet.max_column or 1, 50))]
-            formulas = [cell.coordinate for row in sheet.iter_rows() for cell in row if isinstance(cell.value, str) and cell.value.startswith("=")]
-            styled = [cell.coordinate for row in sheet.iter_rows() for cell in row if cell.has_style]
-            sheets[sheet.title] = {"values": values, "max_row": sheet.max_row, "max_column": sheet.max_column, "merged": [str(rng) for rng in sheet.merged_cells.ranges], "formula_cells": formulas[:2000], "styled_cells": styled[:2000]}
-        return {"source_ref": ref, "sheets": sheets, "formulas_not_recalculated": True, "complex_features": ooxml_features(path)}
-    finally: book.close()
+def xlsx_read(context, args):
+    return read_document(context, args, 'xlsx')
 
 
 def xlsx_create(context, args):
     openpyxl = require("openpyxl")
-    target = context.access.write(args["path"])
-    if target.suffix.casefold() != ".xlsx": raise ToolError("format_mismatch", "输出扩展名必须是 .xlsx")
     book = openpyxl.Workbook(); book.remove(book.active)
+    if not args['sheets'] or len({name.casefold() for name in args['sheets']}) != len(args['sheets']):
+        raise ToolError('validation_error', '工作表名称不能为空或重复')
     for name, rows in args["sheets"].items():
-        sheet = book.create_sheet(str(name)[:31])
+        if not name or len(name) > 31: raise ToolError('validation_error', '工作表名称长度必须为1至31字符')
+        sheet = book.create_sheet(name)
         for row in rows: sheet.append(row)
-    target.parent.mkdir(parents=True, exist_ok=True); book.save(target); book.close()
-    return artifact(context, target, "xlsx", limitations=["公式已写入但未由 Excel 重新计算"])
+    try: return save_document(context, args, "xlsx", book.save, limitations=["公式已写入但未由 Excel 重新计算"])
+    finally: book.close()
 
 
 def xlsx_edit(context, args):
     source_path, ref = source(context, args["source"], "xlsx")
     reject_complex_edit(source_path)
     openpyxl = require("openpyxl")
-    target = context.access.write(args["path"])
     book = openpyxl.load_workbook(source_path)
     for address, value in args["cells"].items():
         if "!" not in address: raise ToolError("validation_error", "单元格键必须是 Sheet!A1")
         sheet, cell = address.split("!", 1)
         if sheet not in book.sheetnames: raise ToolError("not_found", f"工作表不存在：{sheet}")
         book[sheet][cell] = value
-    target.parent.mkdir(parents=True, exist_ok=True); book.save(target); book.close()
-    result = artifact(context, target, "xlsx", limitations=["公式已写入但未由 Excel 重新计算"]); result["source_ref"] = ref; return result
+    try:
+        result = save_document(context, args, "xlsx", book.save, limitations=["公式已写入但未由 Excel 重新计算"])
+        result["source_ref"] = ref
+        return result
+    finally: book.close()
 
 
-def pptx_read(context, value):
-    path, ref = source(context, value, "pptx")
-    Presentation = require("pptx").Presentation
-    deck = Presentation(path); slides = []
-    for index, slide in enumerate(deck.slides):
-        if index >= 200:
-            break
-        texts = [shape.text for shape in slide.shapes if hasattr(shape, "text") and shape.text]
-        notes = slide.notes_slide.notes_text_frame.text if slide.has_notes_slide else ""
-        slides.append({"number": index + 1, "texts": texts, "notes": notes, "objects": len(slide.shapes)})
-    return {"source_ref": ref, "slides": slides, "complex_features": ooxml_features(path)}
+def pptx_read(context, args):
+    return read_document(context, args, 'pptx')
 
 
 def pptx_create(context, args):
-    Presentation = require("pptx").Presentation
-    target = context.access.write(args["path"])
-    if target.suffix.casefold() != ".pptx": raise ToolError("format_mismatch", "输出扩展名必须是 .pptx")
-    deck = Presentation()
-    for item in args["slides"]:
+    Presentation = require('pptx').Presentation
+    if args.get('source'):
+        source_path, ref = source(context, args['source'], 'pptx')
+        reject_complex_edit(source_path)
+        deck = Presentation(source_path)
+    else:
+        deck = Presentation()
+    for item in args['slides']:
         slide = deck.slides.add_slide(deck.slide_layouts[1])
-        slide.shapes.title.text = item["title"]
-        slide.placeholders[1].text = "\n".join(item.get("bullets", []))
-    target.parent.mkdir(parents=True, exist_ok=True); deck.save(target)
-    return artifact(context, target, "pptx", limitations=["仅支持基础标题与项目符号版式"])
+        slide.shapes.title.text = item['title']
+        slide.placeholders[1].text = '\n'.join(item.get('bullets', []))
+    return save_document(context, args, 'pptx', deck.save, limitations=['仅支持基础标题与项目符号版式'])
 
 
-def pdf_read(context, value):
-    path, ref = source(context, value, "pdf")
-    PdfReader = require("pypdf", "pdf").PdfReader
-    reader = PdfReader(path)
-    if reader.is_encrypted: raise ToolError("encrypted", "PDF 已加密")
-    pages = [page.extract_text() or "" for page in reader.pages[:200]]
-    if not any(text.strip() for text in pages): raise ToolError("no_text", "PDF 可能是扫描件；V1 未启用 OCR")
-    return {"source_ref": ref, "page_count": len(reader.pages), "metadata": {str(k): str(v) for k, v in (reader.metadata or {}).items()}, "pages": pages}
+def pdf_read(context, args):
+    return read_document(context, args, 'pdf')
 
 
 def pdf_create(context, args):
-    canvas = require("reportlab.pdfgen.canvas", "pdf")
-    pagesizes = require("reportlab.lib.pagesizes", "pdf")
-    target = context.access.write(args["path"])
-    if target.suffix.casefold() != ".pdf": raise ToolError("format_mismatch", "输出扩展名必须是 .pdf")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    writer = canvas.Canvas(str(target), pagesize=pagesizes.A4); width, height = pagesizes.A4; y = height - 50
-    for line in args["lines"]:
-        if y < 50: writer.showPage(); y = height - 50
-        writer.drawString(50, y, str(line)[:120]); y -= 18
-    writer.save(); return artifact(context, target, "pdf", limitations=["基础文本 PDF；不支持任意原 PDF 编辑"])
-
+    canvas = require('reportlab.pdfgen.canvas', 'pdf')
+    pagesizes = require('reportlab.lib.pagesizes', 'pdf')
+    pdfmetrics = require('reportlab.pdfbase.pdfmetrics', 'pdf')
+    cidfonts = require('reportlab.pdfbase.cidfonts', 'pdf')
+    font = 'STSong-Light'
+    pdfmetrics.registerFont(cidfonts.UnicodeCIDFont(font))
+    def write(path):
+        writer = canvas.Canvas(str(path), pagesize=pagesizes.A4)
+        width, height = pagesizes.A4
+        y = height - 50
+        writer.setFont(font, 12)
+        for value in args['lines']:
+            for line in str(value).split('\n'):
+                remaining = line
+                while remaining or line == '':
+                    low, high = 1, len(remaining)
+                    while low < high:
+                        mid = (low + high + 1) // 2
+                        if pdfmetrics.stringWidth(remaining[:mid], font, 12) <= width - 100: low = mid
+                        else: high = mid - 1
+                    if y < 50:
+                        writer.showPage(); y = height - 50; writer.setFont(font, 12)
+                    writer.drawString(50, y, remaining[:low]); y -= 18
+                    remaining = remaining[low:]
+                    if not remaining: break
+        writer.save()
+    return save_document(context, args, 'pdf', write, limitations=['基础文字PDF；自动换行分页，无版式保真承诺'])

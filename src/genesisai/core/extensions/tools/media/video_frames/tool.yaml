@@ -1,0 +1,4 @@
+name: video_frames
+enabled: true
+category: media
+description: 用本地 ffmpeg 按时间抽取视频帧到新 PNG 文件；每批最多16张，沿 next_seconds 继续，生成后可用 read_image 查看；不代表已看完整视频

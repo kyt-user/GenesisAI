@@ -43,6 +43,8 @@ class ProviderSettings:
     base_url: str = ""
     generation: dict = field(default_factory=dict)
     context: dict = field(default_factory=dict)
+    retry: dict = field(default_factory=dict)
+    request_timeouts: dict = field(default_factory=dict)
 
     def masked_key(self) -> str:
         """返回可展示的掩码密钥。"""
@@ -74,6 +76,8 @@ def load_settings(directory=None) -> ProviderSettings | None:
         base_url=str(data.get("base_url") or "").strip(),
         generation=dict(generation) if isinstance(generation, dict) else {},
         context=data.get('context', {}),
+        retry=data.get('retry', {}),
+        request_timeouts=data.get('request_timeouts', {}),
     )
 
 
@@ -89,6 +93,8 @@ def save_settings(settings: ProviderSettings, directory=None) -> Path:
         "base_url": settings.base_url,
         "generation": dict(settings.generation),
         "context": dict(settings.context),
+        "retry": dict(settings.retry),
+        "request_timeouts": dict(settings.request_timeouts),
     }
     temp = path.with_suffix(".tmp")
     with temp.open("w", encoding="utf-8") as stream:

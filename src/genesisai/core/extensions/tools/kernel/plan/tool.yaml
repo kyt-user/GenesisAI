@@ -1,4 +1,4 @@
 name: plan
 enabled: true
 category: kernel
-description: 写入 应用任务记录 实施计划：步骤、验收标准与非目标
+description: 分页读取任务目标、约束和交接；按版本增量更新阶段、步骤与验收项，完成项绑定实际工具调用证据

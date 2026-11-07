@@ -10,9 +10,9 @@ from genesisai.shared.security import ToolError
 
 
 def validate_command(command):
-    if not isinstance(command, list) or not 1 <= len(command) <= 64:
-        raise ToolError("validation_error", "command 必须是非空字符串数组且不超过 64 项")
-    if any(not isinstance(arg, str) or not arg or len(arg) > 4000 or "\0" in arg for arg in command):
+    if not isinstance(command, list) or not command:
+        raise ToolError("validation_error", "command 必须是非空字符串数组")
+    if any(not isinstance(arg, str) or "\0" in arg for arg in command) or not command[0]:
         raise ToolError("validation_error", "command 中每项必须是非空参数字符串")
     return command
 
@@ -53,9 +53,9 @@ def resolve_command(command, cwd):
     return resolved
 
 
-def process_invocation(command, cwd):
+def process_invocation(command, cwd, *, env_from=None):
     resolved = resolve_command(command, cwd)
-    env = safe_environment()
+    env = safe_environment(env_from)
     if os.name != "nt" or Path(resolved[0]).suffix.lower() not in {".bat", ".cmd"}:
         return resolved, env
     # cmd expands percent variables once. Keeping each value inside quotes and

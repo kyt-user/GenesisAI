@@ -127,7 +127,10 @@ def test_application_task_plan_resumes_without_project_files(tmp_path):
     session=Session(tmp_path/'app',workspace=workspace)
     manager=TaskService(session)
     task=manager.begin_task('实现项目',run_id='run_one')
-    manager.set_plan(steps=['实现功能'],acceptance=['测试通过'])
+    manager.update_plan(expected_revision=0, upsert=[
+        {'id': 'implement', 'kind': 'step', 'text': '实现功能'},
+        {'id': 'tests', 'kind': 'acceptance', 'text': '测试通过', 'requires_verification': True},
+    ])
     restarted=TaskService(Session(session.root,session.id))
     resumed=restarted.begin_task('继续',run_id='run_two')
     assert resumed['id']==task['id'] and resumed['plan_ready']

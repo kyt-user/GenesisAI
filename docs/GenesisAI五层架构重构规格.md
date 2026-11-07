@@ -190,8 +190,8 @@ Cline 的内核只有 9 个工具，其余能力由 **4 条外部扩展路径**�
 ### 4.1 Skills 缝（可执行）
 
 - **现状**：`skills/registry.py` 只做 `skill.yaml`+Markdown 的**只读加载**，`skill_load` 把正文塞进上下文，不提供能力。
-- **目标**：一个内核工具 `use_skill(name)`，一次调用返回该 Skill 的**指令正文**作为工具结果（Cline `skills` 工具同构），模型据指令推进任务。
-- **契约**：`skill.yaml` 四字段保持 `{name, description, entry, tools}`；`entry` 为 Markdown。
+- **目标**：一个内核工具 `use_skill(name, stage)`，一次调用返回该 Skill 的**指令正文**作为工具结果（Cline `skills` 工具同构），模型据指令推进任务。
+- **当前契约**：内置 `skill.yaml` 四字段为 `{name, description, entry, stages}`；外挂采用统一 JSON 能力包，经实际测试和用户验收注册后才由 `use_skill` 加载；`entry` 为 Markdown。同名能力不隐式覆盖。
 - **删除**：`skill_search / skill_describe / skill_load` 三个元工具。
 
 ### 4.2 Rules 缝（系统提示自动注入）
@@ -203,7 +203,7 @@ Cline 的内核只有 9 个工具，其余能力由 **4 条外部扩展路径**�
 ### 4.3 MCP 缝（动态工具桥接）
 
 - **现状**：缺失。
-- **目标**：`core/extensions/mcp/` 启动时读取 `.genesis/mcp.json`，连接 MCP server，把其工具以 `category="mcp"` **动态注册**进同一 `ToolRegistry`。
+- **当前实现**：`core/capabilities/` 管理 MCP 草稿、测试及用户验收，把通过验收的服务定义交给 `core/extensions/mcp/`；按需连接后以 `category="mcp"` 动态注册进同一 `ToolRegistry`。不再读取旧 `mcp.json`。
 - **契约**：MCP 工具与内置工具走**同一条** executor/permissions/ledger 管线；只读/写/网络权限按 MCP 注解映射。
 - **注意**：注册表需支持"动态（非 `tool.yaml`）来源"，与现 `_scan()` 的静态目录扫描并存。
 

@@ -218,7 +218,7 @@ model: deepseek-v4-flash
 
 generation:
   temperature: 0.6
-  max_tokens: 2048
+  max_tokens: 8192
 ```
 
 推荐配置优先级：
@@ -313,7 +313,7 @@ def definitions(self) -> list[dict]:
 
 - `editor` 通过 `operation` 参数分派 `create/patch/move/delete/copy/mkdir`；单次调用只声明统一权限，具体操作在 prepare 阶段给出预览。
 - `memory` 通过 `operation` 分派 `search/read/write/forget/validate/plan`。
-- `run_commands` 通过 `operation` 分派 `run/inspect`，并承载 git 等命令式读取。
+- `run_commands` 执行命令，并承载 git 等命令式读取；`inspect_project` 独立异步探测项目。
 - 每个内核工具只声明单一 permission（`core/read/write/network/shell`）；网络工具 `network=True`，写/命令类工具 `side_effect=True`。
 
 ### 8.4 保留为工具包的领域能力
@@ -324,14 +324,14 @@ def definitions(self) -> list[dict]:
 
 内核之外的领域能力由四条扩展缝挂载，其工具汇入同一 `ToolRegistry`，并走同一条 executor/permissions/ledger 管线：
 
-- **Skills（可执行）**：`core/extensions/skills/`，内核工具 `use_skill(name)` 一次返回指令正文；
+- **Skills（可执行）**：`core/extensions/skills/`，内核工具 `use_skill(name, stage)` 一次返回指令正文；
 - **Rules（系统提示注入）**：`core/extensions/rules/`，组装期读取 `AGENTS.md`（项目级 + 用户级），免工具调用注入；
-- **MCP（动态桥接）**：`core/extensions/mcp/`，读取 `.genesis/mcp.json`，动态注册 `category="mcp"` 工具；
+- **MCP（动态桥接）**：`core/capabilities/` 管理草稿、测试与用户验收，`core/extensions/mcp/` 接受已注册定义，按需连接并动态注册 `category="mcp"` 工具；
 - **Workflows（斜杠工作流）**：`.genesis/workflows/*.md` + `/workflow <name>` 展开。
 
 ### 8.6 权限与安全不变
 
-全量下发只影响「哪些工具定义进入请求」，不影响调用授权。每一次具体调用仍必须通过权限检查；`executor` 保持 `unknown_execution` 防重放、台账与确认冻结。会话 `store["tool_runtime"]` 只保留 `active_skills`（上限 2），早期 `active_tools` 字段已从会话 Schema 移除。
+全量下发只影响「哪些工具定义进入请求」，不影响调用授权。每一次具体调用仍必须通过权限检查；`executor` 保持 `unknown_execution` 防重放、台账与确认冻结。会话 `store["tool_runtime"]` 只保留 `active_skills`（Skill 名称到阶段的映射，无数量上限），早期 `active_tools` 字段已从会话 Schema 移除。
 
 ## 9. Tools 能力规划
 
@@ -350,14 +350,14 @@ def definitions(self) -> list[dict]:
 
 > 原 `shell_run` / `test_run` / `python_project` 合并为内核工具 `run_commands`。
 
-- `run_commands`（`operation=run`）：执行受控命令，并结构化提取测试结果；
-- `run_commands`（`operation=inspect`）：只读环境探测（解释器、依赖、项目结构）。
+- `run_commands`：执行受控命令，并结构化提取测试结果；
+- `inspect_project`：只读环境与子包探测，完整结果分页（解释器、依赖、项目结构、声明的测试入口）。
 
-Shell 必须指定工作目录、超时和输出上限，默认限定在项目内。执行器应优先使用参数数组，避免不必要的命令字符串拼接。命令的退出码、标准输出、标准错误、耗时和截断状态必须真实记录。
+Shell 使用明确的工作目录，执行总时限可选且默认不限；完整输出分段持久化，配额可配置。执行器应优先使用参数数组，避免不必要的命令字符串拼接。命令的退出码、标准输出、标准错误、耗时和截断状态必须真实记录。
 
 `command` 始终表示一个程序的 argv：例如 `["flutter", "--version"]`，不能把多条命令放入数组，也不能把整条命令行写入第一项。Windows 的 `echo`、`dir` 等内置命令须显式使用 `["cmd.exe", "/d", "/c", "echo hello"]`。前台与后台共用入口解析，在工作目录和 PATH 中按 PATHEXT 查找程序，审批预览显示解析后的路径。`.bat/.cmd` 入口使用关闭 AutoRun 和延迟展开的 cmd，参数逐项引用；当前不接受批处理参数内嵌双引号或换行，遇到此类参数应改用原生可执行文件。批处理自行再次解析参数的行为由脚本负责。
 
-连续失败的收尾及下一轮诊断从调用账本获取事实，区分实现开始执行、入口解析失败和进程退出码，不能据 `command_not_found` 推断整个执行通道失效。输出长度恢复使用模型配置的输出预算，仅完整重写一次，最终仍统一核验来源；失效的文件引用最多允许一次受原权限约束的限定路径补读。跨轮较大的工具正文在请求投影中缩为预览和 `history_ref`，原始会话及可精确读取的历史内容保持完整。
+失败诊断从调用账本获取事实，区分实现开始执行、入口解析失败和进程退出码，不能据 `command_not_found` 推断整个执行通道失效。输出截断和引用补读按实际进展恢复，重复无进展时停止；补读继续受原权限约束，最终统一核验来源。最新完整工具批次保留在请求中，旧工具正文可投影为预览和 `history_ref`，原始会话及可精确读取的历史内容保持完整。
 
 ### 9.3 Git
 
@@ -366,7 +366,7 @@ Git 能力并入 `run_commands`（经 shell 权限运行 `git` 子命令），�
 - 只读查看：`git status` / `git diff` / `git log` / `git show` / `git branch`；
 - `git commit` 等写操作需要明确授权后才会执行。
 
-首批 Git 能力以只读查看为主。切换分支、重置、清理、推送和强制操作不进入默认自动执行范围。
+Git 写操作按用户任务授权及当前权限执行，不再由 coding 协议一律禁止。破坏性重置、清理和强制推送仍需匹配明确授权。
 
 ### 9.4 网络
 
@@ -455,29 +455,23 @@ Markdown 负责模型和用户可直接阅读的长期内容：
 ### 10.2 推荐目录
 
 ```text
-<project>/.genesis/
-├── config.yaml
-├── memory/
-│   ├── index.json
-│   ├── files.json
-│   ├── project.md
-│   ├── architecture.md
-│   ├── conventions.md
-│   ├── commands.md
-│   ├── decisions.md
-│   ├── problems.md
-│   └── tasks/
-└── skills/
-
 ~/.genesisai/
-├── config.yaml
-├── sessions/
+├── config.json
+├── state/genesis.sqlite3
+├── assets/images/
+├── projects/<project_id>/
+│   ├── lsp.json
+│   └── workflows/
+├── capabilities/
+│   ├── library.sqlite3
+│   ├── bundles/
+│   ├── tests/
+│   └── trials/
 ├── traces/
-├── skills/
-└── memory/
+└── logs/
 ```
 
-项目知识放在 `<project>/.genesis/memory/`，便于审查和按需跟随项目；会话全文、运行 Trace 和用户级偏好放在 `~/.genesisai/`，避免污染项目仓库。项目可以通过 `.gitignore` 决定哪些 `.genesis` 内容提交。
+当前实现将项目知识、会话全文和能力库统一保存在应用目录，项目身份负责隔离。外挂 Tool、Skill、MCP 均经过能力库的草稿、测试和用户验收流程，不扫描旧目录。数据契约以[记忆系统架构](记忆系统架构.md)为准。
 
 ### 10.3 写入规则
 
@@ -528,15 +522,15 @@ JSON 写入采用临时文件、刷新和原子替换；数据包含 `schema_ver
 
 Skill 描述一类任务的标准流程、约束、完成条件和推荐 Tools。它影响 Agent 如何执行任务，但不直接获得额外权限。
 
-### 11.2 目录和优先级
+### 11.2 来源与作用域
 
 ```text
-src/genesisai/skills/       # 内置
-~/.genesisai/skills/        # 用户级
-<project>/.genesis/skills/  # 项目级
+src/genesisai/core/extensions/skills/builtin/  # 内置
+~/.genesisai/capabilities/library.sqlite3      # 外挂草稿、修订、测试及验收
+~/.genesisai/capabilities/bundles/             # 已校验执行包
 ```
 
-同名 Skill 的优先级为：项目级高于用户级，用户级高于内置。覆盖关系必须在 CLI 中可查看，加载失败不能静默忽略。
+外挂包声明个人或项目作用域。不存在同名覆盖优先级；冲突显式拒绝，旧目录不自动加载或迁移。创建草稿后必须进行实际任务测试并经用户验收才能注册，详情见用户指南。
 
 ### 11.3 Skill 结构
 
@@ -549,7 +543,7 @@ skills/test-fix/
 └── scripts/
 ```
 
-`skill.yaml` 只声明目录检索和确定性加载需要的名称、简介、触发条件、推荐工具、可选工具、平台要求和入口文档，不设置版本字段。`SKILL.md` 描述执行步骤、停止条件、验证方法和输出要求；内容哈希用于检测目录与实例是否一致。
+上述结构用于内置 Skill；`skill.yaml` 严格采用 name、description、entry、stages 四个字段，不设置版本字段。外挂使用统一 JSON 能力包，definition 声明 entry/stages；每阶段含 depends_on、required_tools、optional_tools，files 保存按哈希寻址的资产引用，tests 声明任务输入与产物断言；草稿支持逐文件增量修订和目录快照，冻结后测试；能力库保存修订号和内容摘要。`SKILL.md` 描述执行步骤、停止条件、验证方法和输出要求。
 
 首批内置 Skills：
 

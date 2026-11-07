@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import copy_context
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -98,10 +99,11 @@ class HostObjects:
             except Exception as exc:  # noqa: BLE001 - propagate failures across the worker boundary
                 response.put((False, exc))
 
-        Thread(target=read, daemon=True).start()
+        Thread(target=copy_context().run, args=(read,), daemon=True).start()
         try:
+            deadline = tool_deadline.get()
             ok, value = response.get(
-                timeout=max(0, tool_deadline.get() - time.monotonic())
+                timeout=max(0, deadline - time.monotonic()) if deadline is not None else None
             )
         except Empty:
             raise ToolError("tool_timeout", "网络服务超过工具时限") from None
@@ -210,7 +212,7 @@ class ToolWorker:
         self.reader.start()
 
     def check_deadline(self):
-        if time.monotonic() >= self.deadline:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
             raise ToolError("tool_timeout", "工具执行超时，已终止本地执行进程")
 
     def _send(self, packet):
@@ -231,12 +233,12 @@ class ToolWorker:
                     raise ToolError(
                         "worker_cancelled", "已停止本地工具进程，可能已产生部分修改"
                     )
-            remaining = self.deadline - time.monotonic()
-            if remaining <= 0:
+            remaining = self.deadline - time.monotonic() if self.deadline is not None else None
+            if remaining is not None and remaining <= 0:
                 raise ToolError("tool_timeout", "工具执行超时，已终止本地执行进程")
             try:
                 kind, value = self.inbox.get(
-                    timeout=min(remaining, 0.1) if control else remaining
+                    timeout=min(remaining, 0.1) if control and remaining is not None else .1 if control else remaining
                 )
             except Empty:
                 continue
@@ -264,6 +266,7 @@ class ToolWorker:
 
 @contextmanager
 def tool_worker(context, implementation, observer, deadline):
+    from genesisai.core.tools.permissions import accepted_tool
     host = HostObjects()
     control = current_run.get()
     worker = None
@@ -302,6 +305,9 @@ def tool_worker(context, implementation, observer, deadline):
                     providers,
                     host.ref(control.cancelled) if control else None,
                     getattr(context.runtime.logger.journal, "_secrets", ()),
+                    context.call_id,
+                    context.authorization,
+                    accepted_tool.get(),
                 ),
             )
             yield worker

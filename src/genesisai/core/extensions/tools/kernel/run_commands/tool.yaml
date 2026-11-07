@@ -1,4 +1,4 @@
 name: run_commands
 enabled: true
 category: kernel
-description: 一次运行一个程序。command 是程序名和参数的数组，不能放多条命令整句。Windows 的 echo、dir 等内置命令须显式调用 cmd.exe。background=true 返回 job_id，可用 read_job 和 stop_job 管理。operation=inspect 检查 Python 项目结构。
+description: 一次运行一个程序。command 是程序名和参数数组，不能放多条命令整句。Windows 的 echo、dir 等内置命令须显式调用 cmd.exe。background=true 返回 job_id，用 read_job 和 stop_job 管理。未指定command时优先项目声明的唯一测试入口；inspect_project可异步查看项目和子包。

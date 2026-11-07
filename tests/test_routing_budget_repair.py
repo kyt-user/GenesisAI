@@ -33,26 +33,22 @@ def test_mixed_route_and_readonly_intent():
 
 def test_long_continuation_does_not_override_discussion():
     router = TaskProtocolSelector()
-    task = {'status': 'in_progress'}
+    task = {'status': 'in_progress', 'execution_requested': True, 'execution_context': {'protocols': ['coding']}}
     assert router.is_development_continuation('继续修复刚才列出的所有问题，并且每一项都要验证测试通过后再进入下一项', task)
     assert not router.is_development_continuation('继续讨论，暂时不要修改代码', task)
     assert not router.is_development_continuation('另一个任务：继续实现新项目', task)
 
 
-def test_local_fetch_budget_failure_is_local(tmp_path):
+def test_local_profile_does_not_restrict_web_research(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     state = ResearchController.empty_state('local_files')
     store.record.run_runtime = state
-    runtime.research.register_user_urls('https://example.org/repo')
-    call = {'id': 'fetch', 'name': 'fetch_web_content', 'arguments': json.dumps({'url': 'https://example.org/repo'})}
-    assert runtime.research.before_execute(call) is None
-    state['budget']['search_fetches'] = 0
-    result = runtime.execute(call)
-    assert result['error']['code'] == 'budget_exhausted'
-    assert '未分配' in result['error']['message']
-    assert not store.record.calls['fetch']['executed']
+    runtime.network.fetch = lambda url: {'url': url, 'title': 'Repository', 'text': 'Real fixture text', 'truncated': False}
+    for index in range(25):
+        call = {'id': f'fetch{index}', 'name': 'fetch_web_content', 'arguments': json.dumps({'url': f'https://example.org/repo/{index}'})}
+        assert runtime.execute(call)['ok']
     assert state['phase'] == 'explore' and state['stop_reason'] is None
-    assert state['usage']['search_fetches'] == 0
+    assert state['usage']['search_fetches'] == 25
 
 
 def test_explicit_model_limit_survives_route_change(tmp_path):
@@ -66,10 +62,12 @@ def test_explicit_model_limit_survives_route_change(tmp_path):
 
 def test_github_request_reaches_network_and_returns_evidence(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
+    marker = tmp_path / 'network-calls.txt'
     class Network:
         calls = 0
         def fetch(self, url):
-            self.calls += 1
+            with marker.open('a', encoding='utf-8') as stream:
+                stream.write(url + '\n')
             return {'url': url, 'title': 'Repository', 'text': 'Repository README', 'truncated': False}
     network = Network()
     runtime.network = network
@@ -79,7 +77,7 @@ def test_github_request_reaches_network_and_returns_evidence(tmp_path):
     model = FakeModel(Response(tool_calls=[ToolCall('fetch', 'fetch_web_content', json.dumps({'url': 'https://example.org/git/repo'}))], finish_reason='tool_calls'), answer)
     result = Runner(model, runtime).start('看看这个仓库 https://example.org/git/repo')
     assert result['status'] == 'completed'
-    assert network.calls == 1
+    assert marker.read_text(encoding='utf-8').splitlines() == ['https://example.org/git/repo']
     assert 'fetch_web_content' in {t['function']['name'] for t in model.tools[0]}
 
 
@@ -106,19 +104,19 @@ def test_constraint_applies_to_discovery_and_execution(tmp_path):
 
 def test_parameter_error_reports_actual_and_range(tmp_path):
     _, _, _, _, runtime = development_env(tmp_path)
-    result = runtime.execute({'id': 'bad', 'name': 'discover_tools', 'arguments': json.dumps({'query': 'web', 'limit': 13})})
+    result = runtime.execute({'id': 'bad', 'name': 'discover_tools', 'arguments': json.dumps({'query': 'web', 'limit': 101})})
     assert result['error']['code'] == 'validation_error'
-    assert '实际 13' in result['error']['message'] and '1..12' in result['error']['message']
+    assert '实际 101' in result['error']['message'] and '1..100' in result['error']['message']
 
 
 def test_discussion_followup_does_not_authorize_writes(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     router = TaskProtocolSelector()
     previous = router.route('只讨论本地代码，不要修改，禁止联网')
-    following = router.route('继续', {'status': 'planned'}, previous)
+    following = router.route('继续', {'status': 'planned', 'execution_context': {'protocols': ['coding']}}, previous)
     assert following['constraints'] == {'read_only': True, 'network_forbidden': True}
     assert not following['development_continuation'] and not following['execution_requested']
-    allowed = router.route('继续实现刚才的代码修改，现在允许联网', {'status': 'planned'}, following)
+    allowed = router.route('继续实现刚才的代码修改，现在允许联网', {'status': 'planned', 'execution_context': {'protocols': ['coding']}}, following)
     assert allowed['execution_requested'] and not any(allowed['constraints'].values())
 
 
@@ -141,7 +139,7 @@ def test_large_tool_catalog_is_bounded_and_preserves_pending(tmp_path):
     available = [replace(base, name=f'mcp_tool_{i:02}', category='mcp', description='x' * 2000,
                          spec=replace(base.spec, routes=('mcp',))) for i in range(80)]
     state = {'capability_routes': ['mcp'], 'pending_tools': [{'name': 'mcp_tool_79'}]}
-    selected = select_tools(available, state)
+    selected = select_tools(available, state, token_budget=8000)
     assert 1 < len(selected) < 15
     assert 'mcp_tool_79' in {item.name for item in selected}
 
@@ -152,8 +150,10 @@ def test_local_progress_is_not_web_stagnation(tmp_path):
     state['protocols'] = ['coding']
     state['usage']['search_fetches'] = 1
     store.record.run_runtime = state
-    for _ in range(5):
-        runtime.research.note_progress_round()
+    from genesisai.agent.progress import ProgressTracker
+    tracker = ProgressTracker(state)
+    for number in range(5):
+        assert tracker.observe({'name': 'read_files', 'arguments': json.dumps({'path': f'{number}.py'})}, {'ok': True, 'data': {'text': f'module {number}'}})
     assert state['phase'] == 'explore' and state['stop_reason'] is None
 
 

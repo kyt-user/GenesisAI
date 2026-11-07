@@ -1,4 +1,4 @@
 name: memory_write
 enabled: true
 category: kernel
-description: 保存或修正有来源的项目知识；默认未验证，修改必须携带读取到的版本号
+description: 按 entries 原子保存或修正独立事实；每条使用 body 或 body_ref 精确文档引用及字符范围，引用正文冻结并自动记入来源；默认未验证，修改须携带读取到的版本号

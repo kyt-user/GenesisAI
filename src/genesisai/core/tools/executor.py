@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from genesisai.core.tools.base import SchemaConfigError, SchemaValidationError, PartialToolResult
 from genesisai.core.tools.worker import tool_worker
+from genesisai.core.tools.permissions import accepted_tool, current_authorization
 from genesisai.shared.results import error_result
 from genesisai.shared.run_control import cancellation_requested
 from genesisai.shared.security import ToolError
@@ -50,8 +52,9 @@ class ToolExecutor:
             deadline = started_at + descriptor.spec.timeout_seconds
             if state.status == "running" and state.deadline:
                 deadline = min(deadline, time.monotonic() + state.deadline - time.time())
+            invocation_context = replace(self.context, call_id=call['id'])
             with tool_worker(
-                self.context, implementation, self.context.runtime.observations.adapters.get(descriptor.name), deadline
+                invocation_context, implementation, self.context.runtime.observations.adapters.get(descriptor.name), deadline
             ) as worker:
                 preview = worker.request("prepare", args)
 
@@ -61,17 +64,18 @@ class ToolExecutor:
                         if not prior:
                             self.ledger.await_input(call, preview)
                         return {"call_id": call["id"], "input_request": preview}
-                confirmation_required = self.policy.requires_confirmation(descriptor, args) or (
+                confirmation_required = self.policy.requires_confirmation(descriptor, args, preview) or (
                     prior is not None and prior.get("state") == "prepared"
+                    and (approved is not None or self.policy.authorization_for(descriptor, args, preview) is None)
                 )
                 if confirmation_required:
                     if not isinstance(preview, dict):
                         raise ToolError("permission_error", "需要确认的工具没有提供资源预览")
                     preview = {**preview, "args": args}
                     if approved is None:
-                        if not prior or prior.get("state") != "prepared" or prior.get("expires", 0) < time.time():
-                            digest_value, expires = self.policy.freeze(preview)
-                            self.ledger.prepare(call, preview, digest_value, expires)
+                        if not prior or prior.get("state") != "prepared":
+                            digest_value = self.policy.freeze(preview)
+                            self.ledger.prepare(call, preview, digest_value)
                         return {"pending": True, "call_id": call["id"], "preview": preview}
                     self.policy.validate(preview, prior, approved)
 
@@ -80,7 +84,27 @@ class ToolExecutor:
                 worker.check_deadline()
                 self.ledger.start(call)
                 execution_started = True
-                payload, observations = worker.request("execute", args)
+                acceptance = accepted_tool.set(
+                    {"name": descriptor.name, "digest": approved}
+                    if approved is not None else None
+                )
+                authorization = self.policy.authorization_for(descriptor, args, preview) if approved is None else None
+                authorization_token = current_authorization.set(authorization)
+                from genesisai.core.extensions.tools.web.budget import active_scope
+                scope_token = active_scope.set({'authorization_id': authorization['id'], 'domains': authorization['domains']}
+                                              if authorization is not None else None)
+                invocation_context = replace(invocation_context, authorization=authorization)
+                try:
+                    if descriptor.spec.execution == 'job':
+                        from genesisai.core.jobs.tool_operation import submit_tool
+                        payload, observations = submit_tool(invocation_context, descriptor, implementation, args, preview)
+                    else:
+                        worker.request('authorize', (authorization, accepted_tool.get()))
+                        payload, observations = worker.request("execute", args)
+                finally:
+                    active_scope.reset(scope_token)
+                    current_authorization.reset(authorization_token)
+                    accepted_tool.reset(acceptance)
                 if not isinstance(payload, dict):
                     raise ToolError("invalid_result", "工具结果必须是对象")
                 result = {
@@ -112,7 +136,7 @@ class ToolExecutor:
                 and descriptor is not None
                 and descriptor.spec.side_effect
                 and getattr(exc, "error_type", None) not in {"command_not_found", "command_cancelled", "mcp_tool_error", "patch_conflict"}
-                and (getattr(exc, "error_type", None) in {"tool_timeout", "worker_lost", "worker_cancelled"}
+                and (getattr(exc, "error_type", None) in {"unknown_execution", "tool_timeout", "worker_lost", "worker_cancelled"}
                      or (target and Path(target).exists()))
             ):
                 result = error_result(

@@ -29,7 +29,6 @@ def main():
     load_environment(workspace=project)
     model, _ = build_model(settings=load_settings())
     if model.image_capability.supported is not True:
-        model.client.close()
         raise ValueError(model.image_capability.reason)
     root = project / 'temp' / ('live-image-' + uuid4().hex)
     workspace = root / 'workspace'
@@ -44,7 +43,7 @@ def main():
     model.image_resolver = runtime.images.data_url
     model.bind_logging(runtime.logger, purpose='live_image_acceptance')
     report = {'provider': model.provider, 'model': model.model, 'source_image': str(image), 'checks': {}, 'answers': {}}
-    options = {'max_tokens': 500, 'extra_body': {'enable_thinking': False}, 'timeout': 60}
+    options = {'max_tokens': 500, 'extra_body': {'enable_thinking': False}, 'request_timeouts': {'total': 60}}
     try:
         part = runtime.images.import_image(prepare_path(image, access, runtime.images.config))
         messages = [Message('user', [{'type': 'text', 'text': '请实际观察图片，用两句话描述主要角色的外形、颜色以及整张图片的排列方式。'}, part])]
@@ -77,7 +76,6 @@ def main():
         report['normalized_image'] = part
         print(json.dumps(report, ensure_ascii=False, indent=2))
     finally:
-        model.client.close()
         runtime.mcp.close()
         (root / 'report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf8')
         print('Report:', root / 'report.json', flush=True)

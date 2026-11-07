@@ -1,4 +1,4 @@
 name: fetch_web_content
 enabled: true
 category: kernel
-description: 检索公开网络候选，或抓取已登记候选/用户 URL 的正文并登记来源（query 或 url 二选一）
+description: 检索公网（result_count、offset、过滤与provider分页），或抓取任意授权公网URL。完整源保存；section按正文/text、原文/source、链接/links、结构化块/structured或structured_raw、PDF页目录/document_pages与page分页。链接发现不代表访问授权。query或url二选一。

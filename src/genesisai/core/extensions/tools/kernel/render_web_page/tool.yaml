@@ -1,0 +1,4 @@
+name: render_web_page
+enabled: true
+category: kernel
+description: 显式运行 Chromium 渲染公开动态网页，保存完整 DOM 和正文来源；独立无登录上下文，仅受控 GET，同主机子资源默认允许，可声明额外域名；按作业读取和取消

@@ -1,0 +1,4 @@
+name: inspect_project
+enabled: true
+category: kernel
+description: 异步完整探测项目与子包、声明的测试入口、Python解释器和依赖；按packages/manifests/test_files/dependencies/html_files/source_roots/scan_errors/skipped_links分页，next_offset继续读取。显示扫描与读取错误、排除目录和跳过链接。显式command和根项目声明优先，无根入口的多包项目需选择cwd或command。

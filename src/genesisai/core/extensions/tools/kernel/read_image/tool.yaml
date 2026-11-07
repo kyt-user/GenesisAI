@@ -1,4 +1,4 @@
 name: read_image
 enabled: true
 category: kernel
-description: 读取授权的 PNG/JPEG/WebP 静态图片供模型查看，或用 image_ref 重新加载历史图片；需要支持图片的模型，不支持视频或动画
+description: 读取 PNG/JPEG/WebP 或历史 image_ref；crop 使用方向校正后的原图像素坐标 x/y/width/height，max_side 调整视图分辨率；支持分批查看，需要图片模型

@@ -68,11 +68,21 @@ def image_tokens(part: ImagePart) -> int:
 
 @dataclass(frozen=True)
 class ImageAttachment:
-    """Validated, normalized bytes frozen before enqueueing; never persisted inline."""
+    """Original and preview pixels frozen before enqueueing; never persisted inline."""
     name: str
     width: int
     height: int
     data: bytes = field(repr=False)
+    original: bytes = field(repr=False)
+    original_mime_type: str
+    original_width: int
+    original_height: int
+    region: tuple[int, int, int, int] | None
+    max_side: int
+
+    @property
+    def storage_bytes(self):
+        return len(self.data) + len(self.original)
 
 
 @dataclass(frozen=True)

@@ -27,4 +27,4 @@ class ModelClient(ABC):
         tools: list[dict] | None = None,
         **kwargs,
     ) -> Iterator[str | tuple[str, str] | Response]:
-        """依次产生正文片段、可选推理片段和一个完整的最终响应。"""
+        """依次产生正文、reasoning/tool_call/finish 活动片段和一个完整的最终响应。"""

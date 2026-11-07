@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import sys
 import time
 from pathlib import Path
 from genesisai.shared.paths import application_home
@@ -18,6 +19,7 @@ from genesisai.shared.messages import Response, ToolCall
 from genesisai.shared.security import Access
 from genesisai.core.persistence.session import Session
 from genesisai.core.persistence.files import atomic_json
+from genesisai.app.evals.plan_steps import complete_plan
 
 
 CASE_FIELDS = frozenset({"id", "name", "expectations"})
@@ -32,7 +34,8 @@ class ScriptedModel:
     def chat(self, messages, tools=None, **kwargs):
         if not self.responses:
             raise AssertionError("源码开发仿真响应已耗尽")
-        return self.responses.pop(0)
+        item = self.responses.pop(0)
+        return item(messages) if callable(item) else item
 
     def stream_chat(self, messages, tools=None, **kwargs):
         yield self.chat(messages, tools, **kwargs)
@@ -74,7 +77,10 @@ def case_environment(output: Path, identifier: str) -> tuple[Path, Session, Tool
     store = Session(root / "state", workspace=workspace)
     manager = TaskService(store)
     manager.begin_task(f"源码开发仿真：{identifier}")
-    manager.set_plan(steps=["创建项目文件", "执行验证"], acceptance=["产物存在且验证状态真实"])
+    manager.update_plan(expected_revision=0, upsert=[
+        {'id': 'create', 'kind': 'step', 'text': '创建项目文件'},
+        {'id': 'validate', 'kind': 'acceptance', 'text': '产物存在且验证状态真实', 'requires_verification': True},
+    ])
     store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
     store.commit()
     runtime = ToolRuntime(
@@ -95,10 +101,11 @@ def html_case(output: Path) -> dict:
     )
     result = Runner(ScriptedModel(
         tool("html_create", "editor", {"operation": "create", "path": "index.html", "content": html, "source_refs": []}),
+        complete_plan(runtime),
         Response(content="页面已写入并通过静态验收。"),
     ), runtime).start("按你的默认来")
     task = TaskService(store).active_task()
-    checks = {'runner_completed': result['status'] == 'completed', 'profile_inherited': store.record.run_runtime['profile'] == 'local_files', 'html_written': (workspace / 'index.html').read_text(encoding='utf-8') == html, 'verified': bool(task and task['status'] == 'verified')}
+    checks = {'runner_completed': result['status'] == 'completed', 'profile_inherited': store.record.run_runtime['profile'] == 'local_files', 'html_written': (workspace / 'index.html').read_text(encoding='utf-8') == html, 'verified': bool(task and task['status'] == 'completed' and task['verification_passed'])}
     return {"id": "html_continuation", "status": "passed" if all(checks.values()) else "failed", "checks": checks}
 
 
@@ -107,7 +114,8 @@ def python_case(output: Path) -> dict:
     result = Runner(ScriptedModel(
         tool("py_create", "editor", {"operation": "create", "path": "calculator.py", "content": "def add(a, b):\n    return a + b\n", "source_refs": []}),
         tool("test_create", "editor", {"operation": "create", "path": "test_calculator.py", "content": "from calculator import add\n\ndef test_add():\n    assert add(2, 3) == 5\n", "source_refs": []}),
-        Response(content="源码和测试已写入。"),
+        tool("py_verify", "run_commands", {"command": [sys.executable, "-m", "pytest", "test_calculator.py", "-q"]}),
+        complete_plan(runtime),
         Response(content="Python 测试通过。"),
     ), runtime).start("开始")
     checks = {'runner_completed': result['status'] == 'completed', 'source_written': (workspace / 'calculator.py').is_file(), 'test_written': (workspace / 'test_calculator.py').is_file(), 'verification_succeeded': store.record.run_runtime.get('verification_succeeded') is True}

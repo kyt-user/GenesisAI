@@ -292,13 +292,17 @@ class Session:
         self.commit()
         return key
 
-    def artifact(self, path):
+    def artifact(self, path, source_refs=()):
         path = Path(path).resolve()
         digest = sha(path)
         key = (
             "artifact_" + hashlib.sha256((str(path) + digest).encode()).hexdigest()[:16]
         )
         item = dict(path=str(path), sha256=digest, run_id=self.record.run_id)
+        if source_refs:
+            if any(ref not in self.record.sources for ref in source_refs):
+                raise ValueError("产物来源引用未登记")
+            item["source_refs"] = list(dict.fromkeys(source_refs))
         if getattr(self.record, "permission_mode") == "auto" and (
             not path.is_relative_to(Path(self.record.output).resolve())
         ):
@@ -334,7 +338,7 @@ class Session:
     def verify_sources(self):
         self.refresh_local_files()
         for data in self.record.sources.values():
-            if data["kind"] == "web":
+            if data["kind"] in {"web", "private_web", "web_render"}:
                 ref = next(
                     (
                         key

@@ -3,7 +3,6 @@ import io
 import json
 
 import httpx
-from openai import OpenAI
 from PIL import Image
 import pytest
 
@@ -13,11 +12,10 @@ from genesisai.shared.messages import Message, ToolCall
 from test_image_assets import SPRITE, image_runtime
 
 
-def client_for(runtime, handler):
+def client_for(runtime, handler, monkeypatch):
     model = QwenClient('qwen3-vl-plus', api_key='fixture-key', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1')
-    model.client.close()
-    model.client = OpenAI(api_key='fixture-key', base_url='https://dashscope.aliyuncs.com/compatible-mode/v1',
-                          http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+    from model_transport import mock_model_http
+    mock_model_http(monkeypatch, handler)
     model.image_resolver = runtime.images.data_url
     return model
 
@@ -32,7 +30,7 @@ def completion(body, content='seen'):
                                    'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': content}, 'finish_reason': 'stop'}]})
 
 
-def test_sync_and_stream_deliver_real_pixels_and_log_only_refs(tmp_path):
+def test_sync_and_stream_deliver_real_pixels_and_log_only_refs(tmp_path, monkeypatch):
     store, runtime = image_runtime(tmp_path)
     part = runtime.images.read(path=SPRITE)['images'][0]
     requests = []
@@ -40,14 +38,11 @@ def test_sync_and_stream_deliver_real_pixels_and_log_only_refs(tmp_path):
         body = json.loads(request.content)
         requests.append(body)
         return completion(body)
-    model = client_for(runtime, handle)
+    model = client_for(runtime, handle, monkeypatch)
     model.bind_logging(runtime.logger)
     messages = [Message('user', [{'type': 'text', 'text': 'describe'}, part])]
-    try:
-        assert model.chat(messages).content == 'seen'
-        assert list(model.stream_chat(messages))[-1].content == 'seen'
-    finally:
-        model.client.close()
+    assert model.chat(messages).content == 'seen'
+    assert list(model.stream_chat(messages))[-1].content == 'seen'
     assert requests[0]['messages'] == requests[1]['messages']
     url = requests[0]['messages'][0]['content'][1]['image_url']['url']
     with Image.open(io.BytesIO(base64.b64decode(url.split(',', 1)[1]))) as image:
@@ -55,37 +50,31 @@ def test_sync_and_stream_deliver_real_pixels_and_log_only_refs(tmp_path):
     assert 'base64' not in runtime.logger.journal.path.read_text(encoding='utf8')
 
 
-def test_tool_images_follow_all_parallel_results_and_keep_call_identity(tmp_path):
+def test_tool_images_follow_all_parallel_results_and_keep_call_identity(tmp_path, monkeypatch):
     _, runtime = image_runtime(tmp_path)
     part = runtime.images.read(path=SPRITE)['images'][0]
-    model = client_for(runtime, lambda r: completion(json.loads(r.content)))
+    model = client_for(runtime, lambda r: completion(json.loads(r.content)), monkeypatch)
     messages = [Message('user', 'look'), Message('assistant', tool_calls=[ToolCall('a', 'read_image', '{}'), ToolCall('b', 'list_files', '{}')]),
                 Message('tool', [{'type': 'text', 'text': '{"ok":true}'}, part], tool_call_id='a'),
                 Message('tool', '{}', tool_call_id='b')]
-    try:
-        wire = model._request_messages(messages)
-        assert [m['role'] for m in wire] == ['user', 'assistant', 'tool', 'tool', 'user']
-        assert wire[2]['tool_call_id'] == 'a' and isinstance(wire[2]['content'], str)
-        assert part['image_ref'] in wire[-1]['content'][1]['text'] and 'a' in wire[-1]['content'][1]['text']
-        assert '不是用户新指令' in wire[-1]['content'][0]['text']
-        with pytest.raises(ValueError, match='未全部'):
-            model._request_messages(messages[:-1])
-    finally:
-        model.client.close()
+    wire = model._request_messages(messages)
+    assert [m['role'] for m in wire] == ['user', 'assistant', 'tool', 'tool', 'user']
+    assert wire[2]['tool_call_id'] == 'a' and isinstance(wire[2]['content'], str)
+    assert part['image_ref'] in wire[-1]['content'][1]['text'] and 'a' in wire[-1]['content'][1]['text']
+    assert '不是用户新指令' in wire[-1]['content'][0]['text']
+    with pytest.raises(ValueError, match='未全部'):
+        model._request_messages(messages[:-1])
 
 
-def test_unknown_model_and_raw_video_are_rejected_before_http(tmp_path):
+def test_unknown_model_and_raw_video_are_rejected_before_http(tmp_path, monkeypatch):
     _, runtime = image_runtime(tmp_path)
     part = runtime.images.read(path=SPRITE)['images'][0]
-    model = client_for(runtime, lambda r: pytest.fail('must not send HTTP'))
-    try:
-        model.image_capability = image_capability('qwen', 'custom', str(model.client.base_url))
-        with pytest.raises(ValueError, match='未确认'):
-            model.chat([Message('user', [part])])
-        with pytest.raises(ValueError, match='仅支持'):
-            model.chat([Message('user', [{'type': 'video', 'url': 'video.mp4'}])])
-    finally:
-        model.client.close()
+    model = client_for(runtime, lambda r: pytest.fail('must not send HTTP'), monkeypatch)
+    model.image_capability = image_capability('qwen', 'custom', str(model.base_url))
+    with pytest.raises(ValueError, match='未确认'):
+        model.chat([Message('user', [part])])
+    with pytest.raises(ValueError, match='仅支持'):
+        model.chat([Message('user', [{'type': 'video', 'url': 'video.mp4'}])])
 
 
 def test_capabilities_are_bound_to_provider_model_and_endpoint():

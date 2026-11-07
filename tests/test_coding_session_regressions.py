@@ -6,6 +6,7 @@ import pytest
 from rich.console import Console
 
 from genesisai.agent.loop import Runner
+from genesisai.app.evals.plan_steps import complete_plan
 from genesisai.app.terminal_view import CliView
 from genesisai.shared.ids import sha
 from genesisai.core.persistence.session import Session
@@ -16,7 +17,12 @@ from test_development_continuation import development_env
 
 
 def test_approved_code_change_and_tests_finish_then_allow_followup(tmp_path):
-    workspace, _, _, store, runtime = development_env(tmp_path)
+    workspace, manager, _, store, runtime = development_env(tmp_path, planned=False)
+    manager.begin_task('修复 calc.py 并通过实际测试', new_task=True)
+    manager.update_plan(expected_revision=0, upsert=[
+        {'id': 'fix', 'kind': 'step', 'text': '修复加法'},
+        {'id': 'accept', 'kind': 'acceptance', 'text': '实际测试通过', 'requires_verification': True},
+    ])
     source = workspace / 'calc.py'
     source.write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
     runtime.set_permission("user")
@@ -29,6 +35,7 @@ def test_approved_code_change_and_tests_finish_then_allow_followup(tmp_path):
             'content': 'import unittest\nfrom calc import add\nclass TestAdd(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n'}, 'test_file'),
         tool_response('run_commands', {'command': [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v'],
                                       'cwd': str(workspace)}, 'test_run'),
+        complete_plan(runtime),
         Response(content='已修复并通过测试。'),
         Response(content='上一轮修改和测试均成功。'),
     )

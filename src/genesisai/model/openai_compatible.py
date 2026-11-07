@@ -2,16 +2,24 @@
 
 import asyncio
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+import httpx
 
-from openai import AsyncOpenAI, OpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient, APIConnectionError, APITimeoutError
+from urllib.parse import urlsplit
+import ipaddress
 
 from genesisai.model.base import ModelClient
 from genesisai.shared.run_control import current_run
+from genesisai.shared.request_timeouts import RequestClock, RequestTimeout, RequestTimeouts
 from genesisai.shared.messages import Message, Response, ToolCall
 from genesisai.shared.messages import content_text, image_parts
 from genesisai.shared.context_config import ContextConfig
 from genesisai.model.capabilities import image_capability
+
+
+class IncompleteModelStream(Exception):
+    """The server ended a successful HTTP response before completing generation."""
 
 
 class OpenAICompatibleClient(ModelClient):
@@ -21,18 +29,20 @@ class OpenAICompatibleClient(ModelClient):
         model: str,
         base_url: str,
         api_key: str,
-        timeout: float,
-        max_retries: int = 0,
+        request_timeouts: dict | None = None,
         generation: dict | None = None,
     ):
         if not api_key:
             raise ValueError("模型 API Key 不能为空")
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=timeout,
-            max_retries=max_retries,
-        )
+        hostname = urlsplit(str(base_url)).hostname
+        try:
+            loopback = ipaddress.ip_address(hostname or "").is_loopback
+        except ValueError:
+            loopback = hostname == "localhost"
+        self.trust_environment_proxy = not loopback
+        self.api_key = api_key
+        self.base_url = httpx.URL(str(base_url).rstrip('/') + '/')
+        self.request_timeouts = RequestTimeouts.parse(request_timeouts).as_dict()
         self.model = model
         self.image_capability = image_capability(getattr(self, 'provider', ''), model, base_url)
         self.image_resolver = None
@@ -43,7 +53,7 @@ class OpenAICompatibleClient(ModelClient):
     def bind_logging(self, logger, **context):
         self.io_logger = logger
         self.io_context = context
-        logger.add_secret(getattr(self.client, 'api_key', None))
+        logger.add_secret(self.api_key)
 
     def _record_io(self, event, **payload):
         if getattr(self, 'io_logger', None) is not None:
@@ -56,27 +66,50 @@ class OpenAICompatibleClient(ModelClient):
             yield chunk
 
     @contextmanager
-    def _request(self, payload):
-        control = current_run.get()
-        if control is None:
-            response = self.client.chat.completions.create(**payload)
-            try:
+    def _request(self, payload, limits):
+        clock = RequestClock(limits)
+        try:
+            with self._transport_request(payload, clock) as response:
                 yield response
-            finally:
-                if payload.get('stream') and hasattr(response, 'close'):
-                    response.close()
-            return
+        except (httpx.TimeoutException, APITimeoutError) as exc:
+            cause = exc.__cause__ if isinstance(exc, APITimeoutError) else exc
+            if isinstance(cause, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                phase, seconds = 'connect', limits.connect
+            elif isinstance(cause, httpx.WriteTimeout):
+                phase, seconds = 'write', limits.idle
+            else:
+                phase, seconds, _ = clock.pending()
+            raise RequestTimeout(phase, seconds) from exc
+        except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError, IncompleteModelStream) as exc:
+            # The SDK wraps failures before response headers, but stream-body
+            # reads can escape as raw httpx errors. Give both phases the same
+            # retry contract; no partial tool call has been delivered for execution.
+            request = httpx.Request('POST', self.base_url.join('chat/completions'))
+            raise APIConnectionError(message='模型响应传输未完成', request=request) from exc
 
-        # Drive the async socket on the run worker. Cancel wakes a blocked read,
-        # including the wait for HTTP headers before a stream object exists.
+    @contextmanager
+    def _transport_request(self, payload, clock):
+        control = current_run.get()
+        limits = clock.limits
+        # All requests use interruptible async I/O, including direct non-stream
+        # calls. Heartbeats cannot reset the semantic first-output/idle clocks.
         with asyncio.Runner() as runner:
-            client = AsyncOpenAI(api_key=self.client.api_key, base_url=self.client.base_url,
-                                 timeout=self.client.timeout, max_retries=self.client.max_retries)
+            client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url,
+                                 timeout=httpx.Timeout(connect=limits.connect, pool=limits.connect,
+                                                       write=limits.idle, read=None), max_retries=0,
+                                 http_client=DefaultAsyncHttpxClient(trust_env=self.trust_environment_proxy))
             loop = runner.get_loop()
 
             def wait(awaitable):
-                task = asyncio.ensure_future(awaitable, loop=loop)
-                with control.interruptible(lambda: loop.call_soon_threadsafe(task.cancel)):
+                phase, seconds, remaining = clock.pending()
+                async def bounded():
+                    try:
+                        return await asyncio.wait_for(awaitable, max(0, remaining))
+                    except TimeoutError as exc:
+                        raise RequestTimeout(phase, seconds) from exc
+                task = loop.create_task(bounded())
+                interrupt = control.interruptible(lambda: loop.call_soon_threadsafe(task.cancel)) if control else nullcontext()
+                with interrupt:
                     try:
                         return loop.run_until_complete(task)
                     except asyncio.CancelledError as exc:
@@ -85,6 +118,7 @@ class OpenAICompatibleClient(ModelClient):
             try:
                 response = wait(client.chat.completions.create(**payload))
                 if not payload.get('stream'):
+                    clock.activity()
                     yield response
                     return
                 iterator = response.__aiter__()
@@ -92,7 +126,11 @@ class OpenAICompatibleClient(ModelClient):
                 def chunks():
                     while True:
                         try:
-                            yield wait(anext(iterator))
+                            chunk = wait(anext(iterator))
+                            clock.check()
+                            if self._has_activity(chunk):
+                                clock.activity()
+                            yield chunk
                         except StopAsyncIteration:
                             return
                 try:
@@ -102,10 +140,26 @@ class OpenAICompatibleClient(ModelClient):
             finally:
                 loop.run_until_complete(client.close())
 
+    @staticmethod
+    def _has_activity(chunk):
+        for choice in chunk.choices:
+            delta = choice.delta
+            if (choice.finish_reason or delta.content or getattr(delta, 'reasoning_content', None)
+                    or any(call.id or (call.function and (call.function.name or call.function.arguments))
+                           for call in delta.tool_calls or [])):
+                return True
+        return False
+
+    def _limits(self, overrides):
+        RequestTimeouts.parse(overrides)
+        values = overrides.as_dict() if isinstance(overrides, RequestTimeouts) else overrides or {}
+        return RequestTimeouts.parse({**self.request_timeouts, **values})
+
     def chat(
         self,
         messages: list[Message],
         tools: list[dict] | None = None,
+        request_timeouts=None,
         **kwargs,
     ) -> Response:
         options = self._request_options(kwargs)
@@ -115,8 +169,9 @@ class OpenAICompatibleClient(ModelClient):
         payload = dict(model=self.model,
                        messages=self._request_messages(messages),
                        tools=tools, **options)
-        self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
-        with self._request(payload) as response:
+        limits = self._limits(request_timeouts)
+        self._record_io('provider_request', base_url=str(self.base_url), request=payload, request_timeouts=limits.as_dict())
+        with self._request(payload, limits) as response:
             return self._parse_response(response)
 
     def _parse_response(self, response):
@@ -143,6 +198,7 @@ class OpenAICompatibleClient(ModelClient):
         self,
         messages: list[Message] | list[dict],
         tools: list[dict] | None = None,
+        request_timeouts=None,
         **kwargs,
     ) -> Iterator[str | tuple[str, str] | Response]:
         options = self._request_options(kwargs)
@@ -157,8 +213,9 @@ class OpenAICompatibleClient(ModelClient):
             stream=True,
             **options,
         )
-        self._record_io('provider_request', base_url=str(getattr(self.client, 'base_url', '')), request=payload)
-        with self._request(payload) as stream:
+        limits = self._limits(request_timeouts)
+        self._record_io('provider_request', base_url=str(self.base_url), request=payload, request_timeouts=limits.as_dict())
+        with self._request(payload, limits) as stream:
             yield from self._parse_stream(stream)
 
     def _parse_stream(self, stream):
@@ -182,6 +239,7 @@ class OpenAICompatibleClient(ModelClient):
             if delta.content:
                 content_parts.append(delta.content)
                 yield delta.content
+            tool_activity = False
             for call in delta.tool_calls or []:
                 current = tool_call_parts.setdefault(
                     call.index,
@@ -191,8 +249,15 @@ class OpenAICompatibleClient(ModelClient):
                 if call.function:
                     current["name"] += call.function.name or ""
                     current["arguments"] += call.function.arguments or ""
+                if call.id or (call.function and (call.function.name or call.function.arguments)):
+                    tool_activity = True
+                    yield ('tool_call', '')
+            if getattr(chunk.choices[0], 'finish_reason', None) and not (reasoning_delta or delta.content or tool_activity):
+                # An empty terminal delta is still a completed generation. Keep
+                # Runner's clock aligned while waiting for final usage/EOF.
+                yield ('finish', '')
         if finish_reason is None:
-            raise ValueError('模型流提前结束，未收到结束原因')
+            raise IncompleteModelStream('模型流提前结束，未收到结束原因')
         tool_calls = [
             ToolCall(
                 id=tool_call_parts[index]["id"],
@@ -209,7 +274,10 @@ class OpenAICompatibleClient(ModelClient):
         )
 
     def _request_options(self, overrides: dict) -> dict:
-        return {**self._provider_defaults(), **self.generation, **overrides}
+        options = {**self._provider_defaults(), **self.generation, **overrides}
+        if 'timeout' in options:
+            raise ValueError('请求时限请使用 request_timeouts 的 connect/first_token/idle/total')
+        return options
 
     def _provider_defaults(self) -> dict:
         raise NotImplementedError
@@ -233,7 +301,8 @@ class OpenAICompatibleClient(ModelClient):
         if self.image_resolver is None:
             raise ValueError('图片解析服务未绑定')
         config = ContextConfig.parse(getattr(self, 'context_config', None))
-        if len(parts) > config.max_images or sum(p['byte_size'] for p in parts) > config.max_request_image_bytes:
+        if ((config.max_images is not None and len(parts) > config.max_images)
+                or sum(p['byte_size'] for p in parts) > config.max_request_image_bytes):
             raise ValueError('图片数量或请求图片总大小超过限制')
         result, observations, outstanding = [], [], set()
 

@@ -13,8 +13,8 @@ class Attachments:
     def add(self, path, access, config):
         image = prepare_path(path, access, config)
         with self._lock:
-            if len(self._images) >= config.max_images or sum(len(p.data) for p in self._images) + len(image.data) > config.max_request_image_bytes:
-                raise ValueError('待发送图片数量或总大小超过限制')
+            if sum(p.storage_bytes for p in self._images) + image.storage_bytes > config.max_pending_image_bytes:
+                raise ValueError('待发送原图与预览超过附件内存配额；可分次发送或调整 max_pending_image_bytes')
             self._images.append(image)
         return image
 

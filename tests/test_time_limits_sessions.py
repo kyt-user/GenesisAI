@@ -17,13 +17,13 @@ from test_development_continuation import development_env
 
 def test_profile_changes_do_not_override_explicit_time_limit(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
-    runner = Runner(FakeModel(Response(content='answer')), runtime, seconds=600, request_timeout=120)
+    runner = Runner(FakeModel(Response(content='answer')), runtime, seconds=600, request_timeouts={'idle': 120})
     assert runner.start('hello')['status'] == 'completed'
     assert 599 <= store.record.deadline - store.record.run_runtime['started_at'] <= 601
     deadline = store.record.deadline
     runtime.research.switch_profile('web_quick')
     assert store.record.deadline == deadline
-    assert store.record.run_runtime['request_timeout_seconds'] == 120
+    assert store.record.run_runtime['request_timeouts']['idle'] == 120
 
 
 def test_retry_uses_remaining_task_time(tmp_path):
@@ -33,12 +33,12 @@ def test_retry_uses_remaining_task_time(tmp_path):
         pass
     class Model:
         def stream_chat(self, messages, tools=None, **options):
-            seen.append(options['timeout'])
+            seen.append(options['request_timeouts']['total'])
             if len(seen) == 1:
                 store.record.deadline = time.time() + 5
                 raise InternalServerError('busy')
             yield Response(content='answer')
-    result = Runner(Model(), runtime, seconds=300, request_timeout=60).start('hello')
+    result = Runner(Model(), runtime, seconds=300, request_timeouts={'total': 60}).start('hello')
     assert result['status'] == 'completed'
     assert seen[0] == 60 and 0 < seen[1] <= 5
 
@@ -71,6 +71,19 @@ def test_verified_work_gets_recorded_summary_on_request_timeout(tmp_path):
     assert runner.finish_timeout(task_expired=False)['status'] == 'failed'
 
 
+def test_timeout_summary_does_not_bypass_pending_job_or_capability_acceptance(tmp_path):
+    _, _, _, store, runtime = development_env(tmp_path)
+    runner = Runner(FakeModel(), runtime)
+    state = store.record.run_runtime
+    state.update(project_changed=True, verification_succeeded=True, verification_required=False,
+                 pending_execution_jobs=['job_not_collected'])
+    assert runner.finish_timeout(task_expired=False)['status'] == 'failed'
+    state.update(pending_execution_jobs=[], protocols=['capability_builder'],
+                 execution_requested=True, capability_goal='registered')
+    assert runner.finish_timeout(task_expired=False)['status'] == 'failed'
+    runtime.close()
+
+
 def test_menu_restores_other_workspace_history_and_logs(tmp_path, monkeypatch):
     old_workspace = tmp_path / 'old'
     old_workspace.mkdir()
@@ -85,7 +98,7 @@ def test_menu_restores_other_workspace_history_and_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(session_picker, 'select', lambda *a, **k: 0)
     prompts = iter(['/', 'continue please', '/exit'])
     monkeypatch.setattr(Console, 'input', lambda *a, **k: next(prompts))
-    assert cli.main(['--workspace', str(tmp_path / 'new'), '--seconds', '600', '--request-timeout', '120']) == 0
+    assert cli.main(['--workspace', str(tmp_path / 'new'), '--seconds', '600', '--request-idle-timeout', '120']) == 0
     assert any(m.content == 'previous answer' for m in model.contexts[0])
     data, _ = Session.inspect(restored.root,restored.id)
     assert data['workspace'] == str(old_workspace)

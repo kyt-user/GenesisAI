@@ -12,19 +12,21 @@ class Implementation:
 
     def execute(self, context, args):
         paths = []
-        scan_truncated = False
-        for index, path in enumerate(walk(context.access, args["path"], cap=1001)):
+        offset, limit = args.get("offset", 0), args.get("limit", 100)
+        more = False
+        for index, path in enumerate(walk(context.access, args["path"], include=args.get("include", []))):
             if context.store.record.deadline and time.time() >= context.store.record.deadline:
                 raise ToolError("timeout", "资料扫描达到运行截止时间")
-            if index == 1000:
-                scan_truncated = True
+            if index < offset:
+                continue
+            if len(paths) == limit:
+                more = True
                 break
             paths.append(path)
-        offset = args.get("offset", 0)
         results = [{"path": str(path), "size": path.stat().st_size} for path in paths]
         return {
-            "files": results[offset: offset + 100],
+            "files": results,
             "skipped": [],
-            "truncated": scan_truncated or len(results) > offset + 100,
-            "next_offset": offset + 100 if len(results) > offset + 100 else None,
+            "truncated": more,
+            "next_offset": offset + len(results) if more else None,
         }

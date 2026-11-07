@@ -21,9 +21,10 @@ from genesisai.app.attachments import Attachments
 from genesisai.shared.messages import UserInput
 from genesisai.shared.ids import uid
 from genesisai.app.command_input import COMMANDS
-from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT, DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS
+from genesisai.app.job_input_commands import cli_input_text, execute_job_input, is_job_input
+from genesisai.shared.time_limits import DEFAULT_TASK_SECONDS, DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS
 from genesisai.agent.loop import Runner
-from genesisai.shared.security import Access
+from genesisai.shared.security import Access, ToolError
 from genesisai.core.extensions.skills.registry import SkillError, SkillRegistry
 from genesisai.core.extensions.workflows import WorkflowError, WorkflowRegistry
 from genesisai.core.persistence.session import Session
@@ -81,8 +82,9 @@ def build_cli_session(
     on_event,
     workspace=None,
     logger=None,
-    request_timeout=DEFAULT_REQUEST_TIMEOUT,
+    request_timeouts=None,
     max_tools=DEFAULT_MAX_TOOLS,
+    token_budget=None,
 ):
     """将一个持久化 Session 绑定到访问边界、Runtime、Runner 和 UI 快照。"""
     store.record.apply(grants=list(roots), output=str(output))
@@ -107,7 +109,7 @@ def build_cli_session(
         output=str(output),
         permission_mode=runtime.permission_mode,
         registered_tools=len(runtime.registry),
-        enabled_tools=len(inventory["enabled"]),
+        enabled_tools=sum(item["enabled"] for items in inventory.values() for item in items),
         skill_name=",".join(store.record.tool_runtime["active_skills"]) or "未加载",
         git_state="工具可用"
         if "run_commands" in runtime.registry
@@ -120,12 +122,13 @@ def build_cli_session(
         runtime,
         max_rounds=max_rounds,
         max_tools=max_tools,
+        token_budget=token_budget,
         seconds=seconds,
-        request_timeout=request_timeout,
+        request_timeouts=request_timeouts,
         on_event=on_event,
     )
     store.record.run_runtime["execution_seconds_limit"] = seconds
-    store.record.run_runtime["request_timeout_seconds"] = request_timeout
+    store.record.run_runtime["request_timeouts"] = runner.request_timeouts.as_dict()
     store.commit()
     return CliSession(store=store, runtime=runtime, runner=runner, snapshot=snapshot)
 
@@ -195,20 +198,20 @@ def main(argv=None):
         default=[],
         help="为单次输入附加本地静态图片，可重复；可省略 --prompt",
     )
-    parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="模型交互轮次硬上限，默认 60；单轮内部重试另受超时与重试次数限制")
-    parser.add_argument("--max-tools", type=int, default=DEFAULT_MAX_TOOLS, help="工具调用硬上限，默认 180")
+    parser.add_argument("--max-rounds", type=int, default=DEFAULT_MAX_ROUNDS, help="显式模型轮次预算；默认不限")
+    parser.add_argument("--max-tools", type=int, default=DEFAULT_MAX_TOOLS, help="显式工具调用预算；默认不限")
     parser.add_argument(
         "--seconds",
         type=int,
         default=DEFAULT_TASK_SECONDS,
-        help="一轮任务总执行时限，默认 1800 秒；恢复同一运行不会重置",
+        help="显式任务执行秒数预算；默认不限，恢复同一运行不重置",
     )
-    parser.add_argument(
-        "--request-timeout",
-        type=int,
-        default=DEFAULT_REQUEST_TIMEOUT,
-        help="单次模型请求超时，默认 60 秒",
-    )
+    for phase, label in [('connect', '连接'), ('first-token', '首个有效输出'), ('idle', '流空闲')]:
+        parser.add_argument('--request-' + phase + '-timeout', type=float, default=argparse.SUPPRESS,
+                            help=f'模型请求{label}时限（秒），覆盖模型配置')
+    parser.add_argument('--request-total-timeout', default=argparse.SUPPRESS,
+                        help='模型请求总时限（秒）；none 表示不限')
+    parser.add_argument("--token-budget", type=int, default=None, help="显式累计Token预算；默认不限")
     args = parser.parse_args(argv)
     one_shot = args.prompt is not None or bool(args.image)
     for stream in (sys.stdout, sys.stderr):
@@ -217,8 +220,19 @@ def main(argv=None):
             reconfigure(encoding="utf-8", errors="replace")
     console = Console(legacy_windows=False)
     view = CliView(console)
-    if min(args.max_rounds, args.max_tools, args.seconds, args.request_timeout) < 1:
+    if any(v is not None and v < 1 for v in (args.max_rounds, args.max_tools, args.seconds, args.token_budget)):
         parser.error("预算必须为正数")
+    from genesisai.shared.request_timeouts import RequestTimeouts
+    request_timeouts = {phase: getattr(args, 'request_' + phase + '_timeout')
+                        for phase in ('connect', 'first_token', 'idle', 'total')
+                        if hasattr(args, 'request_' + phase + '_timeout')}
+    try:
+        if 'total' in request_timeouts:
+            value = request_timeouts['total']
+            request_timeouts['total'] = None if value.lower() == 'none' else float(value)
+        RequestTimeouts.parse(request_timeouts)
+    except ValueError as exc:
+        parser.error(str(exc))
     interactive = not one_shot and bool(getattr(sys.stdin, "isatty", lambda: False)())
     try:
         selected_workspace = args.workspace
@@ -281,7 +295,7 @@ def main(argv=None):
             ]
             output = str((args.output or actual_workspace).resolve())
             mode = args.permissions or "user"
-            staged_skills = []
+            staged_skills = {}
             attachments = Attachments()
 
             def restore_environment():
@@ -364,7 +378,7 @@ def main(argv=None):
                 mode = (args.permissions if startup else None) or getattr(
                     saved, "permission_mode", "user"
                 )
-                staged_skills = list(saved.tool_runtime["active_skills"])
+                staged_skills = dict(saved.tool_runtime["active_skills"])
                 session_logger = store.get_logger()
                 session_logger.record(
                     "session_open", resumed=True, workspace=str(workspace)
@@ -430,8 +444,9 @@ def main(argv=None):
                         permission_mode=mode,
                         max_rounds=args.max_rounds,
                         max_tools=args.max_tools,
+                        token_budget=args.token_budget,
                         seconds=args.seconds,
-                        request_timeout=args.request_timeout,
+                        request_timeouts=request_timeouts,
                         on_event=runs.emit if runs else view.render_progress,
                         workspace=actual_workspace,
                         logger=session_logger,
@@ -477,12 +492,8 @@ def main(argv=None):
                             "当前模型尚未确认支持图片，请使用 /model 切换；待发附件已保留"
                         )
                     config = state.runner.context_budgeter.config
-                    if (
-                        len(request.images) > config.max_images
-                        or sum(len(p.data) for p in request.images)
-                        > config.max_request_image_bytes
-                    ):
-                        raise ValueError("图片数量或总大小超过当前模型配置限制")
+                    if sum(p.storage_bytes for p in request.images) > config.max_pending_image_bytes:
+                        raise ValueError('原图与预览超过当前附件内存配额')
                 if new:
                     session_logger.record("cli_input", text=text)
                 view.draft = ""
@@ -715,7 +726,7 @@ def main(argv=None):
                             continue
                         text = raw.strip()
                         command = text.casefold()
-                        session_logger.record("cli_input", text=raw)
+                        session_logger.record("cli_input", text=cli_input_text(raw))
                         if attachment_command(text):
                             continue
                         if command == "/send":
@@ -729,6 +740,19 @@ def main(argv=None):
                         if command == "/cancel":
                             runs.control.cancel()
                             console.print("已请求取消，正在等待当前操作收尾。")
+                        elif is_job_input(text):
+                            view.render_data('作业输入回执', execute_job_input(store, session_logger, text))
+                        elif command == '/revoke' or command.startswith('/revoke '):
+                            from genesisai.app.authorization_commands import execute_authorization_command
+                            def show_revocation(future):
+                                try:
+                                    view.render_data('授权撤销', future.result())
+                                except Exception as exc:
+                                    console.print(str(exc), markup=False)
+                            pending_revoke = runs.defer_until_stopped(
+                                lambda text=text: execute_authorization_command(state.runtime, text))
+                            pending_revoke.add_done_callback(show_revocation)
+                            console.print('已请求停止当前轮次；收尾后立即撤销授权并停止关联后台作业。')
                         elif command == "/status":
                             console.print(
                                 f"{'取消中' if runs.control.cancelled.is_set() else runs.stage} · 等待 {len(runs.pending)} 项"
@@ -742,7 +766,7 @@ def main(argv=None):
                             console.print("排队消息已清空。")
                         elif command.startswith("/"):
                             console.print(
-                                "运行中可使用 /pet、/status、/cancel、/queue、/queue clear 或 /exit。"
+                                "运行中可使用 /pet、/status、/cancel、/revoke、/job-input、/queue、/queue clear 或 /exit。"
                             )
                         elif text:
                             enqueue(text)
@@ -773,7 +797,7 @@ def main(argv=None):
                         return 2
                     if session_logger:
                         session_logger.record(
-                            "cli_input", text=getattr(view, "last_input_raw", text)
+                            "cli_input", text=cli_input_text(getattr(view, "last_input_raw", text))
                         )
                     command = text.casefold()
                     if command == "/" or (command == "/help" and interactive):
@@ -891,7 +915,7 @@ def main(argv=None):
                                 )
                             store = None
                             mode = "user"
-                            staged_skills = []
+                            staged_skills = {}
                             home()
                         else:
                             if command == "/recent" and view.recent:
@@ -935,7 +959,7 @@ def main(argv=None):
                     if command in {"/project", "/project status", "/project rebuild"}:
                         library = memory_runtime()
                         if command == "/project rebuild":
-                            library.project_index.refresh(force=True)
+                            library.maintenance.enqueue('project_index', {'force': True})
                         view.render_data(
                             "Project Memory",
                             {
@@ -948,9 +972,20 @@ def main(argv=None):
                                 ),
                                 "task": library.tasks.context(),
                                 "files": library.project_index.overview(),
+                                'maintenance': library.maintenance.status(limit=10),
                                 "notes": library.memory.notes(),
                             },
                         )
+                        continue
+                    if command.split()[0] == '/pdf-unlock':
+                        from genesisai.app.document_commands import execute_pdf_unlock
+                        library = memory_runtime()
+                        temporary = library if state is None else None
+                        try:
+                            view.render_data('PDF 解锁', execute_pdf_unlock(library, text))
+                        finally:
+                            if temporary:
+                                temporary.close()
                         continue
                     if command.startswith("/memory"):
                         library = memory_runtime()
@@ -959,6 +994,19 @@ def main(argv=None):
                         view.render_data(
                             "Memory", execute_memory_command(library, text)
                         )
+                        continue
+                    if is_job_input(text):
+                        view.render_data('作业输入回执', execute_job_input(store, session_logger, text))
+                        continue
+                    if command.split()[0] in {'/authorize', '/authorizations', '/revoke', '/constraints'}:
+                        from genesisai.app.authorization_commands import execute_authorization_command
+                        library = memory_runtime()
+                        temporary = library if state is None else None
+                        try:
+                            view.render_data('授权与约束', execute_authorization_command(library, text))
+                        finally:
+                            if temporary:
+                                temporary.close()
                         continue
                     if command.split()[0] == "/permissions":
                         parts = command.split()
@@ -990,6 +1038,27 @@ def main(argv=None):
                             else ToolCatalog(ToolRegistry(), None, store).inventory()
                         )
                         view.render_tools(inventory)
+                        continue
+                    if command.split()[0] in {"/create_tool", "/create_skill", "/create_mcp"}:
+                        from genesisai.app.capability_commands import creation_prompt
+                        submit(creation_prompt(text))
+                        continue
+                    if command.split()[0] == "/capabilities":
+                        from genesisai.app.capability_commands import execute_capability_command
+                        library = memory_runtime()
+                        temporary = library if state is None else None
+                        try:
+                            pieces = text.split()
+                            if len(pieces) >= 3 and pieces[1] in {"test", "try"} and library.capabilities.store.get(pieces[2])["package"]["kind"] == "skill":
+                                activate()
+                                library = state.runtime
+                            def accept_capability(preview):
+                                view.render_data("能力操作预览", preview)
+                                return console.input("确认执行以上操作？输入“确认”继续，其他输入取消：").strip() == "确认"
+                            view.render_data("能力库", execute_capability_command(library, text, confirm=accept_capability))
+                        finally:
+                            if temporary:
+                                temporary.close()
                         continue
                     if command == "/budget":
                         view.render_budget(data)
@@ -1025,8 +1094,9 @@ def main(argv=None):
                                 permission_mode=mode,
                                 max_rounds=args.max_rounds,
                                 max_tools=args.max_tools,
+                        token_budget=args.token_budget,
                                 seconds=args.seconds,
-                                request_timeout=args.request_timeout,
+                                request_timeouts=request_timeouts,
                                 on_event=view.render_progress,
                             )
                             try:
@@ -1094,31 +1164,25 @@ def main(argv=None):
                         elif action == "show" and len(parts) > 2:
                             value = registry.describe(parts[2], include_content=True)
                         elif action == "load" and len(parts) > 2:
-                            names = [
-                                item.strip()
-                                for item in parts[2].split(",")
-                                if item.strip()
-                            ]
-                            value = registry.load(names, staged_skills)
-                            staged_skills = value
+                            selected = parts[2].split()
+                            if len(selected) != 2:
+                                raise ValueError('用法：/skills load 名称 阶段')
+                            name, stage = selected
+                            runtime = memory_runtime()
+                            resolution = registry.resolve(name, stage, available=runtime.catalog.available)
+                            staged_skills = registry.load(name, stage, staged_skills, available=runtime.catalog.available)
+                            value = {"loaded": staged_skills, **resolution}
                             if store:
-                                store.record.tool_runtime["active_skills"] = value
+                                store.record.tool_runtime["active_skills"] = staged_skills
                                 store.commit()
                         elif action == "unload":
-                            current = staged_skills
-                            value = (
-                                []
-                                if len(parts) < 3
-                                else [item for item in current if item != parts[2]]
-                            )
-                            staged_skills = value
+                            staged_skills = {} if len(parts) < 3 else {name: stage for name, stage in staged_skills.items() if name != parts[2]}
+                            value = staged_skills
                             if store:
-                                store.record.tool_runtime["active_skills"] = value
+                                store.record.tool_runtime["active_skills"] = staged_skills
                                 store.commit()
                         else:
-                            raise ValueError(
-                                "用法：/skills list|search 词|show 名称|load 名称[,名称]|unload [名称]"
-                            )
+                            raise ValueError("用法：/skills list|search 词|show 名称|load 名称 阶段|unload [名称]")
                         if state:
                             state.snapshot = replace(
                                 state.snapshot,
@@ -1197,7 +1261,7 @@ def main(argv=None):
                         session_logger.record("cli_closed", reason="eof_or_interrupt")
                     view.render_goodbye()
                     break
-                except (ValueError, RuntimeError, SkillError, OSError) as exc:
+                except (ValueError, RuntimeError, SkillError, ToolError, OSError) as exc:
                     if session_logger:
                         session_logger.error("cli_error", exc)
                     view.render_error(str(exc))

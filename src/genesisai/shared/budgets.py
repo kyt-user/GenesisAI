@@ -3,29 +3,9 @@
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
 
-
-@dataclass(frozen=True)
-class TaskProfile:
-    name: str
-    model_calls: int
-    search_queries: int
-    search_fetches: int
-    retries_per_candidate: int
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-
-PROFILES = {
-    "direct_answer": TaskProfile("direct_answer", 3, 0, 0, 0),
-    "web_quick": TaskProfile("web_quick", 8, 2, 4, 1),
-    "web_normal": TaskProfile("web_normal", 12, 4, 8, 1),
-    "web_deep": TaskProfile("web_deep", 20, 8, 12, 1),
-    "local_files": TaskProfile("local_files", 20, 4, 8, 1),
-    "creative": TaskProfile("creative", 25, 2, 4, 1),
-}
+# Profiles select a workflow, never grant or restrict execution budgets.
+PROFILES = frozenset({"direct_answer", "web_quick", "web_normal", "web_deep", "local_files", "creative"})
 
 
 def is_recall_request(text: str) -> bool:
@@ -35,7 +15,8 @@ def is_recall_request(text: str) -> bool:
 
 def initial_run_runtime(profile: str = "direct_answer", *, phase: str = "explore") -> dict:
     """构造一个新 Run 的确定性运行状态字典。"""
-    selected = PROFILES[profile]
+    if profile not in PROFILES:
+        raise ValueError("Unknown task profile: " + profile)
     return {
         "profile": profile,
         "phase": phase,
@@ -47,7 +28,7 @@ def initial_run_runtime(profile: str = "direct_answer", *, phase: str = "explore
         "capability_blocks": {},
         "context_summary": None,
         "context_report": {},
-        "budget": selected.to_dict(),
+        "budget": {"model_calls": None, "tools": None, "total_tokens": None},
         "usage": {
             "model_calls": 0,
             "search_queries": 0, "search_fetches": 0,
@@ -63,8 +44,6 @@ def initial_run_runtime(profile: str = "direct_answer", *, phase: str = "explore
         "recovery_counts": {"length": 0, "empty": 0, "tool_protocol": 0, "provider": 0},
         "counted_calls": [],
         "completed_queries": [],
-        "progress_mark": [0, 0],
-        "stalled_rounds": 0,
         "stop_reason": None,
         "partial_response": "",
         "last_tool_name": None,

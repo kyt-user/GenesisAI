@@ -27,12 +27,9 @@ def test_actual_client_environment_first_then_terminal(monkeypatch, provider, va
         monkeypatch.setenv(variable, environment)
     settings = ProviderSettings(provider=provider, model='fixture', api_key='terminal-key')
     model, _ = build_model(settings=settings)
-    try:
-        assert model.client.api_key == expected
-        assert onboarding.effective_key(settings) == expected
-        assert settings.api_key == 'terminal-key'
-    finally:
-        model.client.close()
+    assert model.api_key == expected
+    assert onboarding.effective_key(settings) == expected
+    assert settings.api_key == 'terminal-key'
 
 
 def test_empty_injected_environment_does_not_use_process(monkeypatch):
@@ -62,10 +59,7 @@ def test_dotenv_chain_reaches_actual_client(tmp_path, monkeypatch, provider, var
     (root/'.env').write_text(f'{variable}="{project}"\n', encoding='utf-8')
     cli.load_environment(workspace=work)
     model, _ = build_model(settings=ProviderSettings(provider=provider, model='fixture', api_key='terminal-key'))
-    try:
-        assert model.client.api_key == expected
-    finally:
-        model.client.close()
+    assert model.api_key == expected
 
 
 def test_explicit_env_file_replaces_auto_search(tmp_path, monkeypatch):
@@ -129,8 +123,7 @@ def test_interactive_start_does_not_prompt_when_env_exists(tmp_path, monkeypatch
     selected = []
     def capture(*args, **kwargs):
         model, _ = real_build(*args, **kwargs)
-        selected.append(model.client.api_key)
-        model.client.close()
+        selected.append(model.api_key)
         return FakeModel(), False
     monkeypatch.setattr(cli, 'build_model', capture)
     assert cli.main(['--workspace',str(work),'--config',str(config),'--config-dir',str(directory)]) == 0

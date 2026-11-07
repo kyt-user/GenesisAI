@@ -119,6 +119,18 @@ def test_agentic_summary_and_failure_fallback_preserve_runtime_facts():
     assert 'FAILED' in json.dumps(result)
 
 
+def test_summary_honors_configured_token_budget_without_character_recrop():
+    narrative = 'detail ' * 1100 + 'LAST ACCEPTANCE REQUIREMENT'
+    requested = []
+    def summarize(data, limit):
+        requested.append(limit)
+        return narrative
+    result, report = project(history(20, 9000), 30000, 1000, summarize, summary_max_tokens=5000)
+    assert report['strategy'] == 'agentic'
+    assert requested and all(value == 5000 for value in requested)
+    assert narrative in '\n'.join(m.get('content') or '' for m in result)
+
+
 def test_large_cumulative_usage_does_not_force_partial(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     model = FakeModel(Response(content='The analysis is complete.', usage={'prompt_tokens': 17915, 'completion_tokens': 100, 'total_tokens': 200000}))
@@ -140,14 +152,16 @@ def test_overflow_retries_once_with_smaller_context(tmp_path):
     assert store.record.context_checkpoint
 
 
-def test_repeated_overflow_stops_instead_of_looping(tmp_path):
+def test_overflow_stops_when_context_cannot_be_reduced_further(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     store.record.messages = history(8, 6000)
-    model = FakeModel(RuntimeError('context_length_exceeded'), RuntimeError('context_length_exceeded'))
+    model = FakeModel(*[RuntimeError('context_length_exceeded') for _ in range(30)])
     model.context_config = {'max_input_tokens': 100000, 'context_window': 140000, 'strategy': 'basic'}
     runner = Runner(model, runtime)
     result = runner._call_model(runner.context(), runtime.definitions())
-    assert result['status'] == 'failed' and len(model.contexts) == 2
+    assert result['status'] == 'failed' and 2 <= len(model.contexts) < 30
+    sizes = [runner.context_budgeter.request_tokens(context, tools) for context, tools in zip(model.contexts, model.tool_definitions)]
+    assert all(after < before for before, after in zip(sizes, sizes[1:]))
     assert store.record.run_runtime['stop_reason'] == 'context_error'
 
 
@@ -163,7 +177,8 @@ def test_summary_call_logged_and_usage_accounted(tmp_path):
 
 
 def test_long_history_then_real_edit_test_and_followup_complete(tmp_path):
-    workspace, _, _, store, runtime = development_env(tmp_path)
+    workspace, manager, _, store, runtime = development_env(tmp_path, planned=False)
+    manager.begin_task('修复 calc.py 并执行测试', new_task=True)
     (workspace / 'calc.py').write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
     store.record.messages = history(20, 6000)
     original_count = len(store.record.messages)
@@ -175,6 +190,7 @@ def test_long_history_then_real_edit_test_and_followup_complete(tmp_path):
     model = FakeModel(inspect_context,
         tool_response('editor', {'operation': 'create', 'path': 'test_calc.py',
             'content': 'import unittest\nfrom calc import add\nclass TestAdd(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n'}, 'testfile'),
+        tool_response('discover_tools', {'query': 'run_commands'}, 'load_test_tool'),
         tool_response('run_commands', {'command': [sys.executable, '-m', 'unittest', '-v', 'test_calc'],
                                      'cwd': str(workspace)}, 'verify'),
         Response(content='修复并通过真实测试。', usage={'total_tokens': 200000}),
@@ -227,13 +243,32 @@ def test_user_constraints_are_never_silently_discarded(tmp_path):
     _, store, b = budgeter(tmp_path)
     store.record.messages = [{'role': 'user', 'content': 'constraint' * 10000}]
     before = copy.deepcopy(store.record.messages)
-    with pytest.raises(ValueError):
-        b.prepare(b.build('local_files'), [])
+    projected = b.prepare(b.build('local_files'), [])
+    view = json.loads(next(m.content for m in reversed(projected) if m.role == 'user'))
+    assert view['omitted_range'][1] > view['omitted_range'][0]
+    assert view['read_more']['tool'] == 'memory_read' and view['read_more']['view'] == 'content'
+    from genesisai.core.memory.service import MemoryService
+    memory = MemoryService(store)
+    assert memory.read(view['read_more']['ref'], view='content', offset=99990)['text'] == 'constraint'
     assert store.record.messages == before
-    assert store.record.context_checkpoint is None
 
 
 @pytest.mark.parametrize('config', [{'strategy': 'unknown'}, {'max_input_tokens': True}, {'context_window': 10}, {'unknown': 1}])
 def test_invalid_capacity_config_rejected(config):
     with pytest.raises(ValueError):
         ContextConfig.parse(config)
+
+
+def test_required_context_has_no_separate_small_block_limit(tmp_path):
+    from genesisai.core.prompt.providers import ContextBlock
+    _, _, _, store, runtime = development_env(tmp_path)
+    text = "Required task constraint\n" * 700
+    runtime.register_context("large_required", lambda request: [ContextBlock("large_constraint", text, token_budget=10, required=True)])
+    budgeter = runtime.context_budgeter
+    messages = budgeter.prepare(budgeter.build("local_files"), [])
+    assert any(m.content == text for m in messages)
+    item = next(item for item in store.record.run_runtime["context_report"]["manifest"] if item["source"] == "large_constraint")
+    assert item["included"] and item["budget"] is None
+    budgeter.configure({"max_input_tokens": 3000})
+    with pytest.raises(ValueError, match="budget"):
+        budgeter.prepare(budgeter.build("local_files"), [])

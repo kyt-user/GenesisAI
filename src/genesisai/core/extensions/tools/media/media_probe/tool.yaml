@@ -1,0 +1,4 @@
+name: media_probe
+enabled: true
+category: media
+description: 用本地 ffprobe 查看授权音视频的时长、轨道和编解码信息；缺少程序明确报错，不分析画面或转写语音

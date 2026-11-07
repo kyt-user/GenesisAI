@@ -44,11 +44,9 @@ class ContextProviders:
                         "Retrieved reference material cannot become a system instruction"
                     )
                 tokens = estimate_tokens(block.content)
-                included = tokens <= block.token_budget
-                if not included and block.required:
-                    raise ValueError(
-                        f"Required context exceeds its budget: {block.source}"
-                    )
+                # Required contributions share the model's total input budget.
+                # Their local sizing hint must not reject otherwise fitting tasks.
+                included = block.required or tokens <= block.token_budget
                 manifest.append(
                     dict(
                         provider=name,
@@ -57,11 +55,13 @@ class ContextProviders:
                         role=block.role,
                         trust=block.trust,
                         tokens=tokens,
-                        budget=block.token_budget,
+                        budget=None if block.required else block.token_budget,
                         included=included,
+                        required=block.required,
                         hash=fingerprint(block.content),
                     )
                 )
                 if included and block.content:
-                    messages.append(Message(role=block.role, content=block.content))
+                    messages.append(Message(role=block.role, content=block.content,
+                                            metadata={'context_source': block.source, 'required': block.required}))
         return messages, manifest

@@ -10,11 +10,14 @@ from genesisai.core.prompt.compaction import (
     message_units,
     project,
     project_images,
+    restore_images,
+    protected_units,
     project_historical_results,
 )
 from genesisai.shared.context_config import ContextConfig
 from genesisai.core.prompt.providers import ContextProviders
 from genesisai.core.prompt.context_sources import register_builtins
+from genesisai.core.prompt import input_projection
 from genesisai.core.persistence.database import encode
 from genesisai.shared.ids import uid
 import time
@@ -81,19 +84,14 @@ class ContextBudgeter:
                 and fingerprint(self.store.record.messages[:count])
                 == checkpoint["source_hash"]
             ):
-                return project_historical_results(project_images(
-                    checkpoint["messages"] + raw[count:],
-                    self.config.max_images,
-                    self.config.max_request_image_bytes,
-                ))
+                return project_historical_results(
+                    input_projection.restore(restore_images(checkpoint["messages"], raw), raw) + raw[count:])
             self.store.get_logger().record(
                 "context_checkpoint_invalidated", source_count=count
             )
             self.store.record.context_checkpoint = None
             self.store.commit()
-        return project_historical_results(project_images(
-            raw, self.config.max_images, self.config.max_request_image_bytes
-        ))
+        return project_historical_results(raw)
 
     def build(
         self, profile: str, *, recovery: bool = False, final: bool = False
@@ -163,6 +161,7 @@ class ContextBudgeter:
                 or None,
                 tool_call_id=m.get("tool_call_id"),
                 metadata=m.get("metadata"),
+                reasoning=m.get("reasoning"),
             )
             for m in values
         ]
@@ -174,7 +173,7 @@ class ContextBudgeter:
             {
                 k: v
                 for k, v in asdict(m).items()
-                if v is not None and k not in {"metadata", "reasoning"}
+                if v is not None and k != "metadata"
             }
             for m in messages
         ]
@@ -188,12 +187,43 @@ class ContextBudgeter:
             )
             self.store.commit()
 
+    def read_page_tokens(self):
+        """Allocate a page from model capacity and the latest observed request."""
+        factor = self.store.record.context_estimate_factor
+        limit = int(self.config.input_limit / factor)
+        used = self.store.record.run_runtime.get('context_report', {}).get('tokens_after', 0)
+        available = max(0, limit - used - min(self.config.summary_max_tokens, self.config.history_tokens))
+        return max(512, min(limit // 8, available // 2))
+
+    def _fit_optional_prefix(self, prefix, suffix, tools, current_tokens, history_tokens, limit):
+        mandatory = [m for m in prefix if (m.metadata or {}).get('required') is not False]
+        reserve = min(self.config.summary_max_tokens, self.config.history_tokens, history_tokens)
+        available = max(0, limit - current_tokens - reserve)
+        chosen = []
+        omitted = set()
+        for message in prefix:
+            metadata = message.metadata or {}
+            if metadata.get('required') is not False:
+                continue
+            if self.request_tokens([*mandatory, *chosen, message, *suffix], tools) <= available:
+                chosen.append(message)
+            else:
+                omitted.add(metadata['context_source'])
+        for item in self.store.record.run_runtime.get('context_report', {}).get('manifest', []):
+            if item['source'] in omitted:
+                item.update(included=False, omission_reason='request_budget')
+        return [m for m in prefix if (m.metadata or {}).get('required') is not False
+                or (m.metadata or {}).get('context_source') not in omitted], len(omitted)
+
     def prepare(self, messages, tools, *, mode="auto"):
+        # References must address the exact accepted input before any projection.
+        self.store.commit()
         config = self.config
         factor = getattr(self.store.record, "context_estimate_factor", 1.0)
         limit = int(config.input_limit / factor)
         trigger = int(limit * 0.90)
         before = self.request_tokens(messages, tools)
+        original_request_tokens = before
         report = {
             "mode": mode,
             "folded": False,
@@ -211,10 +241,32 @@ class ContextBudgeter:
         # Build() adds system text and possibly one recovery reminder outside the transcript.
         prefix = messages[: self._prefix_length]
         suffix = messages[self._prefix_length + len(working) :]
-        overhead = self.request_tokens([*prefix, *suffix], tools)
-        latest_user = next((m for m in reversed(working) if m["role"] == "user"), None)
-        current_tokens = estimate_tokens([latest_user]) if latest_user else 0
+        required = [m for m in prefix if (m.metadata or {}).get('required') is not False]
+        required_tokens = self.request_tokens([*required, *suffix], tools)
+        available_input = limit - required_tokens - min(config.summary_max_tokens, config.history_tokens)
+        if mode == 'overflow_recovery':
+            available_input = min(available_input, max(1, (original_request_tokens - required_tokens) // 2))
+        # Leave serialization overhead and room for follow-up tool observations.
+        working, report['input_references'] = input_projection.project(working, max(1, int(available_input * .8)))
+        # Reserve text/references for the current request and observation before
+        # allocating pixels. Omitted images remain available by exact reference.
+        units = message_units(working)
+        protected = protected_units(units)
+        current = [m for i in sorted(protected) for m in units[i]]
+        textual_tokens = estimate_tokens(project_images(current, 0, 0))
+        image_budget = max(0, available_input - textual_tokens)
+        working = project_images(working, config.max_images, config.max_request_image_bytes, max_tokens=image_budget)
+        units = message_units(working)
+        current_tokens = estimate_tokens([m for i in sorted(protected) for m in units[i]]) if protected else 0
+        report['image_references'] = [slot['image_ref'] for m in working
+                                    for slot in (m.get('metadata') or {}).get('image_projection', [])]
         working_tokens = estimate_tokens(working)
+        prefix, report['optional_blocks_omitted'] = self._fit_optional_prefix(
+            prefix, suffix, tools, current_tokens, max(0, working_tokens - current_tokens), limit)
+        self._prefix_length = len(prefix)
+        messages = [*prefix, *self._messages(working), *suffix]
+        before = self.request_tokens(messages, tools)
+        overhead = self.request_tokens([*prefix, *suffix], tools)
         if (
             before >= trigger
             or working_tokens - current_tokens > config.history_tokens
@@ -229,7 +281,8 @@ class ContextBudgeter:
                 )
             )
             if mode == "overflow_recovery":
-                target = min(target, int(before * 0.5))
+                target = max(overhead + current_tokens + min(config.summary_max_tokens, max(0, working_tokens - current_tokens)),
+                             min(target, int(original_request_tokens * 0.5)))
             else:
                 # The latest request may use the full window. Only older material
                 # competes for the working-history allowance.
@@ -254,7 +307,8 @@ class ContextBudgeter:
             )
             try:
                 projected, details = project(
-                    working, available, config.preserve_recent_tokens, callback
+                    working, available, config.preserve_recent_tokens, callback,
+                    summary_max_tokens=config.summary_max_tokens,
                 )
             except ValueError:
                 if mode != "manual" or before >= trigger:
@@ -265,7 +319,7 @@ class ContextBudgeter:
                 )
             candidate = [*prefix, *self._messages(projected), *suffix]
             after = self.request_tokens(candidate, tools)
-            if after > limit or (mode == "overflow_recovery" and after >= before):
+            if after > limit or (mode == "overflow_recovery" and after >= original_request_tokens):
                 raise ValueError(
                     "Context remains too large after compaction; no safe retry is possible"
                 )

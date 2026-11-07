@@ -30,7 +30,10 @@ def library(tmp_path):
         Access([workspace], workspace, session.root, workspace_root=workspace),
         providers=[],
     )
-    return session, runtime
+    try:
+        yield session, runtime
+    finally:
+        runtime.close()
 
 
 def test_400k_capacity_is_distinct_from_working_history():
@@ -38,6 +41,38 @@ def test_400k_capacity_is_distinct_from_working_history():
     assert config.context_window == config.max_input_tokens == 400000
     assert config.input_limit == 394880
     assert config.history_tokens == 32000
+
+
+def test_project_context_prioritizes_tail_match_and_keeps_exact_reference(library):
+    from genesisai.core.prompt.context_sources import project_context
+    session, runtime = library
+    for i in range(55):
+        (session.workspace / f'file_{i:02}.py').write_text(f'value = {i}\n', encoding='utf-8')
+    target = session.workspace / 'zz_release_guard.py'
+    target.write_text('def release_guard():\n    return "tail requirement"\n', encoding='utf-8')
+    runtime.project_index.refresh()
+    session.record.messages.append({'role': 'user', 'content': '检查 release_guard 的实现'})
+    runtime.context_budgeter.configure({'project_context_tokens': 1500})
+    blocks = list(project_context({'session': session, 'runtime': runtime}))
+    entries = [json.loads(block.content) for block in blocks if block.source.startswith('project_reference:')]
+    assert entries[0]['title'] == 'zz_release_guard.py'
+    assert 'tail requirement' in runtime.memory.read(entries[0]['ref'])['text']
+    assert sum(len(block.content) for block in blocks) < 6000
+    assert 'memory_search' in blocks[0].content
+    assert runtime.project_index.overview(limit=10, offset=50)[-1]['path'] == 'zz_release_guard.py'
+
+
+def test_optional_references_shrink_individually_to_request_budget(library):
+    session, runtime = library
+    runtime.context_budgeter.configure({'max_input_tokens': 6500, 'strategy': 'basic'})
+    runtime.register_context('many_references', lambda request: [
+        ContextBlock('ref_' + str(i), f'REFERENCE {i} ' + 'x' * 2100, token_budget=1000) for i in range(20)])
+    messages = runtime.context_budgeter.prepare(runtime.context_budgeter.build('direct_answer'), [])
+    included = [m for m in messages if (m.content or '').startswith('REFERENCE')]
+    assert 0 < len(included) < 20
+    manifest = session.record.run_runtime['context_report']['manifest']
+    assert any(item.get('omission_reason') == 'request_budget' for item in manifest)
+    assert session.record.messages[0]['content'] in '\n'.join(m.content or '' for m in messages)
 
 
 def test_long_current_input_uses_window_and_keeps_history_bounded(library):
@@ -87,20 +122,20 @@ def test_index_versions_invalidate_knowledge_transitively_and_rebuild(library):
     assert runtime.project_index.refresh()["updated"] == 1
     assert runtime.project_index.refresh()["updated"] == 0
     (hit,) = runtime.memory.search("calculate", corpus="code")
-    note = runtime.memory.write_note(
+    note = runtime.memory.write_notes([dict(
         title="Architecture",
         body="calculate returns 1",
         kind="architecture",
         sources=[hit["ref"]],
         status="active",
-    )
-    dependent = runtime.memory.write_note(
+    )])['entries'][0]
+    dependent = runtime.memory.write_notes([dict(
         title="Consumer",
         body="Calls calculate",
         kind="experience",
         sources=[note["id"]],
         status="active",
-    )
+    )])['entries'][0]
     source.write_text("def calculate():\n    return 2\n", encoding="utf-8")
     runtime.project_index.refresh()
     assert runtime.memory.read(note["id"])["status"] == "stale"
@@ -137,10 +172,10 @@ def test_note_revision_conflict_correction_and_delete(library, tmp_path):
     session, runtime = library
     memory = runtime.memory
     ref = memory.search("约定")[0]["ref"]
-    note = memory.write_note(
+    note = memory.write_notes([dict(
         title="约束", body="SQLite", kind="constraint", sources=[ref]
-    )
-    updated = memory.write_note(
+    )])['entries'][0]
+    updated = memory.write_notes([dict(
         ref=note["id"],
         expected_revision=1,
         title="约束",
@@ -148,7 +183,7 @@ def test_note_revision_conflict_correction_and_delete(library, tmp_path):
         kind="constraint",
         sources=[ref],
         status="active",
-    )
+    )])['entries'][0]
     assert updated["revision"] == 2
     assert memory.read(note["id"], revision=1)["text"] == "SQLite"
     response = runtime.execute(
@@ -169,14 +204,14 @@ def test_note_revision_conflict_correction_and_delete(library, tmp_path):
         == 2
     )
     with pytest.raises(ValueError, match="版本"):
-        memory.write_note(
+        memory.write_notes([dict(
             ref=note["id"],
             expected_revision=1,
             title="约束",
             body="wrong",
             kind="constraint",
             sources=[ref],
-        )
+        )])
     destination = tmp_path / "export.md"
     memory.export(destination)
     assert "SQLite transactions" in destination.read_text(encoding="utf-8")
@@ -220,13 +255,13 @@ def test_git_worktrees_share_project_but_isolate_history(library, tmp_path):
     first.commit()
     a, b = MemoryService(first), MemoryService(second)
     ref = a.search("branch")[0]["ref"]
-    shared = a.write_note(
+    shared = a.write_notes([dict(
         title="Shared decision",
         body="Project policy",
         kind="decision",
         sources=[ref],
         shared=True,
-    )
+    )])['entries'][0]
     assert b.search("branch", corpus="history") == []
     assert b.search("Shared", corpus="project")[0]["ref"] == shared["id"]
     with pytest.raises(ValueError):
@@ -308,23 +343,26 @@ def test_extension_context_manifest_and_priority_boundary(library):
         runtime.context_budgeter.build("direct_answer")
 
 
-def test_required_rule_overflow_is_explicit(library):
+def test_large_required_rules_share_total_context_budget(library):
     session, runtime = library
     (session.workspace / "AGENTS.md").write_text("A" * 9000, encoding="utf-8")
-    with pytest.raises(ValueError, match="AGENTS"):
-        runtime.context_budgeter.build("local_files")
+    messages = runtime.context_budgeter.build("local_files")
+    assert any('A' * 9000 in message.content for message in messages if isinstance(message.content, str))
 
 
-def test_custom_maintenance_survives_interruption(library):
+def test_custom_maintenance_survives_interruption(library, monkeypatch):
     session, runtime = library
     runtime.register_maintenance(
         "fixture", lambda options: {"value": options["value"] + 1}
     )
-    identity = runtime.maintenance.enqueue("fixture", {"value": 4})
-    with session.database.transaction() as db:
-        db.execute("UPDATE jobs SET state='running' WHERE id=?", (identity,))
-    Maintenance.recover_after_host_lock(session.database)
-    (result,) = runtime.maintenance.run_pending()
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime.maintenance, 'start', lambda: None)
+        identity = runtime.maintenance.enqueue("fixture", {"value": 4})
+        with session.database.transaction() as db:
+            db.execute("UPDATE jobs SET state='running' WHERE id=?", (identity,))
+        Maintenance.recover_after_host_lock(session.database)
+    runtime.maintenance.start()
+    result = runtime.maintenance.wait(identity, 5)
     assert result["result"] == {"value": 5} and result["state"] == "completed"
 
 
@@ -462,15 +500,18 @@ def test_observed_change_invalidates_note_before_next_turn(library):
     path.write_text("value = 1", encoding="utf-8")
     runtime.project_index.refresh()
     ref = runtime.memory.search("value", corpus="code")[0]["ref"]
-    note = runtime.memory.write_note(
+    note = runtime.memory.write_notes([dict(
         title="Value", body="one", kind="architecture", sources=[ref], status="active"
-    )
+    )])['entries'][0]
     path.write_text("value = 2", encoding="utf-8")
     runtime.deliver_observations(
         [{"kind": "resource_changed", "path": str(path), "sha256": sha(path)}],
         call_id="change",
     )
     assert runtime.memory.read(note["id"])["status"] == "stale"
+    assert runtime.memory.read(ref)['current'] is False
+    for job in runtime.maintenance.status()['jobs']:
+        assert runtime.maintenance.wait(job['id'], 10)['state'] == 'completed'
     current = runtime.memory.search("value", corpus="code")[0]["ref"]
     assert current != ref and "value = 2" in runtime.memory.read(current)["text"]
 
@@ -492,3 +533,19 @@ def test_image_library_is_shared_only_within_workspace(library, tmp_path):
     unrelated = ImageStore(Session(session.root, workspace=other), runtime.access)
     with pytest.raises(ValueError, match="引用"):
         unrelated.read(image_ref=part["image_ref"])
+
+
+def test_project_index_large_file_tail_and_search_pagination(library):
+    session, runtime = library
+    source = session.workspace / 'large.custom'
+    source.write_text('filler ' * 160000 + '\nUNICORN_TAIL_MARKER\n', encoding='utf-8')
+    for i in range(25):
+        (session.workspace / f'page_{i:02d}.txt').write_text(f'PAGE_NEEDLE {i}', encoding='utf-8')
+    assert runtime.project_index.refresh()['updated'] == 26
+    hits = runtime.memory.search(' '.join(['unrelated'] * 12) + ' UNICORN_TAIL_MARKER', corpus='code')
+    assert hits and hits[0]['title'] == 'large.custom'
+    assert 'UNICORN_TAIL_MARKER' in runtime.memory.read(hits[0]['ref'], offset=1120000, limit=200000)['text']
+    first = runtime.memory.search('PAGE_NEEDLE', corpus='code', limit=20)
+    second = runtime.memory.search('PAGE_NEEDLE', corpus='code', limit=20, offset=20)
+    assert len(first) == 20 and len(second) == 5
+    assert len({item['ref'] for item in first + second}) == 25

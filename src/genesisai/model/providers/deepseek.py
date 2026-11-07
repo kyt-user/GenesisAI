@@ -7,7 +7,6 @@ from genesisai.model.openai_compatible import OpenAICompatibleClient
 class DeepSeekClient(OpenAICompatibleClient):
     provider = "deepseek"
     DEFAULT_BASE_URL = "https://api.deepseek.com"
-    DEFAULT_TIMEOUT = 60
     DEFAULT_THINKING = {"type": "enabled"}
     DEFAULT_REASONING_EFFORT = "low"
     API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -19,8 +18,7 @@ class DeepSeekClient(OpenAICompatibleClient):
         *,
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
-        timeout: float = DEFAULT_TIMEOUT,
-        max_retries: int = 0,
+        request_timeouts: dict | None = None,
         reasoning_enabled: bool = True,
         reasoning_effort: str = DEFAULT_REASONING_EFFORT,
     ):
@@ -31,8 +29,7 @@ class DeepSeekClient(OpenAICompatibleClient):
             model=model,
             base_url=base_url,
             api_key=resolved_key,
-            timeout=timeout,
-            max_retries=max_retries,
+            request_timeouts=request_timeouts,
             generation=generation,
         )
         self.reasoning_enabled = reasoning_enabled
@@ -45,7 +42,15 @@ class DeepSeekClient(OpenAICompatibleClient):
         }
 
     def _no_tool_options(self) -> dict:
-        # 最终回答和恢复轮次不能调用工具。在此禁用提供商侧思考，
-        # 同时避免文本 DSML 尝试并降低成本。
+        # An explicitly tool-free request can disable provider-side thinking.
         return {"extra_body": {"thinking": {"type": "disabled"}}}
+
+    def _request_messages(self, messages):
+        values = super()._request_messages(messages)
+        for item in values:
+            if item.get("role") == "assistant":
+                # Host-generated tool turns have no model reasoning. The current
+                # thinking-mode wire contract still requires the field to exist.
+                item.setdefault("reasoning_content", "")
+        return values
 

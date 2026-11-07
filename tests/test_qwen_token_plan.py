@@ -29,12 +29,9 @@ def test_yaml_build_uses_plan_endpoint_and_credentials(tmp_path, monkeypatch):
     config = tmp_path / 'model.yaml'
     config.write_text('provider: qwen_token_plan\nmodel: qwen3.8-flash\n', encoding='utf-8')
     model, remote = build_model(config)
-    try:
-        assert remote is True
-        assert model.client.api_key == 'sk-sp-test-plan'
-        assert str(model.client.base_url).rstrip('/') == get_provider('qwen_token_plan').base_url
-    finally:
-        model.client.close()
+    assert remote is True
+    assert model.api_key == 'sk-sp-test-plan'
+    assert str(model.base_url).rstrip('/') == get_provider('qwen_token_plan').base_url
 
 
 def test_missing_plan_key_does_not_use_dashscope(monkeypatch):
@@ -65,7 +62,7 @@ def test_terminal_selects_plan_and_persists_correct_endpoint(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize('stream', [False, True])
-def test_sdk_tool_call_roundtrip(stream):
+def test_sdk_tool_call_roundtrip(stream, monkeypatch):
     requests = []
     tool_call = {'id': 'call_read', 'type': 'function', 'function': {'name': 'read_files', 'arguments': '{"path":"main.py"}'}}
     def handle(request):
@@ -85,22 +82,19 @@ def test_sdk_tool_call_roundtrip(stream):
         return httpx.Response(200, json={'id': 'reply', 'object': 'chat.completion', 'created': 0, 'model': payload['model'], 'choices': [{'index': 0, 'message': message, 'finish_reason': finish}]})
 
     model, _ = build_model(settings=ProviderSettings(provider='qwen_token_plan', model='qwen3.8-flash', api_key='sk-sp-test'))
-    model.client.close()
-    model.client = model.client.with_options(http_client=httpx.Client(transport=httpx.MockTransport(handle)))
+    from model_transport import mock_model_http
+    mock_model_http(monkeypatch, handle)
     tools = [{'type': 'function', 'function': {'name': 'read_files', 'parameters': {'type': 'object', 'properties': {'path': {'type': 'string'}}}}}]
     messages = [Message(role='user', content='read main.py')]
     def invoke():
         if stream:
             return list(model.stream_chat(messages, tools=tools))[-1]
         return model.chat(messages, tools=tools)
-    try:
-        reply = invoke()
-        assert reply.tool_calls[0].name == 'read_files'
-        messages.extend([Message(role='assistant', content=reply.content, tool_calls=reply.tool_calls), Message(role='tool', content='print(1)', tool_call_id='call_read')])
-        assert invoke().content == 'done'
-        assert requests[1]['messages'][-1]['tool_call_id'] == 'call_read'
-    finally:
-        model.client.close()
+    reply = invoke()
+    assert reply.tool_calls[0].name == 'read_files'
+    messages.extend([Message(role='assistant', content=reply.content, tool_calls=reply.tool_calls), Message(role='tool', content='print(1)', tool_call_id='call_read')])
+    assert invoke().content == 'done'
+    assert requests[1]['messages'][-1]['tool_call_id'] == 'call_read'
 
 
 def test_plan_key_is_redacted_before_model_binding(tmp_path, monkeypatch):

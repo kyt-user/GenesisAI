@@ -1,4 +1,4 @@
 name: memory_read
 enabled: true
 category: kernel
-description: 按引用分页读取历史原文或知识；旧代码快照不代表当前文件
+description: 按引用分页读取历史原文或知识；页大小随上下文容量和剩余空间调整，沿 next_offset 可读至全文末尾；view=content 读取用户消息原文；旧代码快照不代表当前文件

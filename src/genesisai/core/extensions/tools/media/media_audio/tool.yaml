@@ -1,0 +1,4 @@
+name: media_audio
+enabled: true
+category: media
+description: 用本地 ffmpeg 按时间范围提取音轨为单声道16kHz WAV新文件；沿 next_seconds 继续，不具备语音转写能力

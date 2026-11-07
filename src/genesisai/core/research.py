@@ -10,26 +10,33 @@ from urllib.parse import urlsplit
 
 from genesisai.shared.budgets import PROFILES, initial_run_runtime
 from genesisai.shared.errors import SearchError
+from genesisai.shared.security import ToolError
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.shared.results import error_result
 from genesisai.shared.web import canonicalize_url, normalized_text
+from genesisai.core.extensions.tools.web.source_pages import page_source
+
+
+FETCH_TOOLS = frozenset({'fetch_web_content', 'fetch_private_resource', 'render_web_page'})
+
+
+def fetch_canonicalizer(name):
+    if name == 'fetch_private_resource':
+        from genesisai.core.extensions.tools.web.private_network import canonicalize_private_url
+        return canonicalize_private_url
+    return canonicalize_url
 
 
 URL_PATTERN = re.compile(r"https?://[^\s<>()\[\]{}\"']+", re.IGNORECASE)
-SEARCH_HOSTS = frozenset({
-    "google.com", "www.google.com", "bing.com", "www.bing.com",
-    "duckduckgo.com", "www.duckduckgo.com", "search.brave.com",
-})
 NON_RETRYABLE = frozenset({
-    "unsafe_url", "unsupported_format", "unsupported_encoding", "no_text",
-    "size_limit", "redirect_limit", "unsafe_redirect", "candidate_not_registered",
-    "search_result_page_forbidden", "domain_limit", "duplicate_content",
+    "unsafe_url", "unsupported_format", "unsupported_encoding",
+    "size_limit", "redirect_limit", "invalid_response",
 })
 
 
 def _web_intent(name: str, args: object) -> str | None:
     """把内核网络工具的调用归类为检索(query)或抓取(fetch)。"""
-    if name != "fetch_web_content" or not isinstance(args, dict):
+    if name not in FETCH_TOOLS or not isinstance(args, dict):
         return None
     if isinstance(args.get("url"), str):
         return "fetch"
@@ -51,17 +58,9 @@ class ResearchController:
         return self.store.record.run_runtime
 
     def switch_profile(self, profile: str) -> None:
-        current = self.state["profile"]
-        if current == profile:
-            return
+        if profile not in PROFILES:
+            raise ValueError("Unknown task profile: " + profile)
         self.state["profile"] = profile
-        # 切换流程不能降低现有能力额度，也不能重置实际消耗或用户的硬上限。
-        target = PROFILES[profile].to_dict()
-        current_budget = self.state["budget"]
-        for key in ("search_queries", "search_fetches", "retries_per_candidate"):
-            target[key] = max(target[key], current_budget[key])
-        target["model_calls"] = self.state.get("model_call_limit", max(target["model_calls"], current_budget["model_calls"]))
-        self.state["budget"] = target
         self.store.commit()
 
     def register_user_urls(self, text: str) -> None:
@@ -88,27 +87,37 @@ class ResearchController:
             if "web" not in routes:
                 routes.append("web")
         # 缓存读取和无效 URL 不消耗实际网络预算。
-        if intent == "fetch":
+        if intent == "fetch" and name == "fetch_web_content":
             checked = self._check_fetch(call, args["url"])
             if checked is not None:
                 return checked
-        budget_key = {"query": "search_queries", "fetch": "search_fetches"}.get(intent)
-        if budget_key and self.state["usage"][budget_key] >= self.state["budget"][budget_key]:
-            limit = self.state["budget"][budget_key]
-            used = self.state["usage"][budget_key]
-            message = (f"当前未分配 {budget_key} 额度" if limit == 0 else f"{budget_key} 额度已用完（{used}/{limit}）")
-            self.state.setdefault("capability_blocks", {})[budget_key] = message
-            return error_result(call, "budget_exhausted", message + "；本次未发起网络请求。可继续其他已授权步骤或使用已有资料回答。")
-        if intent == "query" and isinstance(args.get("query"), str):
-            query = normalized_text(args["query"]).casefold()
-            if query in self.state["completed_queries"]:
-                return error_result(call, "duplicate_query", "相同查询已经执行；请使用现有候选和证据回答")
-        if intent == "fetch":
-            return self._check_fetch(call, args["url"])
         return None
 
     def after_execute(self, call: dict, result: dict) -> dict:
         if result.get("pending"):
+            return result
+        data = result.get('data') or {}
+        if data.get('kind') == 'builtin_tool' and data.get('status') in {'queued', 'running', 'stopping', 'unknown'}:
+            return result
+        if call.get('name') == 'read_job' and data.get('kind') == 'builtin_tool' and data.get('origin_call'):
+            original = data['origin_call']
+            if original.get('name') not in FETCH_TOOLS:
+                return result
+            identity = data['job_id']
+            completed = self.state.setdefault('research_jobs', [])
+            if identity in completed:
+                return result
+            payload = data.get('result') or {}
+            error = data.get('operation_error')
+            if error is None and data.get('status') in {'failed', 'stopped', 'cancelled'}:
+                error = {'code': 'job_' + data['status'], 'message': '网页作业未完成', 'retryable': False}
+            completed.append(identity)
+            try:
+                self.after_execute(original, {'call_id': original['id'], 'ok': error is None, 'data': payload,
+                                              'error': error, 'source_refs': payload.get('source_refs', []), 'artifact_refs': []})
+            except BaseException:
+                completed.remove(identity)
+                raise
             return result
         call_id = call.get("id")
         cached = bool((result.get("data") or {}).get("cached"))
@@ -120,6 +129,11 @@ class ResearchController:
         except Exception:
             args = {}
         intent = _web_intent(name, args)
+        if intent:
+            completed = self.state.setdefault('research_completed_calls', [])
+            if call_id in completed:
+                return result
+            completed.append(call_id)
         if call_id not in self.state["counted_calls"]:
             self.state["counted_calls"].append(call_id)
             counter = {"query": "search_queries", "fetch": "search_fetches"}.get(intent)
@@ -150,22 +164,6 @@ class ResearchController:
         self.state["usage"]["total_tokens"] += max(tokens, 0)
         self.store.commit()
 
-    def note_progress_round(self) -> None:
-        if self.state["profile"] not in {"web_quick", "web_normal", "web_deep"}:
-            return
-        if self.state["usage"].get("search_queries", 0) == 0 and self.state["usage"].get("search_fetches", 0) == 0:
-            return
-        mark = [self.state["candidate_count"], len(self.state["evidence_refs"]), self.state['usage']['observations'],
-                len(self.store.record.sources), len(self.store.record.changes)]
-        if mark == self.state.get("progress_mark"):
-            self.state["stalled_rounds"] += 1
-        else:
-            self.state["stalled_rounds"] = 0
-            self.state["progress_mark"] = mark
-        if self.state["stalled_rounds"] >= 3:
-            self._source_unavailable("no_new_evidence")
-        self.store.commit()
-
     def should_force_answer(self) -> bool:
         # 相关性和字段覆盖属于当前问题，而非品牌。
         return self.state["phase"] == "answer" or bool(self.state.get("stop_reason"))
@@ -177,51 +175,44 @@ class ResearchController:
 
     def _source_unavailable(self, reason: str) -> None:
         self.state.setdefault("capability_blocks", {})["web"] = reason
-        if self.state["profile"].startswith("web") and "coding" not in self.state.get("protocols", []):
-            self.force_answer(reason)
-
-    def remaining(self) -> dict:
-        budget, usage = self.state["budget"], self.state["usage"]
-        return {
-            key: max(0, budget[key] - usage.get(key, 0))
-            for key in ("model_calls", "search_queries", "search_fetches")
-        }
 
     def _check_fetch(self, call: dict, raw_url: str) -> dict | None:
+        args = json.loads(call['arguments'])
+        if args.get('query'):
+            return error_result(call, 'validation_error', 'query 与 url 必须且只能指定一个')
         try:
             url = canonicalize_url(raw_url)
         except Exception:
             return error_result(call, "unsafe_url", "URL 不是允许的 HTTP(S) 公网地址")
-        parts = urlsplit(url)
-        host = (parts.hostname or "").lower()
-        if host in SEARCH_HOSTS or (host.endswith(".google.com") and parts.path.startswith("/search")):
-            return error_result(call, "search_result_page_forbidden", "禁止抓取搜索引擎结果页；请读取已登记的正文候选")
         candidate = self.state["candidates"].get(url)
-        if not candidate:
-            return error_result(call, "candidate_not_registered", "URL 未登记。请使用已有候选，或先 fetch_web_content 搜索目标页面，再抓取返回的 URL；批准不能替代登记。")
-        if candidate.get("status") == "fetched":
-            evidence = next((item for item in self.state["evidence"].values() if item["canonical_url"] == url), None)
-            if evidence:
-                args = json.loads(call['arguments'])
-                offset, limit = args.get('offset', 0), args.get('limit', 4000)
-                page_path = self.store.root / 'sources' / (evidence['source_ref'] + '.json')
+        if candidate is None:
+            try:
+                self._register_candidate(url, source_type="tool_request")
+            except ValueError:
+                return error_result(call, "unsafe_url", "URL不属于允许访问的网络地址")
+            candidate = self.state["candidates"][url]
+        failure = self.state['failed_resources'].get(url)
+        permanent = failure and not failure.get('retryable') and (failure.get('http_status') or failure.get('code') in NON_RETRYABLE)
+        if permanent and not args.get('refresh'):
+            return error_result(call, failure['code'], '此资源已确认不可重试；如外部状态已变化，可显式 refresh 重新请求。' +
+                                (f" HTTP {failure['http_status']}" if failure.get('http_status') else ''))
+        if not args.get('refresh'):
+            source = next(((ref, item) for ref, item in reversed(list(self.store.record.sources.items()))
+                           if item.get('kind') == 'web' and url in {item.get('requested_url'), item.get('url')}), None)
+            if source:
+                ref, _ = source
+                page_path = self.store.root / 'sources' / (ref + '.json')
                 page = json.loads(page_path.read_text(encoding='utf-8'))
-                text = page['text']
+                try:
+                    data = page_source(page, ref, args, cached=True)
+                except ToolError as exc:
+                    return error_result(call, exc.error_type, str(exc))
                 return {
                     "call_id": call.get("id", ""), "ok": True,
-                    "data": {
-                        "text": text[offset:offset + limit], "url": url, "title": evidence["title"],
-                        "source_refs": [evidence["source_ref"]], "truncated": bool(page.get('truncated')) or len(text) > offset + limit,
-                        "next_offset": offset + limit if len(text) > offset + limit else None, "cached": True, "duplicate": True,
-                        "links": [link for link in page.get('links', []) if isinstance(link, dict) and link.get('url') in self.state['candidates']],
-                    },
-                    "error": None, "source_refs": [evidence["source_ref"]],
-                    "artifact_refs": [], "truncated": bool(page.get('truncated')) or len(text) > offset + limit,
+                    "data": {**data, 'duplicate': True},
+                    "error": None, "source_refs": [ref],
+                    "artifact_refs": [], "truncated": data['truncated'],
                 }
-        failure = self.state["failed_resources"].get(url)
-        if failure:
-            if not failure.get("retryable") or failure.get("attempts", 0) >= 2:
-                return error_result(call, "retry_exhausted", "该候选已经失败且不允许再次重试")
         return None
 
     def _after_query(self, call: dict, result: dict) -> None:
@@ -234,7 +225,11 @@ class ResearchController:
             ledger = self.store.record.calls.get(call.get('id'), {})
             if query and ledger.get('executed') and query not in self.state["completed_queries"]:
                 self.state["completed_queries"].append(query)
-            diagnostics = self.state.get('search_diagnostics') or {}
+            diagnostics = (result.get('data') or {}).get('diagnostics') or self.state.get('search_diagnostics') or {}
+            if diagnostics:
+                self.state['search_diagnostics'] = diagnostics
+                self.store.event('search_diagnostics', provider='none', new_candidates=0,
+                                 repeated_candidates=False, provider_errors=diagnostics.get('fallback_errors', []))
             if diagnostics.get('all_providers_failed') and self._all_candidates_exhausted():
                 self._source_unavailable('search_service_unavailable')
             return
@@ -272,21 +267,39 @@ class ResearchController:
 
     def _after_fetch(self, call: dict, result: dict) -> None:
         data = result.get('data') or {}
-        if result.get('ok') and isinstance(data.get('text'), str):
+        if result.get('ok') and isinstance(data.get('text'), str) and data['text'].strip():
             span = hashlib.sha256((str(data.get('url')) + '\n' + data['text']).encode('utf-8')).hexdigest()
             spans = self.state.setdefault('observed_spans', [])
             if span not in spans:
                 spans.append(span)
                 self.state['usage']['observations'] += 1
-        if data.get('cached'):
-            return
         try:
-            requested = canonicalize_url(json.loads(call["arguments"])["url"])
+            canonicalize = fetch_canonicalizer(call.get("name"))
+            requested = canonicalize(json.loads(call["arguments"])["url"])
         except Exception:
             return
+        boundary = 'private' if call.get('name') == 'fetch_private_resource' else 'public'
+        if result.get('ok'):
+            self._register_candidate(requested, source_type='tool_request', network_boundary=boundary)
         candidate = self.state["candidates"].get(requested)
+        if result.get('ok'):
+            self.state['failed_resources'].pop(requested, None)
+            args = json.loads(call['arguments'])
+            depth = (candidate or {}).get('depth', 0)
+            ceiling = args.get('discovery_depth')
+            refs = result.get('source_refs') or data.get('source_refs') or []
+            if ceiling is None or depth < ceiling:
+                for link in data.get('links', []):
+                    try:
+                        self._register_candidate(link['url'], source_type='page_link', title=str(link.get('title', '')),
+                                                 parent_source_ref=refs[0] if refs else None,
+                                                 parent_url=data.get('url', requested), depth=depth + 1, network_boundary=boundary)
+                    except (KeyError, TypeError, ValueError, RuntimeError):
+                        continue
+            if data.get('cached') and (not data.get('text', '').strip() or all(ref in self.state['evidence_refs'] for ref in refs)):
+                return
         if not result.get("ok"):
-            # 预检拒绝（例如 retry_exhausted）没有触及网络，
+            # 预检拒绝没有触及网络，
             # 不能覆盖上次实际执行的失败记录。
             if not self.store.record.calls.get(call.get('id'), {}).get('executed', False):
                 return
@@ -305,34 +318,22 @@ class ResearchController:
                 **({"http_status": int(status_match.group(1))} if status_match else {}),
             }
             if candidate:
-                candidate["status"] = "retryable" if retryable and attempts < 2 else "failed"
-            if self._all_candidates_exhausted() and self.state['usage'].get('search_queries', 0) >= self.state['budget'].get('search_queries', 0):
+                candidate["status"] = "retryable" if retryable else "failed"
+            if self._all_candidates_exhausted():
                 self._source_unavailable('external_source_unavailable')
             return
         data = result.get("data") or {}
         refs = result.get("source_refs") or data.get("source_refs") or []
         if not refs or not isinstance(data.get("text"), str):
             return
-        final_url = canonicalize_url(data.get("url") or requested)
+        if not data['text'].strip():
+            if candidate:
+                candidate.update(status='downloaded', source_ref=refs[0])
+            return
+        final_url = canonicalize(data.get("url") or requested)
         if final_url != requested and final_url not in self.state["candidates"]:
             self.state["candidates"][final_url] = {**(candidate or {}), "canonical_url": final_url, "source_type": "redirect"}
         source = self.store.record.sources.get(refs[0], {})
-        depth = (candidate or {}).get('depth', 0)
-        registered_links = []
-        if depth < 2:
-            for link in data.get('links', [])[:40]:
-                if not isinstance(link, dict):
-                    continue
-                try:
-                    linked_url = canonicalize_url(link.get('url', ''))
-                    if urlsplit(linked_url)[:2] != urlsplit(final_url)[:2]:
-                        continue
-                    self._register_candidate(linked_url, source_type='page_link', title=str(link.get('title', ''))[:100],
-                                             parent_source_ref=refs[0], parent_url=final_url, depth=depth + 1)
-                    registered_links.append(link)
-                except (ValueError, RuntimeError):
-                    continue
-        data['links'] = registered_links
         full_hash = source.get("sha256")
         if full_hash and full_hash in self.state["content_hashes"]:
             if candidate:
@@ -356,33 +357,32 @@ class ResearchController:
             return True
         for candidate in candidates:
             status = candidate.get('status', 'candidate')
-            if status == 'candidate':
+            if status in {'candidate', 'downloaded'}:
                 return False
             if status == 'retryable':
                 failure = self.state.get('failed_resources', {}).get(candidate.get('canonical_url'), {})
-                if failure.get('retryable') and failure.get('attempts', 0) < 2:
+                if failure.get('retryable'):
                     return False
         return True
 
-    def _register_candidate(self, raw_url: str, *, source_type: str, **metadata) -> str:
-        url = canonicalize_url(raw_url)
+    def _register_candidate(self, raw_url: str, *, source_type: str, network_boundary='public', **metadata) -> str:
+        # Discovery is a reference inventory, never permission to fetch.
+        try:
+            url = fetch_canonicalizer('fetch_private_resource' if network_boundary == 'private' else 'fetch_web_content')(raw_url)
+        except SearchError:
+            url = fetch_canonicalizer('fetch_private_resource')(raw_url)
+            network_boundary = 'private'
         host = urlsplit(url).hostname or ""
-        if host == "localhost" or host.endswith(".localhost"):
-            raise ValueError("non-public address")
         try:
             if not ipaddress.ip_address(host).is_global:
-                raise ValueError("non-public address")
-        except ValueError as exc:
-            if exc.args == ("non-public address",):
-                raise
+                network_boundary = "private"
+        except ValueError:
+            if host == "localhost" or host.endswith(".localhost"):
+                network_boundary = "private"
         if url not in self.state["candidates"]:
             self.state["candidates"][url] = {
                 "canonical_url": url, "domain": host.lower(), "source_type": source_type,
-                "status": "candidate", **metadata,
+                "status": "candidate", "network_boundary": network_boundary, **metadata,
             }
             self.state["candidate_count"] = len(self.state["candidates"])
-        # A previously guessed URL becomes usable once actual search/user evidence
-        # establishes its provenance; this is not a retry of a failed HTTP request.
-        if self.state['failed_resources'].get(url, {}).get('code') == 'candidate_not_registered':
-            self.state['failed_resources'].pop(url, None)
         return url

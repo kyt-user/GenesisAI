@@ -1,0 +1,4 @@
+name: calculate_price
+enabled: true
+category: kernel
+description: 用Decimal计算有证据费用合计、数量乘单价或汇率换算；每个操作数绑定已读source_ref和逐字quote，或user当前消息给定值；返回公式、舍入与派生来源引用，用户假设不能称为核实市场报价

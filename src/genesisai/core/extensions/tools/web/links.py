@@ -1,4 +1,4 @@
-"""从已抓取 HTML 文档中有界发现同源链接。"""
+"""完整发现 HTTP(S) 链接；发现本身不授予访问权限。"""
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlsplit
 
@@ -6,9 +6,10 @@ from genesisai.core.extensions.tools.web.contracts import canonicalize_url
 
 
 class _Links(HTMLParser):
-    def __init__(self, base):
+    def __init__(self, base, canonicalize):
         super().__init__(convert_charrefs=True)
-        self.base = canonicalize_url(base)
+        self.canonicalize = canonicalize
+        self.base = canonicalize(base)
         self.origin = urlsplit(self.base)[:2]
         self.main_depth = 0
         self.anchor = None
@@ -22,19 +23,20 @@ class _Links(HTMLParser):
         self.anchor = None
         attrs = dict(attrs)
         href = attrs.get('href', '')
-        if not href or href.startswith('#') or len(self.links) >= 200:
+        if not href or href.startswith('#'):
             return
         try:
-            url = canonicalize_url(urljoin(self.base, href))
-            if urlsplit(url)[:2] != self.origin or url == self.base or len(url) > 600:
+            url = self.canonicalize(urljoin(self.base, href))
+            if url == self.base:
                 return
         except (ValueError, RuntimeError):
             return
-        self.anchor = {'url': url, 'title': (attrs.get('aria-label') or '')[:100], 'main': bool(self.main_depth)}
+        self.anchor = {'url': url, 'title': attrs.get('aria-label') or '', 'main': bool(self.main_depth),
+                       'cross_domain': urlsplit(url)[:2] != self.origin}
 
     def handle_data(self, data):
         if self.anchor:
-            self.anchor['title'] = (self.anchor['title'] + ' ' + data.strip()).strip()[:100]
+            self.anchor['title'] = (self.anchor['title'] + ' ' + data.strip()).strip()
 
     def handle_endtag(self, tag):
         if tag == 'main':
@@ -46,15 +48,10 @@ class _Links(HTMLParser):
             self.anchor = None
 
 
-def discover_links(html, base):
-    parser = _Links(base)
+def discover_links(html, base, *, canonicalize=canonicalize_url):
+    parser = _Links(base, canonicalize)
     parser.feed(html)
-    result, size = [], 0
-    for link in sorted(parser.links.values(), key=lambda item: not item['main']):
-        cost = len(link['url']) + len(link['title']) + 40
-        if size + cost > 6000 or len(result) >= 40:
-            break
-        result.append({'url': link['url'], 'title': link['title'] or link['url']})
-        size += cost
-    return result
+    parser.close()
+    return [{'url': link['url'], 'title': link['title'] or link['url'], 'cross_domain': link['cross_domain']}
+            for link in sorted(parser.links.values(), key=lambda item: not item['main'])]
 

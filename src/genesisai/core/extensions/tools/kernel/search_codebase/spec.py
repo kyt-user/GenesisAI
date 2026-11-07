@@ -17,7 +17,7 @@ SPEC = ToolSpec(
         file_offset={"type": "integer", "minimum": 0},
         context_lines={"type": "integer", "minimum": 0, "maximum": 40},
         limit={"type": "integer", "minimum": 1, "maximum": 100},
-        offset={"type": "integer", "minimum": 0, "maximum": 200000},
+        offset={"type": "integer", "minimum": 0},
         depth={"type": "integer", "minimum": 1, "maximum": 1000},
     ),
     permission="read",

@@ -69,7 +69,7 @@ def test_batch_approval_and_foreground_background_use_same_resolver(runtime_env)
             try:
                 job = result['data']['job_id']
                 deadline = time.monotonic() + 5
-                while runtime.jobs.status(job)['status'] == 'running' and time.monotonic() < deadline:
+                while runtime.jobs.status(job)['status'] in {'queued', 'running', 'stopping'} and time.monotonic() < deadline:
                     time.sleep(.02)
                 output = runtime.jobs.output(job)
                 assert output['exit_code'] == 0 and 'fixture-ready' in output['text']
@@ -82,12 +82,12 @@ def test_batch_approval_and_foreground_background_use_same_resolver(runtime_env)
     assert store.record.calls['bad_quote']['executed'] is False
 
 
-def test_failure_limit_and_followup_include_actual_ledger(runtime_env):
+def test_distinct_failures_continue_and_followup_includes_actual_ledger(runtime_env):
     store, runtime = runtime_env
-    model = FakeModel(*[Response(tool_calls=[tool_call('run_commands', {'command': ['missing-genesis-fixture', str(i)]}, f'bad{i}')]) for i in range(3)])
+    model = FakeModel(*[Response(tool_calls=[tool_call('run_commands', {'command': ['missing-genesis-fixture', str(i)]}, f'bad{i}')]) for i in range(3)], Response(content='[[PARTIAL]] missing-genesis-fixture 返回 command_not_found，入口仍需确认。'))
     runner = Runner(model, runtime)
     result = runner.start('运行项目测试，调用 run_commands')
-    assert result['status'] == 'limit_reached', result
+    assert result['status'] == 'partial', result
     assert 'missing-genesis-fixture' in result['answer'] and 'command_not_found' in result['answer']
     assert '没有取得可用证据' not in result['answer']
     runner.model = FakeModel(Response(content='入口未找到，不能据此判断整个执行通道故障。'))
@@ -115,25 +115,24 @@ def test_file_reference_recovery_lists_current_sources_and_rereads_stale_once(ru
     assert result['status'] == 'completed', result
     assert old not in result['answer'] and valid in result['answer']
     assert valid in '\n'.join(str(m.content) for m in model.contexts[1])
-    assert [d['function']['name'] for d in model.tools[1]] == ['read_files']
-    assert model.tools[2] == []
+    assert 'read_files' in {d['function']['name'] for d in model.tools[1]}
+    assert model.tools[2]
 
 
 @pytest.mark.parametrize('budget', [1, 12])
 def test_truncated_invalid_citation_is_never_delivered_or_saved(runtime_env, budget):
     store, runtime = runtime_env
     bad = 'src_0000000000000000'
-    model = FakeModel(Response(content=f'不可交付 [{bad}]。', finish_reason='length'),
-                      Response(content=f'仍不可交付 [{bad}]。', finish_reason='length'))
+    model = FakeModel(*[Response(content=f'不可交付 [{bad}]。', finish_reason='length') for _ in range(4)])
     result = Runner(model, runtime, max_rounds=budget).start('解释这个概念')
-    assert result['status'] == 'partial', result
+    assert result['status'] == ('limit_reached' if budget == 1 else 'partial'), result
     assert bad not in result['answer'] and bad not in json.dumps(store.record.messages)
     if budget > 1:
-        assert '完整重写' in '\n'.join(str(m.content) for m in model.contexts[-1])
+        assert model.tools[-1] and len(model.contexts) == 4
 
 
 @pytest.mark.parametrize('escape', [False, True])
-def test_stale_reread_is_bounded_to_paths_and_uses_normal_permissions(runtime_env, tmp_path, escape):
+def test_stale_reread_can_choose_paths_but_preserves_access_permissions(runtime_env, tmp_path, escape):
     store, runtime = runtime_env
     outside = tmp_path / 'external.txt'
     outside.write_text('old', encoding='utf-8')
@@ -151,15 +150,10 @@ def test_stale_reread_is_bounded_to_paths_and_uses_normal_permissions(runtime_en
         Response(tool_calls=[tool_call('read_files', {'paths': [str(other if escape else outside)]}, 'reread')]),
         Response(content='[[PARTIAL]] 文件尚未核实，不能引用旧内容。')), runtime)
     result = runner.start('说明内容')
-    if escape:
-        assert 'reread' not in store.record.calls
-    else:
-        denied = store.record.calls['reread']
-        assert denied['result']['error']['code'] == 'permission_denied'
-        # read_files checks scope inside its implementation. Entering that
-        # implementation is recorded, but no file content/source is returned.
-        assert denied['result']['data'] is None
-        assert denied['result']['source_refs'] == []
+    denied = store.record.calls['reread']
+    assert denied['result']['error']['code'] == 'permission_denied'
+    assert denied['result']['data'] == {}
+    assert denied['result']['source_refs'] == []
     assert result['status'] == 'partial', result
     assert ref not in result['answer']
 
@@ -197,10 +191,10 @@ def test_terminal_trim_cannot_restart_price_recovery(runtime_env):
     def truncated(_):
         ref = store.record.run_runtime['evidence_refs'][0]
         return Response(content=f'Price USD 8. [{ref}] unfinished', finish_reason='length')
-    model = FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'read')]), truncated, truncated)
+    model = FakeModel(Response(tool_calls=[tool_call('fetch_web_content', {'url': url}, 'read')]), *[truncated for _ in range(4)])
     result = Runner(model, runtime).start(url + ' price')
     assert result['status'] == 'partial', result
-    assert len(model.contexts) == 3
+    assert len(model.contexts) == 5
     assert 'USD 8' not in result['answer']
 
 

@@ -10,13 +10,17 @@ readme = "README.md"
 license = "LicenseRef-GenesisAI-Apache-2.0-with-Commons-Clause-1.0"
 license-files = ["LICENSE", "docs/商业使用说明.md"]
 requires-python = ">=3.11"
-dependencies = ["openai>=2.0,<3", "httpx>=0.28,<1", "PyYAML>=6,<7", "python-dotenv>=1,<2", "rich>=13.9.4,<15", "trafilatura>=2,<3", "brotli>=1,<2", "prompt-toolkit>=3.0.48,<4", "Pillow>=11,<13", "cloudpickle>=3,<4", "jsonschema>=4.18,<5"]
+dependencies = ["openai>=2.0,<3", "httpx>=0.28,<1", "PyYAML>=6,<7", "python-dotenv>=1,<2", "rich>=13.9.4,<15", "trafilatura>=2,<3", "brotli>=1.2.1,<2", "prompt-toolkit>=3.0.48,<4", "Pillow>=11,<13", "cloudpickle>=3,<4", "jsonschema>=4.18,<5"]
 
 [project.optional-dependencies]
+browser = ["playwright>=1.51,<2"]
+terminal = ["pywinpty>=3.1.2,<4; sys_platform == 'win32'"]
 lsp = ["python-lsp-server>=1.11,<2"]
 pet = ["PySide6-Essentials>=6.7,<7; sys_platform == 'win32'"]
 dev = ["pytest>=8,<10", "import-linter>=2,<3"]
 office = ["pypdf>=6,<7", "python-docx>=1.2,<2", "openpyxl>=3.1,<4", "python-pptx>=1,<2", "reportlab>=4,<5"]
+ocr = ["pypdf>=6,<7", "pypdfium2>=4.30,<6", "rapidocr>=3.10,<4", "onnxruntime>=1.20,<2"]
+speech = ["faster-whisper>=1.2,<2"]
 
 [project.scripts]
 genesisai = "genesisai.app.cli:entry"
@@ -34,13 +38,7 @@ root_package = "genesisai"
 [[tool.importlinter.contracts]]
 name = "五层单向依赖"
 type = "layers"
-layers = [
-  "genesisai.app",
-  "genesisai.core",
-  "genesisai.agent",
-  "genesisai.model",
-  "genesisai.shared",
-]
+layers = ["genesisai.app", "genesisai.core", "genesisai.agent", "genesisai.model", "genesisai.shared"]
 
 [[tool.importlinter.contracts]]
 name = "shared 不得依赖其它层"

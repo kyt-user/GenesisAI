@@ -5,8 +5,7 @@ from genesisai.core.extensions.mcp.bridge import (
     McpError,
     McpServerSpec,
     StdioTransport,
-    load_servers,
 )
 
 
-__all__ = ["McpBridge", "McpError", "McpServerSpec", "StdioTransport", "load_servers"]
+__all__ = ["McpBridge", "McpError", "McpServerSpec", "StdioTransport"]

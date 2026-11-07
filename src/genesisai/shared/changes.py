@@ -29,12 +29,17 @@ def record_change(store, *, operation, path, before_sha=None, after_sha=None, ba
 
 
 def atomic_write_bytes(path, payload):
+    import io
+    atomic_write_stream(path, io.BytesIO(payload))
+
+
+def atomic_write_stream(path, source):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with NamedTemporaryFile(dir=path.parent, prefix=".genesis-", delete=False) as stream:
         temp = Path(stream.name)
         try:
-            stream.write(payload)
+            shutil.copyfileobj(source, stream, length=1024 * 1024)
             stream.flush()
             os.fsync(stream.fileno())
         except BaseException:

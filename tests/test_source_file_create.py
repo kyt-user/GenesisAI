@@ -44,6 +44,8 @@ def create(runtime, path, content, call_id="create"):
         ("app.js", "const answer = 42;\n"),
         ("pyproject.toml", "[project]\nname = \"demo\"\n"),
         ("config.yaml", "enabled: true\n"),
+        ("Makefile", "all:\n\t@echo ok\n"),
+        ("schema.custom", "type Query { answer: Int }\n"),
     ],
 )
 def test_source_and_config_files_are_created_verbatim_and_recorded(source_runtime, path, content):
@@ -58,8 +60,8 @@ def test_source_and_config_files_are_created_verbatim_and_recorded(source_runtim
     assert any((change.get('path') == str((workspace / path).resolve()) for change in store.record.changes))
 
 
-@pytest.mark.parametrize("path", ["game.exe", "plugin.dll", "bundle.zip", "image.png", "no_extension"])
-def test_binary_and_unknown_extensions_are_rejected(source_runtime, path):
+@pytest.mark.parametrize("path", ["game.exe", "plugin.dll", "bundle.zip", "image.png", "document.pdf"])
+def test_binary_formats_are_rejected(source_runtime, path):
     workspace, _, runtime = source_runtime
 
     result = create(runtime, path, "not really binary")

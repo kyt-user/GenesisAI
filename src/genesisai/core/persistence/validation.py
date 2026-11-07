@@ -14,6 +14,8 @@ def validate_record(data, expected_id=None):
         "status": str,
         "messages": list,
         "calls": dict,
+        "job_receipts": dict,
+        "authorizations": list,
         "sources": dict,
         "artifacts": dict,
         "pending": list,
@@ -38,12 +40,27 @@ def validate_record(data, expected_id=None):
             raise ValueError(f"会话字段 {name} 类型无效")
     if expected_id is not None and data["id"] != expected_id:
         raise ValueError("会话 ID 与文件名不一致")
+    from genesisai.core.tools.authorization import validate_records
+    validate_records(data['authorizations'], data['id'])
+    if any(not re.fullmatch(r'job_[a-zA-Z0-9_-]+', key) or not isinstance(value, str) or not value
+           for key, value in data['job_receipts'].items()):
+        raise ValueError('作业收取记录无效')
     if not data["workspace"]:
         raise ValueError("会话字段 workspace 无效")
     for ref, source in data["sources"].items():
         if source.get("kind") == "image":
             if not re.fullmatch(r"[a-f0-9]{64}", source.get("sha256", "")):
                 raise ValueError("图片快照哈希无效")
+            if (not re.fullmatch(r'[a-f0-9]{64}', source.get('original_sha256', ''))
+                    or source.get('original_mime_type') not in {'image/png', 'image/jpeg', 'image/webp'}
+                    or any(type(source.get(key)) is not int or source[key] < 1 for key in
+                           ('original_width', 'original_height', 'original_byte_size', 'max_side'))):
+                raise ValueError('图片原图快照元数据无效；需要重新导入原图')
+            region = source.get('region')
+            if region is not None and (not isinstance(region, list) or len(region) != 4
+                    or any(type(v) is not int for v in region) or min(region[:2]) < 0 or min(region[2:]) < 1
+                    or region[0] + region[2] > source['original_width'] or region[1] + region[3] > source['original_height']):
+                raise ValueError('图片裁剪范围无效')
             validate_content(
                 [
                     {
@@ -73,6 +90,21 @@ def validate_record(data, expected_id=None):
             }:
                 raise ValueError("会话消息结构无效")
             validate_content(message.get("content"))
+            projection = (message.get('metadata') or {}).get('image_projection', [])
+            if not isinstance(projection, list):
+                raise ValueError('图片投影槽位无效')
+            indices = set()
+            for slot in projection:
+                if (not isinstance(slot, dict) or set(slot) != {'index', 'image_ref'}
+                        or type(slot['index']) is not int or not isinstance(message.get('content'), list)
+                        or not 0 <= slot['index'] < len(message['content']) or slot['index'] in indices
+                        or not isinstance(slot['image_ref'], str)
+                        or data['sources'].get(slot['image_ref'], {}).get('kind') != 'image'
+                        or message['content'][slot['index']].get('type') != 'text'):
+                    raise ValueError('图片投影槽位或引用无效')
+                indices.add(slot['index'])
+            if message.get("reasoning") is not None and (message["role"] != "assistant" or not isinstance(message["reasoning"], str)):
+                raise ValueError("模型推理协议字段无效")
             for part in image_parts(message.get("content")):
                 source = data["sources"].get(part["image_ref"], {})
                 if (
@@ -116,13 +148,10 @@ def validate_record(data, expected_id=None):
     ):
         raise ValueError("会话字段 deadline 类型无效")
     tool_runtime = data["tool_runtime"]
-    if set(tool_runtime) != {"active_skills"} or not isinstance(
-        tool_runtime["active_skills"], list
-    ):
+    if set(tool_runtime) != {"active_skills"} or not isinstance(tool_runtime['active_skills'], dict):
         raise ValueError("会话字段 tool_runtime 无效")
-    if len(tool_runtime["active_skills"]) > 2 or any(
-        not isinstance(name, str) for name in tool_runtime["active_skills"]
-    ):
+    if any(not isinstance(name, str) or not name or not isinstance(stage, str) or not stage
+           for name, stage in tool_runtime['active_skills'].items()):
         raise ValueError("会话字段 active_skills 无效")
     run_runtime = data["run_runtime"]
     required_runtime = {
@@ -140,8 +169,6 @@ def validate_record(data, expected_id=None):
         "recovery_counts",
         "counted_calls",
         "completed_queries",
-        "progress_mark",
-        "stalled_rounds",
         "stop_reason",
         "partial_response",
         "last_tool_name",
@@ -194,14 +221,13 @@ def validate_record(data, expected_id=None):
         "evidence_refs",
         "counted_calls",
         "completed_queries",
-        "progress_mark",
         "prompt_names",
         "state_history",
         "protocols",
     ):
         if not isinstance(run_runtime[name], list):
             raise ValueError(f"会话字段 run_runtime.{name} 类型无效")
-    for name in ("candidate_count", "fetched_count", "stalled_rounds"):
+    for name in ("candidate_count", "fetched_count"):
         value = run_runtime[name]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ValueError(f"会话字段 run_runtime.{name} 类型无效")
@@ -232,5 +258,22 @@ def validate_record(data, expected_id=None):
         if (not isinstance(constraints, dict) or set(constraints) - {"read_only", "network_forbidden"}
                 or any(type(value) is not bool for value in constraints.values())):
             raise ValueError("会话字段 run_runtime.constraints 无效")
-    if "model_call_limit" in run_runtime and (type(run_runtime["model_call_limit"]) is not int or run_runtime["model_call_limit"] < 1):
-        raise ValueError("会话字段 run_runtime.model_call_limit 无效")
+    for key in ("model_calls", "tools", "total_tokens"):
+        value = run_runtime["budget"][key]
+        if value is not None and (type(value) is not int or value < 1):
+            raise ValueError("无效的显式任务预算: " + key)
+
+    if "progress" in run_runtime:
+        progress = run_runtime["progress"]
+        if (not isinstance(progress, dict) or set(progress) != {"epoch", "observed", "attempts"}
+                or type(progress["epoch"]) is not int or progress["epoch"] < 0):
+            raise ValueError("会话进展检查点无效")
+        for field in ("observed", "attempts"):
+            values = progress[field]
+            if not isinstance(values, dict) or any(not isinstance(k, str) or not re.fullmatch(r"[a-f0-9]{64}", k)
+                   or type(v) is not int or v < 1 for k, v in values.items()):
+                raise ValueError("会话动作指纹无效")
+    limits = data.get("limits", {})
+    if limits and (not isinstance(limits, dict) or set(limits) != {"rounds", "tools", "total_tokens"}
+                   or any(v is not None and (type(v) is not int or v < 1) for v in limits.values())):
+        raise ValueError("会话显式预算无效")

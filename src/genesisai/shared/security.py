@@ -60,6 +60,16 @@ class Access:
                 candidates.append(self.output.joinpath(*raw.parts[1:]))
             raw = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
         path = raw.resolve(strict=True)
+        return self._authorize_read(path)
+
+    def read_reference(self, value):
+        """Authorize an existing snapshot's absolute origin, without reopening it."""
+        raw = self._file_path(value)
+        if not raw.is_absolute():
+            raise ToolError('invalid_path', '历史来源必须是绝对路径')
+        return self._authorize_read(raw.resolve(strict=False))
+
+    def _authorize_read(self, path):
         if is_private_app_path(path, self.state_root):
             raise ToolError('permission_denied', '不能读取程序状态文件')
         if path.name.casefold() == '.env' or path.name.casefold().startswith('.env.'):
@@ -85,7 +95,7 @@ class Access:
             raise ToolError('invalid_path', '目标必须是文件')
         return target
 
-    def write(self, value):
+    def write(self, value, *, overwrite=False):
         relative = self._file_path(value)
         if not self.host_access and (relative.is_absolute() or '..' in relative.parts):
             raise ToolError('permission_denied', '输出只能使用输出目录内的相对路径')
@@ -97,8 +107,12 @@ class Access:
             raise ToolError('permission_denied', '不能操作程序状态文件')
         if target.name.casefold() == '.env' or target.name.casefold().startswith('.env.'):
             raise ToolError('permission_denied', '不能操作密钥文件')
-        if target.exists():
+        if type(overwrite) is not bool:
+            raise ToolError('validation_error', 'overwrite 必须是布尔值')
+        if target.exists() and not overwrite:
             raise ToolError('target_exists', '目标已存在；请使用新文件名')
+        if target.exists() and not target.is_file():
+            raise ToolError('invalid_path', '覆盖目标必须是普通文件')
         return target
 
     def create(self, value, content):

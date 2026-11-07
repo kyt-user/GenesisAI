@@ -9,8 +9,7 @@ from genesisai.shared.errors import SearchError
 from genesisai.shared.web import canonicalize_url, normalized_text
 
 
-MAX_QUERY_CHARS = 400
-MAX_QUERY_WORDS = 50
+MAX_QUERY_CHARS = 500
 SAFE_PROVIDER_ERROR_CODES = frozenset({
     "provider_auth_error", "provider_rate_limited", "provider_unavailable",
     "provider_invalid_response", "access_denied",
@@ -47,13 +46,17 @@ class SearchQuery:
     country: str | None = None
     freshness: str | None = None
     allowed_domains: tuple[str, ...] = ()
+    offset: int = 0
+    network_limits: dict | None = None
 
     def __post_init__(self) -> None:
         query = normalized_text(self.query)
-        if not query or len(query) > MAX_QUERY_CHARS or len(query.split()) > MAX_QUERY_WORDS:
+        if not query or len(self.query) > MAX_QUERY_CHARS:
             raise SearchError("validation_error", "Search query exceeds the allowed size")
         if self.priority not in {1, 2, 3}:
             raise SearchError("validation_error", "Query priority must be 1, 2, or 3")
+        if type(self.offset) is not int or self.offset < 0:
+            raise SearchError('validation_error', 'Search offset must be a nonnegative integer')
         object.__setattr__(self, "query", query)
         object.__setattr__(
             self,
@@ -70,7 +73,7 @@ class SearchQuery:
     def from_dict(cls, value: dict[str, Any]) -> "SearchQuery":
         allowed = {
             "query", "purpose", "priority", "language", "country", "freshness",
-            "allowed_domains",
+            "allowed_domains", "offset", "network_limits",
         }
         if not isinstance(value, dict) or set(value) - allowed:
             raise SearchError("model_output_invalid", "Research query schema is invalid")
@@ -82,7 +85,12 @@ class SearchQuery:
             country=value.get("country"),
             freshness=value.get("freshness"),
             allowed_domains=tuple(value.get("allowed_domains", ())),
+            offset=value.get('offset', 0),
+            network_limits=value.get('network_limits'),
         )
+
+    def terms(self):
+        return self.query + (' (' + ' OR '.join('site:' + domain for domain in self.allowed_domains) + ')' if self.allowed_domains else '')
 
 
 @dataclass(frozen=True)
@@ -106,3 +114,10 @@ class SearchHit:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SearchHit":
         return cls(**value)
+
+
+@dataclass(frozen=True)
+class SearchPage:
+    hits: list
+    next_offset: int | None = None
+    coverage: str = 'provider_response'

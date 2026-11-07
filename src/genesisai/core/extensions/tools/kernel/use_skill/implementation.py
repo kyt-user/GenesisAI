@@ -1,9 +1,5 @@
-"""内核工具：一次调用返回所请求 Skill 的指令正文。
-
-Skills 缝的可执行侧：模型据返回的 SKILL.md 正文推进任务，替代原先
-`skill_search / skill_describe / skill_load` 三个只读元工具。
-"""
-
+"""Load an explicit stage and its dependency closure into the session."""
+from genesisai.core.extensions.skills.registry import SkillError
 from genesisai.shared.security import ToolError
 
 
@@ -12,16 +8,25 @@ class Implementation:
         return None
 
     def execute(self, context, args):
-        registry = getattr(context.runtime, "skills", None)
-        if registry is None:
-            raise ToolError("skill_unavailable", "Skill 注册表不可用")
-        name = args["name"]
+        registry = context.runtime.skills
+        name, stage = args['name'], args['stage']
         if name not in registry.items:
-            raise ToolError("unknown_skill", f"未知 Skill：{name}")
+            raise ToolError('unknown_skill', '未知 Skill：' + name)
+        active = dict(context.store.record.tool_runtime['active_skills'])
+        if args.get('operation', 'load') == 'unload':
+            if active.get(name) == stage:
+                active.pop(name)
+            context.store.record.tool_runtime['active_skills'] = active
+            context.store.commit()
+            return {'name': name, 'stage': stage, 'active': name in active}
+        available = {item.name for item in context.runtime.catalog.available_tools()}.__contains__
+        try:
+            resolved = registry.resolve(name, stage, available=available)
+            context.store.record.tool_runtime['active_skills'] = registry.load(
+                name, stage, active, available=available)
+        except SkillError as exc:
+            raise ToolError('skill_dependency', str(exc)) from exc
+        context.store.commit()
         item = registry.describe(name, include_content=True)
-        return {
-            "name": item["name"],
-            "description": item["description"],
-            "tools": item["tools"],
-            "content": item["content"],
-        }
+        return {'name': name, 'description': item['description'], **resolved,
+                'content': item['content'], 'active': True}

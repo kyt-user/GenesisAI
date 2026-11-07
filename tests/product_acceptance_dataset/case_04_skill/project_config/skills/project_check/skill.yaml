@@ -1,4 +1,0 @@
-name: project_check
-description: Application-owned project checks
-entry: SKILL.md
-tools: [run_commands]

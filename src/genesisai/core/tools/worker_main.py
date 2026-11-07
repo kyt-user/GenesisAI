@@ -13,6 +13,16 @@ from genesisai.shared.process_tree import group_listener
 from genesisai.shared.run_control import RunControl, current_run
 
 
+def authorize(context, authorization, acceptance):
+    from genesisai.core.tools.permissions import accepted_tool, current_authorization
+    from genesisai.core.extensions.tools.web.budget import active_scope
+    context.authorization = authorization
+    current_authorization.set(authorization)
+    accepted_tool.set(acceptance)
+    active_scope.set({'authorization_id': authorization['id'], 'domains': authorization['domains']}
+                     if authorization is not None else None)
+
+
 def main():
     read = os.fdopen(os.dup(sys.stdin.fileno()), "rb")
     with open(os.devnull, "rb") as empty:
@@ -48,6 +58,9 @@ def main():
                     providers,
                     cancelled,
                     secrets,
+                    call_id,
+                    authorization,
+                    acceptance,
                 ) = args
                 if isinstance(implementation, HostBoundTool):
                     implementation.host_service = Remote(
@@ -74,7 +87,9 @@ def main():
                     service(network),
                     [service(p) for p in providers],
                     runtime,
+                    call_id=call_id,
                 )
+                authorize(context, authorization, acceptance)
                 if cancelled:
 
                     def emit(kind, data):
@@ -87,6 +102,9 @@ def main():
                 result = None
             elif method == "prepare":
                 result = implementation.prepare(context, args)
+            elif method == 'authorize':
+                authorize(context, *args)
+                result = None
             else:
                 payload = implementation.execute(context, args)
                 adapter = observer or getattr(implementation, "observe", None)

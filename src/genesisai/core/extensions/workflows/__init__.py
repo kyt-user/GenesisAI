@@ -11,7 +11,6 @@ from pathlib import Path
 
 
 WORKFLOW_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
-MAX_WORKFLOW_CHARS = 12000
 
 
 class WorkflowError(ValueError):
@@ -37,14 +36,16 @@ class WorkflowRegistry:
                 diagnostics.append(f"{path.name}: 名称无效")
                 continue
             try:
+                if path.is_symlink() or path.resolve().parent != self.root:
+                    raise WorkflowError("工作流不能经链接越出目录")
                 text = path.read_text(encoding="utf-8").strip()
-            except (OSError, UnicodeError) as exc:
+            except (OSError, UnicodeError, WorkflowError) as exc:
                 diagnostics.append(f"{path.name}: {exc}")
                 continue
             if not text:
                 diagnostics.append(f"{path.name}: 内容为空")
                 continue
-            items[name] = {"name": name, "path": str(path), "text": text[:MAX_WORKFLOW_CHARS]}
+            items[name] = {"name": name, "path": str(path), "text": text}
         return items, diagnostics
 
     def names(self) -> list[str]:

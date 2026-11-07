@@ -1,4 +1,4 @@
 name: pptx_create
 enabled: true
 category: office
-description: 创建基础 PPTX 标题与项目符号版式并验证
+description: 创建PPTX或以source为基础追加幻灯片；覆盖须overwrite和expected_sha256；只生成基础标题项目符号版式

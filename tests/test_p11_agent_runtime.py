@@ -1,3 +1,4 @@
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 import json
 import time
 
@@ -61,11 +62,10 @@ def runtime_env(tmp_path):
     return store, runtime
 
 
-def test_p11_profiles_are_fixed_and_conservative():
-    assert PROFILES["direct_answer"].model_calls == 3
-    assert PROFILES["web_quick"].search_queries == 2
-    assert PROFILES["web_quick"].search_fetches == 4
-    assert "token_budget" not in PROFILES["web_quick"].to_dict()
+def test_profiles_select_workflow_without_execution_quotas():
+    from genesisai.shared.budgets import initial_run_runtime
+    for name in PROFILES:
+        assert initial_run_runtime(name)["budget"] == {"model_calls": None, "tools": None, "total_tokens": None}
     assert select_initial_profile("请深度、全面调研这个主题") == "web_deep"
     assert select_initial_profile("比较并整理一份专题报告") == "web_normal"
     assert select_initial_profile("你好") == "direct_answer"
@@ -92,7 +92,8 @@ def test_mcp_structured_links_register_candidates_without_promoting_snippets(run
     assert not store.record.run_runtime["candidates"]
     runtime.research.after_execute(dict(call, id="m2"), {"ok": True, "data": result})
     state = store.record.run_runtime
-    assert list(state["candidates"]) == [url]
+    assert list(state["candidates"]) == [url, "http://127.0.0.1/"]
+    assert state["candidates"]["http://127.0.0.1/"]["network_boundary"] == "private"
     assert state["candidates"][url]["query_call_id"] == "m2"
     assert state["candidates"][url]["tool_name"] == "mcp_news_search"
     assert not state["evidence_refs"] and not store.record.sources
@@ -108,14 +109,15 @@ def test_p11_prompt_composer_is_modular_and_hashed():
     assert "当前日期" in composed.text and "时区" in composed.text
 
 
-def test_p11_unregistered_and_search_pages_are_rejected(runtime_env):
+def test_valid_urls_and_search_pages_are_reachable_without_preregistration(runtime_env):
     store, runtime = runtime_env
+    runtime.network.fetch = lambda url: {"url": url, "title": "Fetched", "text": "Fetched factual text", "truncated": False}
     store.record.run_runtime = ResearchController.empty_state("web_quick")
     store.commit()
-    missing = runtime.execute({"id": "f1", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://example.com/a"})})
-    search_page = runtime.execute({"id": "f2", "name": "fetch_web_content", "arguments": json.dumps({"url": "https://www.google.com/search?q=x"})})
-    assert missing["error"]["code"] == "candidate_not_registered"
-    assert search_page["error"]["code"] == "search_result_page_forbidden"
+    for index, url in enumerate(["https://example.com/a", "https://www.google.com/search?q=x"]):
+        result = runtime.execute({"id": f"f{index}", "name": "fetch_web_content", "arguments": json.dumps({"url": url})})
+        assert result["ok"] and result["source_refs"], result
+    assert store.record.run_runtime["usage"]["search_fetches"] == 2
 
 
 def test_p11_query_registers_candidates_and_fetch_creates_evidence(runtime_env):
@@ -124,7 +126,7 @@ def test_p11_query_registers_candidates_and_fetch_creates_evidence(runtime_env):
     class Provider:
         name = "fixture"
         def search(self, query, limit=5):
-            return [{"title": "Apple", "url": "https://apple.example/news", "snippet": "event"}]
+            return SearchPage([{"title": "Apple", "url": "https://apple.example/news", "snippet": "event"}])
 
     class Network:
         calls = 0
@@ -157,7 +159,7 @@ def test_p11_direct_answer_dispatches_full_tool_set(runtime_env):
     assert store.record.run_runtime['profile'] == 'direct_answer'
 
 
-def test_p11_length_recovers_once_without_tools(runtime_env):
+def test_truncated_answer_can_recover_with_tools(runtime_env):
     store, runtime = runtime_env
     model = FakeModel(
         Response(content="已有部分答案", finish_reason="length", usage={"total_tokens": 100}),
@@ -165,21 +167,18 @@ def test_p11_length_recovers_once_without_tools(runtime_env):
     )
     result = Runner(model, runtime).start("解释这个概念")
     assert result["status"] == "completed" and result["answer"] == "完整答案"
-    assert model.tools[1] == []
-    assert store.record.run_runtime['partial_response'] == '已有部分答案'
+    assert model.tools[1]
+    assert store.record.run_runtime['partial_response'] == ''
     assert store.record.run_runtime['recovery_counts']['length'] == 1
 
 
-def test_p11_second_length_delivers_partial(runtime_env):
+def test_repeated_truncation_stops_without_delivering_incomplete_drafts(runtime_env):
     _, runtime = runtime_env
-    model = FakeModel(
-        Response(content="第一份草稿。", finish_reason="length"),
-        Response(content="重写后的完整句子。尚未写完的", finish_reason="length"),
-    )
+    model = FakeModel(*[Response(content="草稿。尚未写完的", finish_reason="length") for _ in range(4)])
     result = Runner(model, runtime).start("长回答")
     assert result["status"] == "partial"
-    assert "第一份草稿" not in result["answer"] and "重写后的完整句子。" in result["answer"]
-    assert "尚未写完的" not in result["answer"]
+    assert "草稿" not in result["answer"] and "尚未写完的" not in result["answer"]
+    assert len(model.contexts) == 4
 
 
 def test_p11_context_compacts_old_tool_bodies_and_keeps_previous_answer(runtime_env):

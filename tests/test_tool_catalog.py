@@ -32,12 +32,14 @@ def definition_names(runtime):
 
 def test_definitions_select_a_subset_of_enabled_and_available_tools(runtime):
     inventory = runtime.inventory()
-    enabled = {item["name"] for item in inventory["enabled"]}
+    entries = [item for group in inventory.values() for item in group]
+    enabled = {item["name"] for item in entries if item["enabled"]}
 
     assert {"discover_tools", "attempt_completion"} <= set(definition_names(runtime)) < enabled
     assert "read_files" in enabled and "editor" in enabled
-    assert all(item.get("reason") for item in inventory["disabled"])
-    assert enabled | {item["name"] for item in inventory["disabled"]} == set(runtime.registry._items)
+    assert all(item.get("reason") for item in entries if not item["enabled"])
+    assert enabled | {item["name"] for item in entries if not item["enabled"]} == set(runtime.registry._items)
+    assert set(inventory) == {"builtin", "external"}
 
 
 def test_business_tool_executes_without_any_load(runtime):
@@ -67,7 +69,7 @@ def test_disabled_tool_is_listed_and_cannot_execute(tmp_path, monkeypatch):
     monkeypatch.setattr(registry, "refresh", lambda: None)
 
     inventory = runtime.inventory()
-    assert any(item["name"] == "read_files" for item in inventory["disabled"])
+    assert any(item["name"] == "read_files" and not item["enabled"] for item in inventory["builtin"])
     assert "read_files" not in definition_names(runtime)
     result = runtime.execute(tool_call("read_files", {"path": "note.md"}, "disabled"))
     assert result["error"]["code"] == "tool_unavailable"
@@ -113,3 +115,20 @@ def test_on_demand_loading_meta_tools_are_gone(runtime):
     assert meta.isdisjoint(definition_names(runtime))
     assert 'active_tools' not in getattr(runtime.store.record, 'tool_runtime', {})
     assert not hasattr(runtime, "load_tools") and not hasattr(runtime, "reset_task")
+
+
+def test_discovery_pages_filter_and_exact_schema_loading(runtime):
+    expected = {item.name for item in runtime.catalog.available_tools() if item.category == 'kernel' and item.source == 'builtin'}
+    names, offset = [], 0
+    while True:
+        page = runtime.discover_tools(limit=7, offset=offset, category='kernel', source='builtin', activate=False)
+        names.extend(item['name'] for item in page['candidates'])
+        assert all(item['category'] == 'kernel' and item['source'] == 'builtin' for item in page['candidates'])
+        if page['next_offset'] is None:
+            break
+        offset = page['next_offset']
+    assert len(names) == len(set(names)) and set(names) == expected
+    assert runtime.discover_tools(provider='missing-provider')['candidates'] == []
+    selected = runtime.discover_tools(query='read_files', limit=1)
+    assert selected['available_next_round'][0]['name'] == 'read_files'
+    assert 'read_files' in definition_names(runtime)

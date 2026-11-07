@@ -2,7 +2,59 @@ import json
 import sys
 
 from genesisai.agent.loop import Runner
-from genesisai.core.extensions.tools.shell.jobs import CommandJobs
+from genesisai.core.jobs.service import JobService
+
+
+def test_directory_pages_reach_beyond_old_total_cap_and_explicit_dependencies(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    for index in range(1105):
+        (root / f"file_{index:04d}.txt").touch()
+    dependency = root / "node_modules"
+    dependency.mkdir()
+    (dependency / "dependency.custom").write_text("dependency", encoding="utf-8")
+    result = call(runtime, "list_files", {"path": ".", "offset": 1000, "limit": 200}, "tail")["data"]
+    assert any(item["path"].endswith("file_1104.txt") for item in result["files"])
+    assert not any("node_modules" in item["path"] for item in result["files"])
+    included = call(runtime, "list_files", {"path": "node_modules"}, "include")["data"]
+    assert included["files"][0]["path"].endswith("dependency.custom")
+
+
+def test_large_unknown_suffix_text_is_range_readable(tmp_path):
+    from genesisai.shared.filetypes import detect_file_type
+    root, _, _, _, runtime = development_env(tmp_path)
+    path = root / "generated.customlang"
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        for _ in range(10):
+            stream.write("x" * 1024 * 1024)
+        stream.write("\nTAIL_MARKER\n")
+    assert detect_file_type(path) == "text"
+    result = call(runtime, "read_files", {"path": path.name, "offset": 10 * 1024 * 1024, "limit": 100}, "large")["data"]
+    assert result["files"][0]["text"] == "\nTAIL_MARKER\n"
+    assert result["files"][0]["next_offset"] is None
+    lines = call(runtime, "read_files", {"path": path.name, "line_start": 2, "line_end": 2}, "line")["data"]
+    assert lines["files"][0]["text"] == "2: TAIL_MARKER"
+
+
+def test_full_document_extraction_keeps_tail_and_all_sheets(tmp_path):
+    import pytest
+    docx = pytest.importorskip("docx")
+    xlsx = pytest.importorskip("openpyxl")
+    from genesisai.core.extensions.tools.filesystem.shared import extract
+    doc = docx.Document()
+    for _ in range(3100):
+        doc.add_paragraph("x" * 70)
+    doc.add_paragraph("DOCX_TAIL_MARKER")
+    path = tmp_path / "large.docx"
+    doc.save(path)
+    text, truncated = extract(path)
+    assert len(text) > 200000 and text.rstrip().endswith("DOCX_TAIL_MARKER") and not truncated
+    book = xlsx.Workbook()
+    for index in range(11):
+        book.create_sheet(f"Sheet{index}")["A1002"] = "XLSX_TAIL_MARKER"
+    path = tmp_path / "large.xlsx"
+    book.save(path)
+    text, truncated = extract(path)
+    assert text.count("XLSX_TAIL_MARKER") == 11 and "## Sheet10" in text and not truncated
 from genesisai.shared.messages import Response, ToolCall
 from test_development_continuation import development_env
 from test_p11_agent_runtime import FakeModel
@@ -41,7 +93,31 @@ def test_index_exclusions_and_large_file_coverage(tmp_path):
     (root / 'big.py').write_text('# filler\n' * 25000 + 'def tail(): pass', encoding='utf-8')
     data = call(runtime, 'search_codebase', {'path': '.', 'mode': 'index'}, 'index')['data']
     assert data['total_files'] == 1
-    assert data['files'][0]['content_truncated'] and data['partial_files']
+    assert not data['files'][0]['content_truncated'] and not data['partial_files']
+    assert data['files'][0]['functions'][0]['name'] == 'tail'
+
+
+def test_large_file_search_and_symbol_pages_reach_tail(tmp_path):
+    root, _, _, _, runtime = development_env(tmp_path)
+    (root / 'large.custom').write_text('x' * (9 * 1024 * 1024) + '\nUNIQUE_TAIL\n', encoding='utf-8')
+    data = call(runtime, 'search_codebase', {'path': 'large.custom', 'query': 'UNIQUE_TAIL'}, 'search_tail')['data']
+    assert data['matches'][0]['line'] == 2
+    assert data['matches'][0]['read_request']['offset'] > 8 * 1024 * 1024
+    (root / 'symbols.py').write_text(''.join(f'def function_{i}(): pass\n# TODO: task_{i}\n' for i in range(80)), encoding='utf-8')
+    args = {'path': 'symbols.py', 'mode': 'index', 'max_output_chars': 2000}
+    names, todos, cursors = [], [], set()
+    for page in range(30):
+        data = call(runtime, 'search_codebase', args, f'symbol_page_{page}')['data']
+        names.extend(item['name'] for item in data['files'][0]['functions'])
+        todos.extend(item['note'] for item in data['files'][0]['todos'])
+        cursor = data['next_cursor']
+        if cursor is None:
+            break
+        assert cursor not in cursors
+        cursors.add(cursor)
+        args['cursor'] = cursor
+    assert names == [f'function_{i}' for i in range(80)]
+    assert todos == [f'task_{i}' for i in range(80)]
 
 
 def test_python_index_reuses_ast_without_string_false_positives(tmp_path):
@@ -53,6 +129,25 @@ def test_python_index_reuses_ast_without_string_false_positives(tmp_path):
     assert data['files'][0]['imports'] == [{'module': '.'}]
     assert runtime.project_index.refresh()['updated'] == 1
     assert runtime.project_index.refresh()['updated'] == 0
+
+
+def test_streaming_editor_large_file_reference_and_conflicts(tmp_path):
+    from genesisai.shared.ids import sha
+    root, _, _, store, runtime = development_env(tmp_path)
+    path = root / 'large.custom'
+    prefix = b'x' * (9 * 1024 * 1024)
+    path.write_bytes(prefix + b'\r\nold tail\r\n')
+    replacement = root / 'replacement.txt'
+    replacement.write_text('new tail', encoding='utf-8')
+    result = call(runtime, 'editor', {'operation': 'replace', 'path': str(path), 'old_text': 'old tail',
+        'new_text_ref': {'path': str(replacement), 'sha256': sha(replacement)}, 'expected_sha256': sha(path)}, 'large_replace')
+    assert path.read_bytes() == prefix + b'\r\nnew tail\r\n'
+    patch = root / 'change.diff'
+    patch.write_text('@@ -2 +2 @@\n-new tail\n+patched tail\n', encoding='utf-8')
+    call(runtime, 'editor', {'operation': 'patch', 'path': str(path), 'patch_ref': {'path': str(patch), 'sha256': sha(patch)}}, 'large_patch')
+    assert path.read_bytes() == prefix + b'\r\npatched tail\r\n'
+    assert result['data']['before_sha256'] != result['data']['after_sha256']
+    assert len(store.record.changes) == 2
 
 
 def test_incremental_index_updates_only_changed_module(tmp_path, record_testsuite_property):
@@ -131,16 +226,19 @@ def test_job_recovery_does_not_replay_process(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
     try:
         started = runtime.jobs.start([sys.executable, '-c', 'import time; time.sleep(20)'], store.workspace, 25)
-        restored = CommandJobs(store, lambda x: x)
-        assert restored.wait(started['job_id'], .1)['status'] == 'owner_unavailable'
-        assert not restored.active
+        restored = JobService(store, lambda x: x)
+        assert restored.wait(started['job_id'], .5)['status'] in {'queued', 'running'}
+        runtime.jobs.close()
+        assert restored.stop(started['job_id'])['status'] == 'stopped'
     finally:
         runtime.jobs.close()
 
 
 def test_long_run_passes_checkpoint_without_resetting_usage(tmp_path):
     _, _, _, store, runtime = development_env(tmp_path)
-    responses = [Response(tool_calls=[ToolCall(f'find{i}', 'discover_tools', json.dumps({'query': 'read_files'}))], finish_reason='tool_calls') for i in range(24)]
+    for i in range(24):
+        (store.workspace / f'part_{i}.txt').write_text(f'content {i}')
+    responses = [Response(tool_calls=[ToolCall(f'read{i}', 'read_files', json.dumps({'path': f'part_{i}.txt'}))], finish_reason='tool_calls') for i in range(24)]
     model = FakeModel(*responses, Response(content='检查结束'))
     result = Runner(model, runtime, max_rounds=30, max_tools=40).start('检查本地代码工具')
     assert result['status'] == 'completed'

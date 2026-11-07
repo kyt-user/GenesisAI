@@ -1,5 +1,6 @@
 """Tool Runtime 与 Runner 的全量下发、恢复和完整链路。"""
 
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 import dataclasses
 import json
 
@@ -57,7 +58,7 @@ def test_web_agent_searches_fetches_and_registers_source(tmp_path):
         name = "fixture"
 
         def search(self, query, limit=5):
-            return [{"title": "Public", "url": "https://public.test/", "snippet": "candidate"}]
+            return SearchPage([{"title": "Public", "url": "https://public.test/", "snippet": "candidate"}])
 
     class Pages:
         def fetch(self, url):
@@ -84,7 +85,7 @@ def test_followup_reuses_previous_answer_and_web_tools(tmp_path):
         name = "fixture"
 
         def search(self, query, limit=5):
-            return [{"title": "Watch", "url": "https://public.test/watch", "snippet": "candidate"}]
+            return SearchPage([{"title": "Watch", "url": "https://public.test/watch", "snippet": "candidate"}])
 
     class Pages:
         def fetch(self, url):
@@ -186,7 +187,7 @@ def test_network_confirmation_uses_network_message(tmp_path):
         name = "fixture"
 
         def search(self, query, limit=5):
-            return []
+            return SearchPage([])
 
     _, _, _, runtime = make_runtime(tmp_path, providers=[Provider()], permission_mode="user")
     model = FakeModel(
@@ -232,9 +233,9 @@ def test_permission_matrix_and_session_restore(tmp_path, mode):
 
 def test_local_project_inspection_needs_no_approval(tmp_path):
     _, _, _, runtime = make_runtime(tmp_path, permission_mode="user")
-    inspected = runtime.execute(call("run_commands", {"operation": "inspect", "cwd": "."}, "inspect"))
+    inspected = runtime.execute(call("inspect_project", {"cwd": "."}, "inspect"))
     assert inspected["ok"]
-    command = {"operation": "run", "command": ["git", "status"]}
+    command = {"command": ["git", "status"]}
     assert runtime.execute(call("run_commands", command, "shell"))["pending"]
 
 
@@ -375,7 +376,7 @@ def test_cancel_acknowledges_unknown_without_replaying_it(tmp_path):
         [],
         {"active_skills": "read_files"},
         {"active_skills": ["read_files", 1]},
-        {"active_skills": [str(index) for index in range(3)]},
+        {"active_skills": ["duplicate", "duplicate"]},
         {"active_skills": [], "implementation": "unsafe"},
     ],
 )

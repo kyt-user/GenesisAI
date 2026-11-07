@@ -12,6 +12,7 @@ from rich.cells import chop_cells
 
 from genesisai.app.run_queue import PREVIEW_ROWS
 from genesisai.app.terminal_text import terminal_text
+from genesisai.app.job_input_commands import is_job_input
 
 
 COMMANDS = [
@@ -22,6 +23,10 @@ COMMANDS = [
     ('/auth', '切换模型提供商和配置密钥', '模型与权限'),
     ('/model', '切换当前提供商的模型', '模型与权限'),
     ('/permissions', '查看操作权限', '模型与权限'),
+    ('/authorize', '创建会话或任务范围授权：JSON 指定工具、路径、域名与环境映射', '模型与权限'),
+    ('/authorizations', '查看当前会话的范围授权与撤销状态', '模型与权限'),
+    ('/revoke', '按授权 id 撤销并停止其排队或运行作业', '模型与权限'),
+    ('/constraints', '查看或明确修改当前任务的只读/禁网约束', '模型与权限'),
     ('/compact', '压缩当前上下文', '会话'),
     ('/help', '查看全部操作', '帮助'),
     ('/status', '查看会话、工作区和运行状态', '诊断'),
@@ -35,15 +40,21 @@ COMMANDS = [
     ('/project rebuild', '重建项目结构索引', '项目'),
     ('/memory', '查看知识库；支持 search/read/write/delete/export/rebuild/diagnostic/backup', '项目'),
     ('/tools', '查看可用工具', '项目'),
+    ('/pdf-unlock', '以隐藏密码输入将加密 PDF 解锁至新文件', '文档'),
+    ('/capabilities', '管理内置与外挂能力、草稿及测试报告', '能力'),
+    ('/create_tool', '让 Agent 创建并测试外挂 Tool', '能力'),
+    ('/create_skill', '让 Agent 创建并测试外挂 Skill', '能力'),
+    ('/create_mcp', '让 Agent 创建或连接 MCP 并测试', '能力'),
     ('/skills', '列出可加载的 Skill', '项目'),
     ('/workflow', '列出工作区工作流', '项目'),
-    ('/permissions user', '用户审批，写入与对外调用逐次确认', '模型与权限'),
+    ('/permissions user', '用户审批，范围授权内执行，范围外逐次确认', '模型与权限'),
     ('/permissions auto', '自动审批，允许读写宿主文件', '模型与权限'),
     ('/answer', '回答当前问题，可输入选项编号或自由文本', '运行'),
     ('/approve', '允许当前操作一次', '运行'),
     ('/reject', '拒绝当前操作', '运行'),
     ('/resume', '继续中断的运行', '运行'),
     ('/cancel', '取消当前任务', '运行'),
+    ('/job-input', '向交互作业发送 JSON 输入、关闭管道或调整终端；输入内容不记日志和历史', '运行'),
     ('/queue', '查看排队消息', '运行'),
     ('/queue resume', '继续已暂停的消息队列', '运行'),
     ('/queue clear', '移除尚未开始的排队消息', '运行'),
@@ -119,10 +130,19 @@ def input_bindings(palette=False, recent=False):
     return bindings
 
 
+class CommandHistory(InMemoryHistory):
+    def __init__(self, strings=()):
+        super().__init__(value for value in strings if not is_job_input(value))
+
+    def append_string(self, string):
+        if not is_job_input(string):
+            super().append_string(string)
+
+
 class TaskInput:
     def __init__(self, history=(), *, input=None, output=None):
         self.session = PromptSession(
-            history=InMemoryHistory(history), completer=CommandCompleter(),
+            history=CommandHistory(history), completer=CommandCompleter(),
             complete_while_typing=True, multiline=True,
             key_bindings=input_bindings(), reserve_space_for_menu=7,
             input=input, output=output,

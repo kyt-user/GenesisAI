@@ -1,0 +1,4 @@
+name: fetch_private_resource
+enabled: true
+category: kernel
+description: 显式读取内网HTTP(S)资源；url和address_ranges必填，需要匹配的域名/CIDR范围授权或具体资源确认。每个DNS结果和重定向均校验授权，允许内网非标准端口。正文、链接、结构化数据和完整原文均可分页，长读取返回作业后用read_job取得结果。

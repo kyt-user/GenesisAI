@@ -6,7 +6,10 @@ SPEC = ToolSpec(
     parameters=object_schema(
         ["path"],
         path={"type": "string", "minLength": 1, "maxLength": 2000},
+        offset={'type':'integer','minimum':0}, limit={'type':'integer','minimum':1,'maximum':50000},
+        expected_sha256={'type':'string','minLength':64,'maxLength':64},
     ),
+    max_output_chars=200000,
     permission="read",
     path_scope="authorized",
 )

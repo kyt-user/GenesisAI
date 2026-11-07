@@ -85,8 +85,10 @@ def test_request_image_count_is_bounded_without_mutating_full_history(tmp_path):
     projection = project_images(history, 2, 10000000)
     assert sum(len(image_parts(m.get('content'))) for m in projection) == 2
     assert sum(len(image_parts(m.get('content'))) for m in history) == 6
-    with pytest.raises(ValueError, match='必要图片'):
-        project_images([{'role': 'user', 'content': [part, part, part]}], 2, 10000000)
+    current = project_images([{'role': 'user', 'content': [part, part, part]}], 2, 10000000)
+    assert len(image_parts(current[0]['content'])) == 2
+    assert part['image_ref'] in content_text(current[0]['content'])
+    assert '不能视为已查看' in content_text(current[0]['content'])
 
 
 def test_mcp_mixed_image_text_is_not_discarded_and_unsupported_types_fail(tmp_path):

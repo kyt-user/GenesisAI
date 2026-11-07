@@ -13,6 +13,9 @@ from pathlib import Path
 from dataclasses import asdict
 
 from genesisai.agent.completion import CompletionValidator
+from genesisai.agent.progress import ProgressTracker
+from genesisai.shared.retry_policy import RetryPolicy
+from genesisai.shared.request_timeouts import RequestTimeouts
 from genesisai.agent.evidence import EvidenceBundle
 from genesisai.agent.recovery import RecoveryMixin, SOURCE_REF
 from genesisai.agent.state_machine import RunStateMachine, StateTransitionError
@@ -22,8 +25,8 @@ from genesisai.shared.budgets import (
 )
 from genesisai.shared.ids import uid
 from genesisai.shared.run_control import cancellation_requested
-from genesisai.shared.time_limits import (DEFAULT_TASK_SECONDS, DEFAULT_REQUEST_TIMEOUT,
-                                         DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS, PROGRESS_CHECKPOINT_ROUNDS)
+from genesisai.shared.time_limits import (DEFAULT_TASK_SECONDS,
+                                         DEFAULT_MAX_ROUNDS, DEFAULT_MAX_TOOLS, PROGRESS_CHECKPOINT_ROUNDS, exhausted, remaining)
 from genesisai.shared.messages import UserInput, content_text
 
 
@@ -45,21 +48,21 @@ class Runner(RecoveryMixin):
         *,
         max_rounds=DEFAULT_MAX_ROUNDS,
         max_tools=DEFAULT_MAX_TOOLS,
-        max_failures=3,
+        token_budget=None,
         seconds=DEFAULT_TASK_SECONDS,
-        request_timeout=DEFAULT_REQUEST_TIMEOUT,
+        request_timeouts=None,
         on_event=None,
     ):
         self.model, self.runtime, self.store = model, runtime, runtime.store
-        self.max_rounds, self.max_tools, self.max_failures, self.seconds = (
-            max_rounds,
-            max_tools,
-            max_failures,
-            seconds,
-        )
-        if min(seconds, request_timeout, max_rounds, max_tools, max_failures) <= 0:
-            raise ValueError("任务时限、请求超时和调用上限必须为正数")
-        self.request_timeout = request_timeout
+        self.max_rounds, self.max_tools, self.seconds = max_rounds, max_tools, seconds
+        self.token_budget = token_budget
+        if any(v is not None and (type(v) is not int or v < 1) for v in (max_rounds, max_tools, token_budget)):
+            raise ValueError("显式调用/Token预算必须为正整数")
+        if seconds is not None and (type(seconds) not in (int, float) or seconds <= 0):
+            raise ValueError("显式任务时限必须为正数")
+        RequestTimeouts.parse(request_timeouts)
+        self.timeout_overrides = (request_timeouts.as_dict() if isinstance(request_timeouts, RequestTimeouts)
+                                  else dict(request_timeouts or {}))
         self.on_event = on_event or (lambda *args: None)
         self.cancel_requested = False
         self._needs_verification = False
@@ -74,6 +77,11 @@ class Runner(RecoveryMixin):
 
     def set_model(self, model):
         self.model = model
+        self.retry_policy = RetryPolicy.parse(getattr(model, 'retry_config', None))
+        configured = RequestTimeouts.parse(getattr(model, 'request_timeouts', None)).as_dict()
+        self.request_timeouts = RequestTimeouts.parse({**configured, **self.timeout_overrides})
+        self.store.record.run_runtime['request_timeouts'] = self.request_timeouts.as_dict()
+        self.runtime.bind_model(model)
         if self.context_budgeter is not None:
             self.context_budgeter.configure(
                 getattr(model, "context_config", None),
@@ -196,8 +204,6 @@ class Runner(RecoveryMixin):
         text = request.text
         if not text.strip() and not request.images:
             raise ValueError("输入不能为空")
-        if len(text) > 3 * self.context_budgeter.config.input_limit:
-            raise ValueError("当前输入已超过配置的上下文预算")
         content = text
         if request.images:
             if not self.runtime.supports_images:
@@ -205,12 +211,8 @@ class Runner(RecoveryMixin):
                     "当前模型尚未确认支持图片；请通过 /model 选择图片模型，附件已保留"
                 )
             config = self.context_budgeter.config
-            if (
-                len(request.images) > config.max_images
-                or sum(len(p.data) for p in request.images)
-                > config.max_request_image_bytes
-            ):
-                raise ValueError("图片数量或总大小超过限制")
+            if sum(p.storage_bytes for p in request.images) > config.max_pending_image_bytes:
+                raise ValueError('原图与预览超过附件内存配额')
             parts = [self.runtime.images.import_image(p) for p in request.images]
             content = ([{"type": "text", "text": text}] if text else []) + parts
         self.store.verify_sources()
@@ -244,6 +246,10 @@ class Runner(RecoveryMixin):
             )
         project_manager = self.tasks
         active_task = self.tasks.active_task()
+        if active_task and active_task['status'] not in {'completed', 'cancelled', 'superseded'}:
+            previous_runtime = {**previous_runtime, **active_task['execution_context']}
+        elif active_task:
+            previous_runtime = {**previous_runtime, 'constraints': {}}
         try:
             self.runtime.prepare_turn()
         except (OSError, ValueError) as exc:
@@ -260,7 +266,7 @@ class Runner(RecoveryMixin):
             d.run_runtime["pending_intent"] = {
                 "kind": "continue_development",
                 "task_id": active_task["id"],
-                "objective": active_task["title"],
+                "objective": active_task["objective"],
                 "task_status": active_task["status"],
                 "current_phase": active_task["status"],
                 "default_plan_confirmed": self.prompt.accepts_default_plan(text),
@@ -277,8 +283,10 @@ class Runner(RecoveryMixin):
                 "instruction": text.strip(),
             }
         d.run_runtime["protocols"] = protocols
+        if route.get("followup") and previous_runtime.get("capability_target"):
+            d.run_runtime["capability_target"] = previous_runtime["capability_target"]
         d.run_runtime["budget"]["model_calls"] = self.max_rounds
-        d.run_runtime["model_call_limit"] = self.max_rounds
+        d.run_runtime["budget"].update(tools=self.max_tools, total_tokens=self.token_budget)
         if previous_runtime.get("evidence_refs") or (route.get("followup") and previous_runtime.get("candidates")):
             # 普通追问建立新 Run，但从上一 Run 搬运不可变候选、来源和证据索引。
             for key in (
@@ -294,11 +302,11 @@ class Runner(RecoveryMixin):
                     )
             d.run_runtime["reuse_evidence"] = bool(previous_runtime.get("evidence_refs"))
         d.run_runtime["execution_seconds_limit"] = self.seconds
-        d.run_runtime["request_timeout_seconds"] = self.request_timeout
+        d.run_runtime["request_timeouts"] = self.request_timeouts.as_dict()
         d.run_runtime["objective"] = (
-            active_task["title"]
+            active_task["objective"]
             if continuation
-            else (text or content_text(content, images=True))
+            else (previous_runtime.get("objective") if route.get("followup") and "capability_builder" in protocols else (text or content_text(content, images=True)))
         )
         d.run_runtime["execution_requested"] = route["execution_requested"]
         d.run_runtime["project_changed"] = False
@@ -311,12 +319,12 @@ class Runner(RecoveryMixin):
             rounds=0,
             tool_count=0,
             failures=0,
-            deadline=time.time() + self.seconds,
+            deadline=time.time() + self.seconds if self.seconds is not None else 0,
             pending=[],
             answer="",
             usage={},
             limits=dict(
-                rounds=self.max_rounds, tools=self.max_tools, failures=self.max_failures
+                rounds=self.max_rounds, tools=self.max_tools, total_tokens=self.token_budget
             ),
         )
         d.messages.append(dict(role="user", content=content))
@@ -333,15 +341,25 @@ class Runner(RecoveryMixin):
             self.machine.restart()
             self.machine.transition("execute", "prepared")
             self.cancel_requested = False
-            if "coding" in d.run_runtime["protocols"] and project_manager is not None:
+            if project_manager is not None:
                 try:
                     task = project_manager.begin_task(
-                        d.run_runtime["objective"], run_id=d.run_id
+                        d.run_runtime["objective"], run_id=d.run_id, instruction=text,
+                        new_task=route.get('new_task', False), constraint_changes=route.get('constraint_updates', []),
+                        execution_requested=route['execution_requested'],
                     )
+                    d.run_runtime['objective'] = task['objective']
+                    d.run_runtime['constraints'] = project_manager.effective_constraints(task, d.run_id)
+                    d.run_runtime.update(project_changed=bool(task['last_write_at']),
+                        verification_succeeded=task['verification_passed'], verification_required=task['verification_required'],
+                        change_revision=task['change_revision'], verified_revision=task['verification_revision'],
+                        changed_files=dict(task['changed_files']))
+                    if d.run_runtime['constraints'].get('read_only'):
+                        d.run_runtime['execution_requested'] = False
                     d.run_runtime["project_task_id"] = task["id"]
                     d.run_runtime["project_task_status"] = task["status"]
                 except Exception as exc:
-                    d.run_runtime["memory_error"] = f"{type(exc).__name__}: {exc}"
+                    return self.fail(exc, reason='task_state_error')
             self.research.register_user_urls(text)
             self.store.commit()
             self.store.event("run_start", profile=profile, phase="explore")
@@ -375,7 +393,7 @@ class Runner(RecoveryMixin):
         """构建当前轮次的模型上下文。"""
         try:
             if tools is None:
-                tools = [] if final or recovery else self.runtime.definitions()
+                tools = self.runtime.definitions()
             self.store.record.run_runtime["capabilities"] = {
                 "enabled": [item["function"]["name"] for item in tools],
             }
@@ -405,39 +423,18 @@ class Runner(RecoveryMixin):
         d.messages.append(
             dict(role="tool", tool_call_id=call["id"], content=self.runtime.model_content(call, result))
         )
-        code = (result.get("error") or {}).get("code")
-        if result["ok"]:
-            d.failures = 0
-            d.run_runtime.setdefault("correctable_errors", {}).pop(call["name"], None)
-        elif code in {"validation_error", "budget_exhausted", "task_constraint", "network_forbidden"}:
-            counters = d.run_runtime.setdefault("correctable_errors", {})
-            counters[call["name"]] = counters.get(call["name"], 0) + 1
-            if counters[call["name"]] > 2:
-                d.failures += 1
-        else:
-            d.failures += 1
+        d.failures = 0 if result["ok"] else d.failures + 1
+        if not ProgressTracker(d.run_runtime).observe(call, result):
+            d.run_runtime["stalled_action"] = call["name"]
         d.pending.pop(0)
-        if d.run_runtime.pop("source_read_paths", None):
-            d.run_runtime["response_issue"] = (
-                "补读机会已使用。请根据实际结果完整重写，只引用仍有效的来源；补读失败时说明缺口。"
-            )
-        if d.run_runtime.pop("price_read_candidates", None):
-            read_refs = result.get("source_refs") or (result.get("data") or {}).get("source_refs", [])
-            if result.get("ok") and set(read_refs).intersection(d.run_runtime["evidence_refs"]):
-                d.run_runtime["phase"] = "answer"
-                d.run_runtime["response_issue"] = "用已读取正文的 source_ref 核验金额。比较依据不足时以 [[PARTIAL]] 说明差什么。"
-            else:
-                d.run_runtime["phase"] = "recover"
-                d.run_runtime["stop_reason"] = "unsupported_evidence_claim"
-                d.run_runtime["response_issue"] = "补读未取得可引用正文。请以 [[PARTIAL]] 说明已有线索和缺口，略去未核实的金额。"
         if d.run_runtime.get("pending_question", {}).get("call_id") == call["id"]:
             d.run_runtime.pop("pending_question")
         if result.get("ok") and not d.pending and result.get("completion_candidate"):
             d.run_runtime["completion_candidate"] = result["completion_candidate"]
+        self._update_development_state(call, result)
         self.runtime.deliver_observations(
             result.get("observations", []), call_id=call["id"]
         )
-        self._update_development_state(call, result)
         self.store.commit()
         self.on_event("tool_result", result)
 
@@ -505,6 +502,7 @@ class Runner(RecoveryMixin):
         """标记取消请求并终止运行。"""
         self.run_logger.record("run_cancel")
         self.cancel_requested = True
+        self.runtime.cancel_jobs()
         for call in self.store.record.calls.values():
             if call.get("state") in {"started", "unknown"}:
                 call["acknowledged"] = True
@@ -546,7 +544,8 @@ class Runner(RecoveryMixin):
         paused_at = state.get("confirmation_paused_at")
         if paused_at is not None:
             duration = max(0, time.time() - paused_at)
-            d.deadline += duration
+            if d.deadline:
+                d.deadline += duration
             state["paused_seconds"] = state.get("paused_seconds", 0) + duration
             state["confirmation_paused_at"] = None
 
@@ -585,28 +584,17 @@ class Runner(RecoveryMixin):
             return self.fail(exc)
 
     def _confirm(self, approve):
-        """执行确认或拒绝操作，处理过期确认的重新预览。"""
+        """执行确认或拒绝操作；具体资源仍由执行器重新核对。"""
         d = self.store.record
         self._resume_clock(d)
         call = d.pending[0]
-        if time.time() >= d.deadline:
+        if d.deadline and time.time() >= d.deadline:
             return self.stop("limit_reached", "运行已超时；确认没有执行", "deadline")
         if cancellation_requested():
             return self.cancel()
         if approve:
             prior = d.calls.get(call["id"], {})
-            if prior.get("expires", 0) < time.time():
-                # 重建预览，但绝不用过期的确认执行。
-                result = self.runtime.execute(call)
-                if result.get("pending"):
-                    return self.status(
-                        "awaiting_confirmation",
-                        "确认已过期；目标已重新预览，请再次确认。",
-                    )
-                self.append_result(call, result)
-                self.machine.transition("execute", "confirmation_expired")
-                return self.drive()
-            result = self.runtime.execute(call, approved=prior.get("digest", "invalid"))
+            result = self._execute_tool_call(call, approved=prior.get("digest", "invalid"))
         else:
             result = self.research.after_execute(call, self.runtime.reject(call))
         self.machine.transition("execute", "confirmation_resolved")
@@ -633,27 +621,13 @@ class Runner(RecoveryMixin):
                 if self.cancel_requested or cancellation_requested():
                     return self.cancel()
                 state = d.run_runtime
-                limits = getattr(
-                    d,
-                    "limits",
-                    dict(
-                        rounds=self.max_rounds,
-                        tools=self.max_tools,
-                        failures=self.max_failures,
-                    ),
-                )
-                if time.time() >= d.deadline:
+                limits = d.limits
+                if d.deadline and time.time() >= d.deadline:
                     return self.finish_timeout(task_expired=True)
-                if d.failures >= limits["failures"]:
-                    if state["evidence_refs"]:
-                        self.research.force_answer("failure_limit")
-                    else:
-                        from genesisai.shared.execution import failure_summary
-                        return self.stop(
-                            "limit_reached",
-                            self.run_logger.journal.clean(failure_summary(d)),
-                            "failure_limit",
-                        )
+                if exhausted(limits.get("total_tokens"), d.usage.get("total_tokens", 0)):
+                    return self.stop("limit_reached", "已达到用户设置的Token预算，进度已保存。", "token_budget")
+                if state.get("stalled_action"):
+                    return self.stop("partial", "相同工具动作持续没有产生新结果，进度已保存：" + state["stalled_action"], "repeated_action")
                 if d.pending:
                     outcome = self._execute_pending(limits)
                     if outcome is not None:
@@ -670,8 +644,8 @@ class Runner(RecoveryMixin):
                 if d.rounds and d.rounds % PROGRESS_CHECKPOINT_ROUNDS == 0 and checkpoint != d.rounds:
                     state["progress_checkpoint"] = {
                         "round": d.rounds, "tools_used": d.tool_count,
-                        "remaining_rounds": max(0, limits["rounds"] - d.rounds),
-                        "remaining_seconds": max(0, round(d.deadline - time.time())),
+                        "remaining_rounds": remaining(limits["rounds"], d.rounds),
+                        "remaining_seconds": max(0, round(d.deadline - time.time())) if d.deadline else None,
                         "instruction": "核对计划与实际进展，复用已有结果并优先完成验证；没有进展时调整方法。硬上限不会重置。",
                     }
                     self.store.event("progress_checkpoint", **state["progress_checkpoint"])
@@ -679,7 +653,7 @@ class Runner(RecoveryMixin):
                 final, recovery = decision == "answer", decision == "recover"
                 if final and self.machine.state not in {"verify", "recover"}:
                     self.machine.transition("verify", "answer_ready")
-                if d.rounds >= limits["rounds"]:
+                if exhausted(limits["rounds"], d.rounds):
                     if state["evidence_refs"] or state.get("partial_response"):
                         state["stop_reason"] = "model_budget"
                         return self._finish_answer(state.get("partial_response") or
@@ -687,43 +661,7 @@ class Runner(RecoveryMixin):
                     return self.stop(
                         "limit_reached", "达到模型轮次上限", "model_budget"
                     )
-                if (
-                    not final
-                    and not recovery
-                    and limits["rounds"] > 1
-                    and state["usage"]["model_calls"]
-                    >= max(1, state["budget"]["model_calls"] - 1)
-                ):
-                    self.research.force_answer("model_answer_reserve")
-                    continue
-                self.research.note_progress_round()
-                tool_definitions = (
-                    [] if final or recovery else self.runtime.definitions()
-                )
-                source_paths = state.get("source_read_paths")
-                if source_paths:
-                    tool_definitions = self.runtime.definitions(names={"read_files"})
-                    if tool_definitions:
-                        tool_definitions[0]["function"]["parameters"] = {
-                            "type": "object", "properties": {"paths": {"type": "array",
-                                "items": {"type": "string", "enum": source_paths}, "minItems": 1, "maxItems": 3}},
-                            "required": ["paths"], "additionalProperties": False,
-                        }
-                    else:
-                        state.pop("source_read_paths", None)
-                        state["response_issue"] += " read_files 当前不可用，请只依据有效来源回答并说明缺口。"
-                        source_paths = None
-                price_urls = state.get("price_read_candidates")
-                if price_urls:
-                    if final or recovery:
-                        return self._price_gap()
-                    tool_definitions = [t for t in tool_definitions if t["function"]["name"] == "fetch_web_content"]
-                    if not tool_definitions:
-                        return self._price_gap()
-                    tool_definitions[0]["function"]["parameters"] = {
-                        "type": "object", "properties": {"url": {"type": "string", "enum": price_urls}},
-                        "required": ["url"], "additionalProperties": False,
-                    }
+                tool_definitions = self.runtime.definitions()
                 context = self.context(recovery=recovery, final=final, tools=tool_definitions)
                 response = self._call_model(context, tool_definitions)
                 if cancellation_requested():
@@ -737,7 +675,7 @@ class Runner(RecoveryMixin):
                         return outcome
                     continue
                 if response.finish_reason == "length":
-                    outcome = self._handle_length(response.content or "")
+                    outcome = self._handle_length(response.content or "", calls)
                     if outcome is not None:
                         return outcome
                     continue
@@ -751,41 +689,23 @@ class Runner(RecoveryMixin):
                         return outcome
                     continue
                 invalid = self._invalid_calls(calls, tool_definitions)
-                if source_paths and calls:
-                    try:
-                        args = json.loads(calls[0]["arguments"])
-                    except (TypeError, ValueError):
-                        args = None
-                    valid = (len(calls) == 1 and isinstance(args, dict) and set(args) == {"paths"}
-                             and isinstance(args["paths"], list) and 1 <= len(args["paths"]) <= 3
-                             and all(isinstance(path, str) and path in source_paths for path in args["paths"]))
-                    if invalid or not valid:
-                        state.pop("source_read_paths", None)
-                        state["response_issue"] = "失效文件补读调用无效，未执行。请用有效来源回答并明确缺口。"
-                        self.store.commit()
-                        continue
                 if invalid:
-                    if price_urls:
-                        return self._price_gap()
                     outcome = self._recover_tool_protocol(invalid)
                     if outcome is not None:
                         return outcome
                     continue
-                if price_urls and calls:
-                    try:
-                        args = json.loads(calls[0]["arguments"])
-                    except (TypeError, ValueError):
-                        args = None
-                    if len(calls) != 1 or not isinstance(args, dict) or set(args) != {"url"} or args["url"] not in price_urls:
-                        return self._price_gap()
                 state.pop("response_issue", None)
-                if state["phase"] == "answer" and calls:
-                    continue
+                if calls:
+                    state["phase"] = "explore"
+                    state["stop_reason"] = None
+                    if self.machine.state in {"verify", "recover"}:
+                        self.machine.transition("execute", "continue_execution")
                 if calls:
                     d.messages.append(
                         dict(
                             role="assistant",
                             content=response.content,
+                            reasoning=response.reasoning or "",
                             tool_calls=[dict(call) for call in calls],
                         )
                     )
@@ -794,8 +714,7 @@ class Runner(RecoveryMixin):
                     continue
                 if not response.content:
                     continue
-                state.pop("source_read_paths", None)
-                outcome = self._finish_answer(response.content)
+                outcome = self._finish_answer(response.content, reasoning=response.reasoning)
                 if outcome is not None:
                     return outcome
         except KeyboardInterrupt:
@@ -809,7 +728,7 @@ class Runner(RecoveryMixin):
     def _serialized_tool_markup(text):
         return re.search(r"<[^>\n]{0,40}DSML[^>\n]{0,40}(?:calls|invoke|parameter)", text or "", re.I)
 
-    def _finish_answer(self, answer_text, *, terminal=False):
+    def _finish_answer(self, answer_text, *, terminal=False, reasoning=None):
         """Validate every proposed final answer against the same evidence and task gates."""
         d = self.store.record
         state = d.run_runtime
@@ -831,15 +750,17 @@ class Runner(RecoveryMixin):
             answer_text = '[[PARTIAL]] ' + answer_text.lstrip().removeprefix('[[PARTIAL]]').strip()
         if self._serialized_tool_markup(answer_text):
             return self._recover_serialized_tool_output()
-        if not terminal and self.development.development_change_required(state):
-            return self.development.recover_tool_required(self)
-        # 自验证：文件修改后自动运行测试。
+        # 使用项目验证器；未注册时由模型按风险选择验证方法。
         if (
             self._needs_verification or state.get("verification_required")
         ) and not terminal and self.development.should_auto_verify(state):
             outcome = self.development.inject_verification_test(self)
             if outcome != "skip":
                 return outcome
+        if not terminal and not answer_text.lstrip().startswith("[[PARTIAL]]"):
+            issue = self.runtime.completion_issue()
+            if issue:
+                return self._request_repair("acceptance", issue, identity=issue)
         if self.machine.state in {"execute", "recover"}:
             self.machine.transition("verify", "model_answer")
         if not self._answer_refs_valid(answer_text):
@@ -853,7 +774,7 @@ class Runner(RecoveryMixin):
         self.store.verify_artifacts(current_run_only=True)
         EvidenceBundle(self.store).verify()
         d.messages.append(
-            dict(role="assistant", content=answer_text, tool_calls=None)
+            dict(role="assistant", content=answer_text, reasoning=reasoning or "", tool_calls=None)
         )
         self.store.commit()
         partial = answer_text.lstrip().startswith("[[PARTIAL]]")
@@ -897,6 +818,13 @@ class Runner(RecoveryMixin):
             answer,
         )
 
+    def _execute_tool_call(self, call, approved=None):
+        batch = next((message['tool_calls'] for message in reversed(self.store.record.messages)
+                      if message.get('role') == 'assistant' and message.get('tool_calls')
+                      and any(item.get('id') == call['id'] for item in message['tool_calls'])), [call])
+        with self.runtime.submission_batch(batch):
+            return self.runtime.execute(call, approved=approved)
+
     def _execute_pending(self, limits):
         """执行单个待处理工具调用并更新验证状态。"""
         d = self.store.record
@@ -904,8 +832,8 @@ class Runner(RecoveryMixin):
         prior = d.calls.get(call["id"])
         if prior and prior["state"] in {"unknown", "started"}:
             return self.status("interrupted", "存在不确定调用，禁止自动重放")
-        if not prior and d.run_runtime.get("pending_question", {}).get("call_id") != call["id"]:
-            if d.tool_count >= limits["tools"]:
+        if not prior and call["name"] != "read_job" and d.run_runtime.get("pending_question", {}).get("call_id") != call["id"]:
+            if exhausted(limits["tools"], d.tool_count):
                 if not d.run_runtime["evidence_refs"] and (
                     d.run_runtime["profile"] in {"direct_answer", "local_files"}
                     or d.run_runtime["usage"].get("search_queries", 0) == 0
@@ -919,7 +847,7 @@ class Runner(RecoveryMixin):
 
         self.on_event("tool_start", dict(name=call["name"]))
         started = time.monotonic()
-        result = self.runtime.execute(call)
+        result = self._execute_tool_call(call)
         elapsed_ms = round((time.monotonic() - started) * 1000)
 
         if "input_request" in result:
@@ -960,6 +888,8 @@ class Runner(RecoveryMixin):
         for item in result.get("observations", []):
             if item["kind"] == "resource_changed":
                 state["project_changed"] = True
+                state["change_revision"] = state.get("change_revision", 0) + 1
+                state.setdefault("changed_files", {})[item["path"]] = item.get("sha256")
                 if self.development.requires_change_verification(
                     result, run_state=state
                 ):
@@ -971,3 +901,4 @@ class Runner(RecoveryMixin):
                 self._needs_verification = not passed
                 state["verification_required"] = not passed
                 state["verification_succeeded"] = passed
+                state['verified_revision'] = state.get('change_revision', 0)

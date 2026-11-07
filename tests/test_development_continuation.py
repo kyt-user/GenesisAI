@@ -16,7 +16,10 @@ def development_env(tmp_path, *, planned=True):
     manager = TaskService(store)
     task = manager.begin_task("构建一个 HTML 猜数字小游戏")
     if planned:
-        manager.set_plan(steps=["创建 index.html"], acceptance=["页面可离线运行"])
+        manager.update_plan(expected_revision=0, upsert=[
+            {'id': 'create', 'kind': 'step', 'text': '创建 index.html'},
+            {'id': 'accept', 'kind': 'acceptance', 'text': '页面可离线运行', 'requires_verification': True},
+        ])
     store.record.apply(grants=[str(workspace)], output=str(workspace), deadline=time.time() + 300)
     store.commit()
     runtime = ToolRuntime(
@@ -30,7 +33,7 @@ def development_env(tmp_path, *, planned=True):
 
 def test_accept_default_continues_active_development_task(tmp_path):
     _, _, task, store, runtime = development_env(tmp_path)
-    model = FakeModel(Response(content="我会开始。"), Response(content="仍未写入。"))
+    model = FakeModel(*[Response(content="我会开始。") for _ in range(4)])
 
     result = Runner(model, runtime).start("按你的默认来")
 

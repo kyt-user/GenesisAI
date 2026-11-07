@@ -1,4 +1,4 @@
 name: docx_read
 enabled: true
 category: office
-description: 读取 DOCX 的段落、样式、表格和页眉页脚结构
+description: 按段落、表格行、页眉或页脚分页读取DOCX；next包含续读参数和源哈希，单元过长时沿text_offset继续

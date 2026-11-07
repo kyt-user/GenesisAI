@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import json
+from functools import lru_cache
 import importlib.util
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,110 +38,56 @@ class Tool:
         }
 
     def _validate_args(self, args: object) -> None:
-        self._validate_schema()
-        schema = self.parameters or {}
+        validator = self._validate_schema()
         if not isinstance(args, dict):
-            raise SchemaValidationError("工具参数必须是 JSON object")
+            raise SchemaValidationError('工具参数必须是 JSON object')
+        try:
+            json.dumps(args, allow_nan=False)
+        except (ValueError, TypeError, RecursionError) as exc:
+            raise SchemaValidationError('工具参数必须是有限数值组成的有效 JSON 数据') from exc
+        from referencing.exceptions import Unresolvable
+        try:
+            error = next(validator.iter_errors(args), None)
+        except (Unresolvable, RecursionError) as exc:
+            raise SchemaConfigError('工具 Schema 含不可解析或循环引用') from exc
+        if error is not None:
+            # Do not echo arbitrary input values (including interactive stdin)
+            # into diagnostics. The exact path and violated rule are sufficient.
+            detail = ''
+            if error.validator in {'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum'} and type(error.instance) in (int, float):
+                lower = error.schema.get('minimum', error.schema.get('exclusiveMinimum', '-∞'))
+                upper = error.schema.get('maximum', error.schema.get('exclusiveMaximum', '+∞'))
+                detail = f'；实际 {error.instance}，允许范围 {lower}..{upper}'
+            raise SchemaValidationError(f"字段 '{error.json_path}' 不满足 {error.validator} 约束{detail}；请按工具 Schema 修正参数")
 
-        required = schema.get("required", [])
-        for name in required:
-            if name not in args:
-                raise SchemaValidationError(f"缺少必需字段: '{name}'")
+    def _validate_schema(self):
+        schema = self.parameters
+        if not isinstance(schema, dict) or schema.get('type') != 'object':
+            raise SchemaConfigError('Schema 配置无效：parameters 必须声明 object 类型')
+        if schema.get('additionalProperties') is not False:
+            raise SchemaConfigError('Schema 配置无效：必须禁止未知参数')
+        properties, required = schema.get('properties', {}), schema.get('required', [])
+        if (not isinstance(properties, dict) or not isinstance(required, list)
+                or any(not isinstance(name, str) or name not in properties for name in required)):
+            raise SchemaConfigError('Schema 配置无效：required 必须引用已声明属性')
+        try:
+            encoded = json.dumps(schema, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise SchemaConfigError('Schema 配置必须是有效 JSON 数据') from exc
+        return _builtin_validator(encoded)
 
-        properties = schema.get("properties", {})
-        if schema.get("additionalProperties") is False:
-            unknown = set(args) - set(properties)
-            if unknown:
-                raise SchemaValidationError(f"包含未知字段: {sorted(unknown)[0]}")
 
-        validators = {
-            "string": lambda value: isinstance(value, str),
-            "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
-            "number": lambda value: isinstance(value, (int, float)) and not isinstance(value, bool),
-            "boolean": lambda value: isinstance(value, bool),
-            "array": lambda value: isinstance(value, list),
-            "object": lambda value: isinstance(value, dict),
-        }
-        for name, definition in properties.items():
-            if not isinstance(definition, dict):
-                raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的定义必须是对象")
-            if name not in args or definition.get("type") is None:
-                continue
-            expected = definition["type"]
-            validator = validators.get(expected)
-            if validator is None:
-                raise SchemaConfigError(f"Schema 配置无效：不支持的类型 '{expected}'")
-            if not validator(args[name]):
-                raise SchemaValidationError(f"字段 '{name}' 必须是 {expected} 类型，实际为 {type(args[name]).__name__}；请修正参数后重试")
-            if "enum" in definition and args[name] not in definition["enum"]:
-                raise SchemaValidationError(f"字段 '{name}' 不在允许的选项中；允许值：{definition['enum']}")
-            self._validate_bounds(args[name], definition, name)
-
-    def _validate_schema(self) -> None:
-        schema = self.parameters or {}
-        if not isinstance(schema, dict):
-            raise SchemaConfigError("Schema 配置无效：parameters 必须是对象")
-        if schema.get("type") not in (None, "object"):
-            raise SchemaConfigError(f"不支持的根类型: {schema.get('type')}")
-        if schema.get("additionalProperties") is not False:
-            raise SchemaConfigError("Schema 配置无效：必须禁止未知参数")
-        required = schema.get("required", [])
-        properties = schema.get("properties", {})
-        if not isinstance(required, list) or any(not isinstance(name, str) for name in required):
-            raise SchemaConfigError("Schema 配置无效：required 必须是字符串数组")
-        if not isinstance(properties, dict):
-            raise SchemaConfigError("Schema 配置无效：properties 必须是对象")
-        if any(name not in properties for name in required):
-            raise SchemaConfigError("Schema 配置无效：required 字段没有属性定义")
-        allowed = {"string", "integer", "number", "boolean", "array", "object"}
-        for name, definition in properties.items():
-            if not isinstance(name, str) or not isinstance(definition, dict):
-                raise SchemaConfigError("Schema 配置无效：属性定义必须是对象")
-            if definition.get("type") not in allowed:
-                raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 类型无效")
-            self._validate_property_schema(name, definition, allowed)
-
-    @staticmethod
-    def _validate_property_schema(name: str, definition: dict, allowed: set[str]) -> None:
-        for lower, upper in (("minLength", "maxLength"), ("minItems", "maxItems")):
-            for field in (lower, upper):
-                value = definition.get(field)
-                if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
-                    raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的 {field} 无效")
-            if lower in definition and upper in definition and definition[lower] > definition[upper]:
-                raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的边界颠倒")
-        for field in ("minimum", "maximum"):
-            value = definition.get(field)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
-                raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的 {field} 无效")
-        if "minimum" in definition and "maximum" in definition and definition["minimum"] > definition["maximum"]:
-            raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的数值边界颠倒")
-        if definition["type"] == "array":
-            items = definition.get("items")
-            if not isinstance(items, dict) or items.get("type") not in allowed:
-                raise SchemaConfigError(f"Schema 配置无效：属性 '{name}' 的 items 无效")
-
-    @classmethod
-    def _validate_bounds(cls, value, definition, name):
-        if isinstance(value, str):
-            if len(value) < definition.get("minLength", 0) or len(value) > definition.get("maxLength", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 长度超限：实际 {len(value)}，允许 {definition.get('minLength', 0)}..{definition.get('maxLength', '不限')}")
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            if value < definition.get("minimum", -float("inf")) or value > definition.get("maximum", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 数值超限：实际 {value}，允许 {definition.get('minimum', '不限')}..{definition.get('maximum', '不限')}；请修正后重试")
-        elif isinstance(value, list):
-            if len(value) < definition.get("minItems", 0) or len(value) > definition.get("maxItems", float("inf")):
-                raise SchemaValidationError(f"字段 '{name}' 项数超限：实际 {len(value)}，允许 {definition.get('minItems', 0)}..{definition.get('maxItems', '不限')}")
-            item_schema = definition.get("items", {})
-            for item in value:
-                if item_schema.get("type") == "string" and not isinstance(item, str):
-                    raise SchemaValidationError(f"字段 '{name}' 数组元素必须是字符串")
-                if item_schema.get("type") == "object":
-                    if not isinstance(item, dict):
-                        raise SchemaValidationError(f"字段 '{name}' 数组元素必须是对象")
-                    if "properties" in item_schema:
-                        Tool(name=name, description="", parameters=item_schema)._validate_args(item)
-                cls._validate_bounds(item, item_schema, name)
+@lru_cache(maxsize=128)
+def _builtin_validator(encoded):
+    from jsonschema import Draft202012Validator
+    from jsonschema.exceptions import SchemaError
+    from referencing import Registry
+    schema = json.loads(encoded)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise SchemaConfigError('Schema 配置无效：' + exc.message) from exc
+    return Draft202012Validator(schema, registry=Registry())
 
 
 @dataclass(frozen=True)
@@ -150,19 +98,36 @@ class ToolSpec:
     permission: str
     path_scope: str = "none"
     network: bool = False
+    network_boundary: str = 'public'
     side_effect: bool = False
     timeout_seconds: int = 30
+    execution: str = 'foreground'
+    execution_timeout_seconds: float | None = None
     max_output_chars: int = 12000
     platforms: tuple[str, ...] = ("win32", "linux", "darwin")
     dependencies: tuple[str, ...] = ()
+    dependency_extra: str | None = None
     history_lookup: bool = False
     routes: tuple[str, ...] = ()
     launches_service: bool = False
     awaits_input: bool = False
     external_schema: bool = False
     completion_field: str | None = None
+    requires_acceptance: bool = False
 
     def validate(self) -> None:
+        import math
+        if self.execution not in {'foreground', 'job'}:
+            raise SchemaConfigError('Spec execution 必须是 foreground 或 job')
+        if self.execution_timeout_seconds is not None and (
+                type(self.execution_timeout_seconds) not in (int, float)
+                or not math.isfinite(self.execution_timeout_seconds) or self.execution_timeout_seconds <= 0
+                or self.execution != 'job'):
+            raise SchemaConfigError('作业执行时限必须是正数，或不设置总时限')
+        if self.execution == 'job' and (self.awaits_input or self.requires_acceptance or self.completion_field):
+            raise SchemaConfigError('输入、注册验收和完成控制必须由前台处理')
+        if type(self.requires_acceptance) is not bool or (self.requires_acceptance and (self.permission != "write" or not self.side_effect)):
+            raise SchemaConfigError("用户验收操作必须是有副作用的 write 工具")
         if not isinstance(self.routes, tuple) or not all(isinstance(r, str) and r for r in self.routes):
             raise SchemaConfigError("Spec routes 必须是任务标签元组")
         if type(self.launches_service) is not bool or type(self.awaits_input) is not bool:
@@ -181,6 +146,8 @@ class ToolSpec:
             raise SchemaConfigError("Spec path_scope 无效")
         if not isinstance(self.network, bool) or not isinstance(self.side_effect, bool):
             raise SchemaConfigError("Spec 布尔字段无效")
+        if self.network_boundary not in {'public', 'private'} or (self.network_boundary == 'private' and not self.network):
+            raise SchemaConfigError('Spec network_boundary 必须是 public/private；private 仅适用于网络工具')
         if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or self.timeout_seconds < 1:
             raise SchemaConfigError("Spec timeout_seconds 无效")
         if type(self.max_output_chars) is not int or self.max_output_chars < 256:
@@ -189,6 +156,8 @@ class ToolSpec:
             raise SchemaConfigError("Spec platforms 无效")
         if not isinstance(self.dependencies, tuple) or any(not isinstance(item, str) or not item for item in self.dependencies):
             raise SchemaConfigError("Spec dependencies 无效")
+        if self.dependency_extra is not None and (not isinstance(self.dependency_extra, str) or not self.dependency_extra.isidentifier()):
+            raise SchemaConfigError('Spec dependency_extra 必须是可选依赖组名')
         if self.permission == "network" and not self.network:
             raise SchemaConfigError("网络工具必须声明 network=True")
         if self.permission != "network" and self.network:
@@ -213,7 +182,8 @@ class ToolSpec:
         if sys.platform not in self.platforms:
             return f"当前平台 {sys.platform} 不受支持"
         missing = [name for name in self.dependencies if importlib.util.find_spec(name) is None]
-        return "缺少可选依赖，请安装 genesisai[office]：" + ", ".join(missing) if missing else None
+        return (('缺少可选依赖，请安装 genesisai[' + self.dependency_extra + ']：')
+                if self.dependency_extra else '缺少可选依赖：') + ', '.join(missing) if missing else None
 
 
 @dataclass(frozen=True)
@@ -226,6 +196,9 @@ class ToolDescriptor:
     description: str
     directory: Path
     spec: ToolSpec
+    source: str = "builtin"
+    scope: str = "application"
+    provider: str | None = None
 
     def validate_arguments(self, args):
         if self.spec.external_schema:
@@ -244,7 +217,7 @@ class ToolDescriptor:
 
 class PartialToolResult(dict):
     """A failed operation with known partial results and observations."""
-    def __init__(self, code, message, **data):
+    def __init__(self, code, message, /, **data):
         super().__init__(data)
         self.error = {"code": code, "message": message, "retryable": False}
 
@@ -268,6 +241,8 @@ class ToolContext:
     # Explicitly injected live clients keep their identity on the host.
     hosted_network: bool = True
     hosted_providers: bool = True
+    call_id: str | None = None
+    authorization: dict | None = None
 
 
 def object_schema(required: list[str], **properties) -> dict:

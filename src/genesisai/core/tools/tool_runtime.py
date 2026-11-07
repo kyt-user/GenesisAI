@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from copy import copy
+from dataclasses import replace
 import json
 import time
 from pathlib import Path
 from genesisai.shared.ids import uid
 
 from genesisai.core.extensions.lsp.extension import register_lsp
-from genesisai.core.extensions.tools.shell.jobs import CommandJobs
+from genesisai.core.jobs.service import JobService
 from genesisai.core.tools.base import ToolContext
 from genesisai.core.memory.scope import CodeScope
 from genesisai.core.tools.catalog import ToolCatalog
@@ -40,6 +41,8 @@ from genesisai.core.memory.maintenance import Maintenance
 from genesisai.core.tools.observations import ObservationRegistry
 from genesisai.core.paths import ApplicationPaths
 from genesisai.core.registration import register_installed_extensions
+from genesisai.core.capabilities.service import CapabilityService
+from genesisai.core.capabilities.tools import register_lifecycle
 from genesisai.core.media.images import ImageStore
 from genesisai.shared.messages import validate_content
 
@@ -109,10 +112,11 @@ class ToolRuntime:
         self.memory = MemoryService(self.store, code_scope)
         self.tasks = TaskService(self.store)
         self.project_index = ProjectIndex(self.store, code_scope)
-        self.maintenance = Maintenance(self.store)
+        self.maintenance = Maintenance(self.store, limits=lambda: self.jobs._limits())
         self.maintenance.register(
-            "project_index", lambda options: self.project_index.refresh(**options)
+            "project_index", lambda options: self.project_index.refresh(**options, progress=self._maintenance_progress)
         )
+        self.maintenance.register('rebuild', self._rebuild_memory)
         self.observations = ObservationRegistry()
         self.context_budgeter.runtime = self
         self.research = ResearchController(self.store)
@@ -121,34 +125,46 @@ class ToolRuntime:
             getattr(self.store.record, "workspace") or self.access.workspace
         ).resolve()
         # Skills 可执行缝：内核工具 use_skill 经此取回 SKILL.md 正文。
-        self.skills = SkillRegistry(
-            workspace,
-            self.registry,
-            project_root=ApplicationPaths(self.store.root).project(
-                self.store.record.project_id
-            ),
-            user=self.store.root / "skills",
-        )
-        # MCP 桥接缝：读取应用目录 projects/<project_id>/mcp.json 并动态注册 category="mcp" 工具。
+        self.skills = SkillRegistry(self.registry)
         self.lsp_error = None
+        self.lsp = None
         try:
-            register_lsp(ApplicationPaths(store.root).project(store.record.project_id), self.registry, self.loader)
+            self.lsp = register_lsp(ApplicationPaths(store.root).project(store.record.project_id), self.registry, self.loader, state_root=store.root)
         except ValueError as exc:
             self.lsp_error = str(exc)
             self.logger.error("lsp_config_error", exc)
-        self.jobs = CommandJobs(store, self.logger.journal.clean)
+        self.jobs = JobService(store, self.logger.journal.clean, logger=self.logger)
         self.mcp = McpBridge(
             ApplicationPaths(self.store.root).project(self.store.record.project_id),
             self.registry,
             self.loader,
-        ).configure(self.store.record.mcp_tools)
+        ).configure(self.store.record.mcp_tools, servers=[])
         self.mcp.image_handler = self._mcp_image
         self.mcp.image_config = lambda: self.images.config
         register_installed_extensions(self)
+        self.capabilities = CapabilityService(self)
+        self._capability_tools = set()
+        self._capability_signature = None
+        self.capability_diagnostics = []
+        self.tool_allowlist = None
+        register_lifecycle(self)
+        self.refresh_capabilities()
+        if self.maintenance._queued():
+            self.maintenance.start()
+
+    def bind_model(self, model):
+        self.capabilities.model = model
+
+    def collect_tool_job(self, job_id, call_id):
+        from genesisai.core.jobs.tool_operation import collect_tool
+        return collect_tool(self, job_id, call_id)
+
+    def refresh_capabilities(self):
+        from genesisai.core.capabilities.activation import refresh
+        refresh(self)
 
     def prepare_turn(self):
         self.maintenance.enqueue("project_index")
-        self.maintenance.run_pending(limit=2)
 
     def deliver_observations(self, observations, *, call_id):
         self.tasks.observe(observations, call_id=call_id)
@@ -156,16 +172,30 @@ class ToolRuntime:
             item["path"] for item in observations if item["kind"] == "resource_changed"
         ]
         if changed:
+            self.project_index.mark_changed(changed)
             self.maintenance.enqueue("project_index", {"changed_paths": changed})
-            self.maintenance.run_pending(limit=2)
 
     def register_maintenance(self, name, handler):
         self.maintenance.register(name, handler)
+        self.maintenance.start()
+
+    @staticmethod
+    def _maintenance_progress(value):
+        from genesisai.shared.run_control import current_run
+        if control := current_run.get():
+            control.emit('maintenance_progress', value)
+
+    def _rebuild_memory(self, options):
+        if options:
+            raise ValueError('完整记忆重建不接受额外参数')
+        return {'project': self.project_index.refresh(force=True, progress=self._maintenance_progress),
+                'search': self.memory.rebuild_search()}
 
     def register_tool(self, descriptor, implementation):
         descriptor.spec.validate()
         if descriptor.name in self.registry:
             raise ValueError("Tool already registered: " + descriptor.name)
+        descriptor = replace(descriptor, source="external", scope="user")
         self.loader.register(descriptor.name, implementation)
         self.registry.register(descriptor)
 
@@ -221,21 +251,58 @@ class ToolRuntime:
             self.context.providers = value
             self.context.hosted_providers = True
 
+    def completion_issue(self):
+        """Check host-owned acceptance facts before delivering a completed task."""
+        state = self.store.record.run_runtime
+        if state.get("pending_execution_jobs"):
+            return "仍有未收取或结果未知的作业，请用 read_job 等待并核对：" + ", ".join(state["pending_execution_jobs"])
+        if state.get("constraints", {}).get("read_only") or not state.get("execution_requested"):
+            return None
+        issue = self.tasks.completion_issue()
+        if issue:
+            return issue
+        if "capability_builder" in state.get("protocols", []):
+            target = state.get("capability_target")
+            if not target:
+                return "能力构建尚无实际草稿。请执行已授权的构建步骤；计划或下一步说明不是完成结果。"
+            item = self.capabilities.store.get(target["id"])
+            actual = self.capabilities.summary(item)["state"]
+            required = state.get("capability_goal", "registered")
+            ranks = {"draft": 0, "tested": 1, "registered": 2}
+            if ranks[actual] < ranks[required]:
+                return f"能力实际状态为{actual}，验收目标为{required}。继续修订/测试/请求用户验收注册，不得宣称已安装。"
+        elif not self.tasks.has_execution_evidence() and not any(item.get("ok") and item.get("tool") not in {"plan", "discover_tools", "search_skills", "use_skill", "inspect_capabilities"}
+                     and not (item.get("tool") in self.registry and self.registry.get(item["tool"]).spec.completion_field)
+                     for item in state.get("tool_activity", [])):
+            return "实际执行任务尚无工具事实。请先检查或执行；若无需修改，应取得当前项目状态支持该结论。"
+        return None
+
     def definitions(self, *, names=None) -> list[dict]:
+        self.refresh_capabilities()
         self.catalog.refresh()
         available = self.catalog.available_tools()
+        if self.tool_allowlist is not None:
+            available = [item for item in available if item.name in self.tool_allowlist]
         if names is not None:
             return [item.definition() for item in available if item.name in names]
-        skill_tools = {name for skill in self.store.record.tool_runtime["active_skills"]
-                       if skill in self.skills.items for name in self.skills.items[skill].tools}
+        skill_tools = self.skills.active_tools(self.store.record.tool_runtime['active_skills'], available=self.catalog.available)
         state = {**self.store.record.run_runtime, "pending_tools": self.store.record.pending}
-        selected = select_tools(available, state, skill_tools)
+        selected = select_tools(available, state, skill_tools,
+                                token_budget=max(1, self.context_budgeter.config.input_limit // 8))
         return [item.definition() for item in selected]
 
-    def discover_tools(self, query, limit, activate=True):
+    def submission_batch(self, calls):
+        from genesisai.core.jobs.submission import submission_batch
+        return submission_batch(self, calls)
+
+    def discover_tools(self, query='', limit=20, activate=True, *, offset=0, provider=None, category=None, source=None):
         self.catalog.refresh()
         matches = discover([item for item in self.catalog.available_tools()
-                            if allowed_by_constraints(item, self.store.record.run_runtime)], query, limit)
+                            if (self.tool_allowlist is None or item.name in self.tool_allowlist)
+                            and allowed_by_constraints(item, self.store.record.run_runtime)], query, limit + 1,
+                            offset=offset, provider=provider, category=category, source=source)
+        more = len(matches) > limit
+        matches = matches[:limit]
         state = self.store.record.run_runtime
         if activate:
             selected = [*state.get("discovered_tools", []), *(item["name"] for item in matches)]
@@ -243,6 +310,7 @@ class ToolRuntime:
             state["explicit_discovery"] = next((item["name"] for item in matches if item["name"].casefold() == query.strip().casefold()), None)
         selected_names = {item["function"]["name"] for item in self.definitions()} if activate else set()
         return {"available_next_round": [item for item in matches if item["name"] in selected_names], "candidates": matches,
+                "next_offset": offset + limit if more else None,
                 "deferred": [item["name"] for item in matches if activate and item["name"] not in selected_names]}
 
     def model_content(self, call, result):
@@ -283,6 +351,9 @@ class ToolRuntime:
         return result
 
     def _execute(self, call: dict, approved: str | None = None) -> dict:
+        self.refresh_capabilities()
+        if self.tool_allowlist is not None and call.get("name") not in self.tool_allowlist:
+            return error_result(call, "tool_unavailable", "此试运行只允许 Skill 声明的工具")
         self.catalog.refresh()
         # 先校验调用资格，再查询研究缓存或权限。
         try:
@@ -305,6 +376,30 @@ class ToolRuntime:
             result = error_result(call, "task_constraint", "当前用户任务约束不允许此操作；调用未执行。请使用允许的能力继续。")
             self.ledger.finish(call, result, 0)
             return result
+        if descriptor.spec.side_effect and descriptor.spec.path_scope == "workspace" and self.store.record.status == "running":
+            from genesisai.core.extensions.rules import RulesLoader
+            from genesisai.shared.security import digest
+            args = json.loads(call["arguments"])
+            paths = []
+            def collect(value):
+                if isinstance(value, dict):
+                    for key, child in value.items():
+                        if key in {"path", "cwd", "source", "destination", "new_path"} and isinstance(child, str):
+                            paths.append(child)
+                        elif isinstance(child, (dict, list)):
+                            collect(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        collect(child)
+            collect(args)
+            blocks = RulesLoader(self.store.workspace, application_root=self.store.root).load(paths)
+            state = self.store.record.run_runtime
+            changed = [b for b in blocks if state.get("presented_rules", {}).get(b["path"]) != digest(b)]
+            if changed:
+                state["rule_paths"] = list(dict.fromkeys([*state.get("rule_paths", []), *paths]))
+                result = error_result(call, "rules_context_changed", "操作范围存在尚未呈现或已变更的 AGENTS.md；已加入下一轮上下文，请读取适用规则后继续此操作。")
+                self.ledger.finish(call, result, 0)
+                return result
         blocked = self.research.before_execute(call)
         if blocked is not None:
             result = self._validate_result(call, blocked)
@@ -384,7 +479,10 @@ class ToolRuntime:
         return self.policy.mode
 
     def set_permission(self, mode: str) -> None:
-        policy = PermissionPolicy(mode)
+        from genesisai.core.tools.authorization import AuthorizationService
+        if not hasattr(self, 'authorizations'):
+            self.authorizations = AuthorizationService(self.store)
+        policy = PermissionPolicy(mode, self.authorizations)
         previous = getattr(self.store.record, "permission_mode", "user")
         if previous != mode:
             self.store.record.permission_mode = mode
@@ -394,6 +492,7 @@ class ToolRuntime:
                 self.store.record.permission_mode = previous
                 raise
             if mode == "user" and hasattr(self, "mcp"):
+                self.jobs.stop_all()
                 self.close()
         self.policy = policy
         self.access.host_access = mode == "auto"
@@ -401,8 +500,14 @@ class ToolRuntime:
             self.executor.policy = policy
 
     def close(self):
+        self.maintenance.close()
+        if self.lsp:
+            self.lsp.close()
         self.jobs.close()
         self.mcp.close()
+
+    def cancel_jobs(self):
+        self.jobs.stop_run(self.store.record.run_id)
 
     def confirmation_message(self, name: str) -> str:
         """根据工具固定 Spec 返回准确的待确认类型。"""
@@ -423,11 +528,12 @@ class ToolRuntime:
         return "需要确认当前操作"
 
     def inventory(self) -> dict[str, list[dict]]:
-        """返回启用/禁用工具清单（CLI 展示用）。"""
+        """返回内置/外挂清单；每项包含是否可用。"""
+        self.refresh_capabilities()
         self.catalog.refresh()
         inventory = self.catalog.inventory()
         if self.lsp_error:
-            inventory["disabled"].append({"name": "lsp_query", "category": "lsp",
+            inventory["external"].append({"name": "lsp_query", "category": "lsp", "source": "external", "enabled": False,
                                           "description": "语言服务查询", "reason": self.lsp_error})
         return inventory
 

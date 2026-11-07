@@ -21,10 +21,10 @@ import yaml
 from genesisai.model.config import build_model
 from genesisai.agent.loop import Runner
 from genesisai.shared.security import Access
-from genesisai.core.extensions.skills.registry import SkillRegistry
 from genesisai.core.persistence.session import Session
 from genesisai.core.persistence.files import atomic_json
 from genesisai.core.tools.tool_runtime import ToolRuntime
+from genesisai.core.extensions.tools.web.contracts import SearchPage
 
 
 CASE_FIELDS = frozenset({"id", "name", "stages", "prompt", "fixture", "assertions", "forbidden", "artifacts"})
@@ -58,7 +58,9 @@ def load_dataset(root):
 class FixtureProvider:
     name = "fixture"
     def __init__(self, data): self.data = data
-    def search(self, query, limit=5): return self.data["results"][:limit]
+    def search(self, query, limit=10):
+        end = query.offset + limit
+        return SearchPage(self.data['results'][query.offset:end], end if end < len(self.data['results']) else None)
 
 
 class FixtureNetwork:
@@ -68,14 +70,11 @@ class FixtureNetwork:
         return {**self.data["page"], "truncated": False}
 
 
-def make_runtime(workspace, run_root, *, providers=None, network=None, project_config=None):
+def make_runtime(workspace, run_root, *, providers=None, network=None):
     state = run_root / "state"; output = run_root / "outputs"; output.mkdir(parents=True, exist_ok=True)
     store = Session(state, workspace=workspace)
     store.record.apply(grants=[str(workspace)], output=str(output), run_id='run_simulation')
     store.commit()
-    if project_config is not None and project_config.is_dir():
-        from genesisai.core.paths import ApplicationPaths
-        shutil.copytree(project_config, ApplicationPaths(store.root).project(store.record.project_id))
     runtime = ToolRuntime(store, Access([workspace], output, state, workspace_root=workspace), providers=providers, network=network, permission_mode="auto")
     return store, runtime, output
 
@@ -95,12 +94,35 @@ def runtime_report(store, runtime):
     """返回不含 Prompt 正文、工具参数和密钥的运行摘要。"""
     data = store.record
     run = getattr(data, 'run_runtime', {})
-    return {'session_id': store.id, 'run_id': getattr(data, 'run_id'), 'runner_state': getattr(data, 'status'), 'lifecycle': run.get('lifecycle'), 'stop_reason': run.get('stop_reason'), 'rounds': getattr(data, 'rounds', 0), 'model_calls': (run.get('usage') or {}).get('model_calls', 0), 'tool_calls': len(getattr(data, 'calls', {})), 'tokens': (getattr(data, 'usage') or {}).get('total_tokens', 0), 'prompt_hashes': run.get('prompt_hashes', {}), 'active_skills': list(getattr(data, 'tool_runtime', {}).get('active_skills', [])), 'permissions': runtime.permission_mode, 'recovery_counts': run.get('recovery_counts', {}), 'calls': [{'id': identifier, 'name': item.get('call', {}).get('name'), 'state': item.get('state')} for identifier, item in getattr(data, 'calls', {}).items()], 'changes': getattr(data, 'changes', []), 'artifacts': list(getattr(data, 'artifacts', {})), 'sources': list(getattr(data, 'sources', {}))}
+    return {'session_id': store.id, 'run_id': getattr(data, 'run_id'), 'runner_state': getattr(data, 'status'), 'lifecycle': run.get('lifecycle'), 'stop_reason': run.get('stop_reason'), 'rounds': getattr(data, 'rounds', 0), 'model_calls': (run.get('usage') or {}).get('model_calls', 0), 'tool_calls': len(getattr(data, 'calls', {})), 'tokens': (getattr(data, 'usage') or {}).get('total_tokens', 0), 'prompt_hashes': run.get('prompt_hashes', {}), 'active_skills': dict(getattr(data, 'tool_runtime', {}).get('active_skills', {})), 'permissions': runtime.permission_mode, 'recovery_counts': run.get('recovery_counts', {}), 'calls': [{'id': identifier, 'name': item.get('call', {}).get('name'), 'state': item.get('state')} for identifier, item in getattr(data, 'calls', {}).items()], 'changes': getattr(data, 'changes', []), 'artifacts': list(getattr(data, 'artifacts', {})), 'sources': list(getattr(data, 'sources', {}))}
 
 
-def run_offline_case(case, workspace, run_root, project_config=None):
+def install_fixture_skill(runtime, package_path):
+    """Harness explicitly tests and accepts this known fixture through the executor."""
+    from genesisai.app.evals.python_development import ScriptedModel, _tool
+    from genesisai.shared.messages import Response
+    from genesisai.app.capability_commands import read_manifest
+    # The harness explicitly grants read access to fixture sources.
+    runtime.access.roots.append(package_path.parent.resolve())
+    package = read_manifest(runtime, str(package_path))
+    item = require_ok(call(runtime, "create_skill", {key: value for key, value in package.items() if key != "kind"}))
+    require_ok(call(runtime, "freeze_capability", {"id": item["id"], "expected_revision": item["revision"]}))
+    script = "import subprocess,sys; from pathlib import Path; subprocess.run([sys.executable,'-m','pytest','-q'],check=True); Path('check.txt').write_text('pytest passed')"
+    runtime.bind_model(ScriptedModel([_tool("skill_check", "run_commands", {"command": [sys.executable, "-c", script], "cwd": ".", "timeout_seconds": 60}), Response(content="pytest 通过，已生成 check.txt")]))
+    reference = {key: item[key] for key in ("id", "revision", "digest")}
+    tested = require_ok(call(runtime, "test_capability", reference))
+    if not tested["report"]["passed"]:
+        raise RuntimeError("Skill 夹具未通过真实任务测试")
+    pending = call(runtime, "register_capability", reference)
+    if not pending.get("pending"):
+        raise RuntimeError("Skill 夹具必须等待显式验收")
+    saved = next(value for value in reversed(list(runtime.store.record.calls.values())) if value["call"]["name"] == "register_capability")
+    require_ok(runtime.execute(saved["call"], approved=saved["digest"]))
+
+
+def run_offline_case(case, workspace, run_root, capability_path=None):
     identifier = case["id"]
-    store, runtime, output = make_runtime(workspace, run_root, project_config=project_config)
+    store, runtime, output = make_runtime(workspace, run_root)
     checks = {}
     if identifier == "case_01_code_fix":
         subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
@@ -110,8 +132,8 @@ def run_offline_case(case, workspace, run_root, project_config=None):
         before = require_ok(call(runtime, "read_files", {"path": "calculator.py"}))["files"][0]["sha256"]
         patch = "@@ -1,2 +1,2 @@\n def add(left, right):\n-    return left - right\n+    return left + right"
         require_ok(call(runtime, "editor", {"operation": "patch", "path": "calculator.py", "patch": patch, "expected_sha256": before}))
-        test = require_ok(call(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))
-        diff = require_ok(call(runtime, "run_commands", {"operation": "run", "command": ["git", "diff"], "cwd": "."}))
+        test = require_ok(call(runtime, "run_commands", {"command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))
+        diff = require_ok(call(runtime, "run_commands", {"command": ["git", "diff"], "cwd": "."}))
         checks = {"product_fixed": "left + right" in (workspace / "calculator.py").read_text(), "test_passed": test["exit_code"] == 0, "test_unchanged": (workspace / "test_calculator.py").read_bytes() == original_test, "git_read": "calculator.py" in diff["stdout"]}
     elif identifier == "case_02_file_management":
         (workspace / "windows.txt").write_bytes(b"\xef\xbb\xbfalpha\r\nbeta\r\n")
@@ -131,9 +153,10 @@ def run_offline_case(case, workspace, run_root, project_config=None):
         state = store.record.run_runtime
         checks = {"candidate": state["candidate_count"] == 1, "fetched": state["fetched_count"] == 1, "evidence": bool(state["evidence_refs"]), "source": bool(fetched["source_refs"]), "session_allow": runtime.permission_mode == "auto"}
     elif identifier == "case_04_skill":
+        install_fixture_skill(runtime, capability_path)
         skill = runtime.skills.describe("project_check", include_content=True)
-        test = require_ok(call(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))
-        checks = {"project_skill": skill["source"] == "project", "test_passed": test["exit_code"] == 0}
+        test = require_ok(call(runtime, "run_commands", {"command": [sys.executable, "-m", "pytest", "-q"], "cwd": ".", "timeout_seconds": 60}))
+        checks = {"registered_project_skill": skill["source"] == "external" and skill["scope"] == "project", "test_passed": test["exit_code"] == 0}
     elif identifier == "case_05_office_files":
         seed = yaml.safe_load((workspace / "content.yaml").read_text(encoding="utf-8"))
         original_doc = require_ok(call(runtime, "docx_create", {"path": "original.docx", "title": seed["title"], "paragraphs": seed["paragraphs"]}))
@@ -143,13 +166,13 @@ def run_offline_case(case, workspace, run_root, project_config=None):
         edited_xlsx = require_ok(call(runtime, "xlsx_edit", {"source": original_xlsx["path"], "path": "edited.xlsx", "cells": {"Data!B2": "=1+1"}}))
         deck = require_ok(call(runtime, "pptx_create", {"path": "created.pptx", "slides": [{"title": seed["title"], "bullets": ["Verified"]}]}))
         pdf = require_ok(call(runtime, "pdf_create", {"path": "created.pdf", "lines": [seed["title"], "Verified"]}))
-        checks = {"docx": require_ok(call(runtime, "docx_read", {"path": edited_doc["path"]}))["paragraphs"][-1]["text"].startswith("Updated"), "xlsx": edited_xlsx["verified"], "pptx": bool(require_ok(call(runtime, "pptx_read", {"path": deck["path"]}))["slides"]), "pdf": require_ok(call(runtime, "pdf_read", {"path": pdf["path"]}))["page_count"] == 1, "originals_preserved": Path(original_doc["path"]).is_file() and Path(original_xlsx["path"]).is_file()}
+        checks = {"docx": require_ok(call(runtime, "docx_read", {"path": edited_doc["path"]}))["items"][-1]["text"].startswith("Updated"), "xlsx": edited_xlsx["verified"], "pptx": bool(require_ok(call(runtime, "pptx_read", {"path": deck["path"]}))["items"]), "pdf": require_ok(call(runtime, "pdf_read", {"path": pdf["path"]}))["items"][0]["page_count"] == 1, "originals_preserved": Path(original_doc["path"]).is_file() and Path(original_xlsx["path"]).is_file()}
     else:
         raise ValueError("未知案例")
     return {"status": "passed" if all(checks.values()) else "failed", "assertions": checks, **runtime_report(store, runtime)}
 
 
-def run_deepseek_case(case, workspace, run_root):
+def run_deepseek_case(case, workspace, run_root, capability_path=None):
     from genesisai.app.cli import load_environment
     load_environment(workspace=workspace)
     if case["id"] == "case_01_code_fix":
@@ -173,6 +196,8 @@ def run_deepseek_case(case, workspace, run_root):
                 sheet.append(row)
         workbook.save(workspace / "source.xlsx")
     store, runtime, _ = make_runtime(workspace, run_root)
+    if case["id"] == "case_04_skill":
+        install_fixture_skill(runtime, capability_path)
     model, remote = build_model(None)
     if not remote: raise RuntimeError("P7 DeepSeek 模式要求远程 OpenAI 兼容模型")
     original_tests = {
@@ -229,7 +254,8 @@ def run_all(dataset, output, *, mode="offline", selected=None):
             shutil.rmtree(case_root, onexc=remove_readonly)
         shutil.copytree(fixture, workspace)
         try:
-            detail = run_offline_case(case, workspace, case_root, fixture.parent / "project_config") if mode == "offline" else run_deepseek_case(case, workspace, case_root)
+            capability_path = fixture.parent / "capability.json"
+            detail = run_offline_case(case, workspace, case_root, capability_path) if mode == "offline" else run_deepseek_case(case, workspace, case_root, capability_path)
         except Exception as exc:
             detail = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
         detail.update(

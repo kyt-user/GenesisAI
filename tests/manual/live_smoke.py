@@ -32,8 +32,8 @@ def main():
     network=Network()
     for name,action in {
         'fetch':lambda:network.fetch('https://www.python.org/about/'),
-        'query':lambda:[h.to_dict() for h in DuckDuckGoSearchProvider(client=network).search(SearchQuery('Python official about'),limit=3)],
-        'bing_query':lambda:[h.to_dict() for h in BingSearchProvider(client=network).search(SearchQuery('Python official about'),limit=3)]
+        'query':lambda:[h.to_dict() for h in DuckDuckGoSearchProvider(client=network).search(SearchQuery('Python official about'),limit=3).hits],
+        'bing_query':lambda:[h.to_dict() for h in BingSearchProvider(client=network).search(SearchQuery('Python official about'),limit=3).hits]
     }.items():
         try:
             result=action()

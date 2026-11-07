@@ -1,7 +1,7 @@
 """Select schemas per turn and discover more by capability or exact name."""
 
 import re
-import json
+from genesisai.core.prompt.compaction import estimate_tokens
 
 FORMAT_TERMS = {
     "xlsx": ("xlsx", "excel", "工作簿", "电子表格"),
@@ -29,6 +29,8 @@ def task_routes(state):
     routes = {"base", profile, *state.get("protocols", []), *state.get("capability_routes", [])}
     if profile.startswith("web") or state.get("reuse_evidence"):
         routes.add("web")
+    if state.get("history_lookup"):
+        routes.add("memory")
     if state.get("background_jobs"):
         routes.add("jobs")
     if state.get("output_refs"):
@@ -36,33 +38,31 @@ def task_routes(state):
     return routes
 
 
-def select_tools(available, state, skill_tools=()):
-    if state.get("history_lookup"):
-        return [item for item in available if item.spec.history_lookup]
+def select_tools(available, state, skill_tools=(), *, token_budget):
     routes = task_routes(state)
     protected = set(skill_tools) | {call["name"] for call in state.get("pending_tools", [])}
     if state.get("explicit_discovery"):
         protected.add(state["explicit_discovery"])
-    protected.update(item.get("tool") for item in state.get("tool_activity", [])[-6:] if item.get("tool") != "discover_tools")
-    protected.update(item.name for item in available if "base" in item.spec.routes)
+    protected.update(item.get("tool") for item in state.get("tool_activity", []) if item.get("tool") != "discover_tools")
+    protected.update(item.name for item in available if "base" in item.spec.routes or (state.get("history_lookup") and item.spec.history_lookup))
     words = set(re.findall(r"[a-z][a-z0-9_]+", str(state.get("objective", "")).lower()))
     discovered = list(reversed(state.get("discovered_tools", ())))
     ranks = {name: i for i, name in enumerate(discovered)}
     candidates = [item for item in available if allowed_by_constraints(item, state) and (
         item.name in protected or item.name in ranks or item.name in words or routes.intersection(item.spec.routes))]
-    # 基础、活动 Skill、最近使用和待执行工具保留；其余按定义字符预算选择。
+    # Required schemas survive route changes. Optional schemas share the configured model budget.
     ordered = sorted(candidates, key=lambda item: (item.name not in protected, ranks.get(item.name, len(ranks)), item.name))
-    remaining = 24000
+    remaining = token_budget
     selected = set()
     for item in ordered:
-        size = len(json.dumps(item.definition(), ensure_ascii=False))
+        size = estimate_tokens(item.definition())
         if item.name in protected or size <= remaining:
             selected.add(item.name)
             remaining -= size
     return [item for item in available if item.name in selected]
 
 
-def discover(available, query, limit):
+def discover(available, query, limit, *, offset=0, provider=None, category=None, source=None):
     words = re.findall(r"[a-z0-9_]+|[\u3400-\u9fff]+", query.casefold())
     words.extend(name for name, aliases in CAPABILITY_TERMS.items() if any(alias in query for alias in aliases))
     # 中文没有空格时，用短片段补召回；精确工具名仍有最高权重。
@@ -74,6 +74,9 @@ def discover(available, query, limit):
     )
     scored = []
     for item in available:
+        if any(expected is not None and getattr(item, field) != expected
+               for field, expected in (('provider', provider), ('category', category), ('source', source))):
+            continue
         fields = " ".join(
             (item.name, item.category, *item.spec.routes, item.description)
         ).casefold()
@@ -90,9 +93,10 @@ def discover(available, query, limit):
             for word in words
         )
         score += min(3, sum(fragment in fields for fragment in fragments))
-        if score:
-            scored.append((-score, item.name, item.description))
+        if score or not query.strip():
+            scored.append((-score, item.name, item))
     return [
-        {"name": name, "description": description}
-        for _, name, description in sorted(scored)[:limit]
+        {"name": name, "description": item.description, "provider": item.provider,
+         "category": item.category, "source": item.source}
+        for _, name, item in sorted(scored)[offset:offset + limit]
     ]

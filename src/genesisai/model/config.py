@@ -11,7 +11,7 @@ import yaml
 
 DEFAULT_CONFIG = Path(__file__).with_name("default.yaml")
 PROVIDERS = frozenset({"deepseek", "qwen", "qwen_token_plan"})
-TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation", "context"})
+TOP_LEVEL_KEYS = frozenset({"provider", "model", "generation", "context", "retry", "request_timeouts"})
 GENERATION_KEYS = frozenset({"max_tokens", "temperature", "top_p"})
 
 
@@ -21,6 +21,8 @@ class ModelConfig:
     model: str
     generation: dict = field(default_factory=dict)
     context: dict = field(default_factory=dict)
+    retry: dict = field(default_factory=dict)
+    request_timeouts: dict = field(default_factory=dict)
 
 
 def load_model_config(path=None) -> ModelConfig:
@@ -57,7 +59,13 @@ def load_model_config(path=None) -> ModelConfig:
     from genesisai.shared.context_config import ContextConfig
     context = data.get('context', {})
     ContextConfig.parse(context)
-    return ModelConfig(provider=provider, model=model.strip(), generation=dict(generation), context=context)
+    from genesisai.shared.retry_policy import RetryPolicy
+    retry = data.get('retry', {})
+    RetryPolicy.parse(retry)
+    from genesisai.shared.request_timeouts import RequestTimeouts
+    timeouts = data.get('request_timeouts', {})
+    RequestTimeouts.parse(timeouts)
+    return ModelConfig(provider=provider, model=model.strip(), generation=dict(generation), context=context, retry=retry, request_timeouts=timeouts)
 
 
 def build_model(path=None, settings=None):
@@ -74,9 +82,10 @@ def build_model(path=None, settings=None):
     from genesisai.model.providers.qwen_token_plan import QwenTokenPlanClient
 
     classes = dict(deepseek=DeepSeekClient, qwen=QwenClient, qwen_token_plan=QwenTokenPlanClient)
-    client = classes[config.provider](model=config.model, generation=config.generation)
+    client = classes[config.provider](model=config.model, generation=config.generation, request_timeouts=config.request_timeouts)
     client.context_config = config.context
-    host = urlsplit(str(client.client.base_url)).hostname
+    client.retry_config = config.retry
+    host = urlsplit(str(client.base_url)).hostname
     remote = host not in {"localhost", "127.0.0.1", "::1"}
     return client, remote
 
@@ -97,6 +106,7 @@ def _build_from_settings(settings):
         "model": settings.model.strip(),
         "generation": dict(settings.generation or {}),
         "api_key": settings.api_key or None,
+        "request_timeouts": settings.request_timeouts,
     }
     if settings.base_url:
         kwargs["base_url"] = settings.base_url
@@ -104,7 +114,10 @@ def _build_from_settings(settings):
     from genesisai.shared.context_config import ContextConfig
     ContextConfig.parse(settings.context)
     client.context_config = dict(settings.context)
-    host = urlsplit(str(client.client.base_url)).hostname
+    from genesisai.shared.retry_policy import RetryPolicy
+    client.retry_config = dict(getattr(settings, 'retry', {}))
+    RetryPolicy.parse(client.retry_config)
+    host = urlsplit(str(client.base_url)).hostname
     remote = host not in {"localhost", "127.0.0.1", "::1"}
     return client, remote
 

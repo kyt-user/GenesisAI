@@ -6,10 +6,10 @@ class Implementation:
         }
 
     def execute(self, context, args):
+        offset, limit = args.get('offset', 0), args.get('limit', 8)
+        matches = context.runtime.memory.search(args['query'], corpus=args.get('corpus', 'all'),
+                                                limit=limit + 1, offset=offset)
         return {
-            "matches": context.runtime.memory.search(
-                args["query"],
-                corpus=args.get("corpus", "all"),
-                limit=args.get("limit", 8),
-            )
+            "matches": matches[:limit],
+            "next_offset": offset + limit if len(matches) > limit else None,
         }

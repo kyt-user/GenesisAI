@@ -50,17 +50,17 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
     assert changed['ok'] and target.read_bytes().endswith(b'a + b\r\n') and store.record.changes
     conflict = execute(runtime, "editor", {"operation": "patch", "path": "calc.py", "patch": patch, "expected_sha256": digest}, "conflict")
     assert not conflict["ok"] and conflict["error"]["code"] == "patch_conflict"
-    shell = execute(runtime, "run_commands", {"operation": "run", "command": [sys.executable, "-c", "print('ok')"], "cwd": ".", "timeout_seconds": 10})
+    shell = execute(runtime, "run_commands", {"command": [sys.executable, "-c", "print('ok')"], "cwd": ".", "timeout_seconds": 10})
     assert shell["ok"] and shell["data"]["exit_code"] == 0 and "ok" in shell["data"]["stdout"]
     runtime.set_permission("user")
-    blocked = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "commit", "-m", "x"], "cwd": "."}, "blocked_git")
+    blocked = execute(runtime, "run_commands", {"command": ["git", "commit", "-m", "x"], "cwd": "."}, "blocked_git")
     assert blocked["pending"]
     program, *args = blocked["preview"]["command"]
     assert Path(program).is_absolute() and Path(program).stem.casefold() == "git"
     assert args == ["commit", "-m", "x"]
     runtime.set_permission("auto")
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
-    status = execute(runtime, "run_commands", {"operation": "run", "command": ["git", "rev-parse", "--show-toplevel"], "cwd": "."}, "git_toplevel")
+    status = execute(runtime, "run_commands", {"command": ["git", "rev-parse", "--show-toplevel"], "cwd": "."}, "git_toplevel")
     assert status["ok"] and "workspace" in status["data"]["stdout"]
     machine = RunStateMachine(store); store.record.run_runtime['lifecycle'] = "ready"
     machine.transition("prepare", "test"); machine.transition("execute", "test")
@@ -70,14 +70,14 @@ def test_p2_prompt_state_file_patch_shell_and_git(tmp_path):
 def test_p2_single_file_pytest_project_is_detected(tmp_path):
     workspace, _, _, runtime = runtime_for(tmp_path)
     (workspace / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-    result = execute(runtime, "run_commands", {"operation": "run"})
+    result = execute(runtime, "run_commands", {})
     assert result["ok"] is True
     assert result["data"]["exit_code"] == 0
 
 
 def test_p4_catalog_includes_patch_tool(tmp_path):
     _, _, _, runtime = runtime_for(tmp_path)
-    enabled = {item["name"] for item in runtime.inventory()["enabled"]}
+    enabled = {item["name"] for group in runtime.inventory().values() for item in group if item["enabled"]}
     assert "editor" in enabled
 
 
@@ -91,28 +91,32 @@ def test_p5_generated_output_can_be_read_by_relative_name(tmp_path):
 
 
 def test_p5_optional_dependency_status_is_visible():
-    spec = ToolSpec(parameters=object_schema([]), permission="read", dependencies=("genesisai_dependency_that_does_not_exist",))
+    spec = ToolSpec(parameters=object_schema([]), permission="read", dependencies=("genesisai_dependency_that_does_not_exist",), dependency_extra="office")
     assert "genesisai[office]" in spec.unavailable_reason()
 
 
-def test_p4_skill_priority_strict_schema_and_core_tools(tmp_path):
+def test_skills_do_not_implicitly_load_or_override_builtin(tmp_path):
     workspace = tmp_path / "workspace"; workspace.mkdir()
     project_root = tmp_path / "app" / "project"
     root = project_root / "skills" / "bug_fix"; root.mkdir(parents=True)
     (root / "skill.yaml").write_text("name: bug_fix\ndescription: project override\nentry: SKILL.md\ntools: [read_files]\n", encoding="utf-8")
     (root / "SKILL.md").write_text("# Project flow\n", encoding="utf-8")
-    registry = ToolRegistry(); skills = SkillRegistry(workspace, registry, project_root=project_root)
+    registry = ToolRegistry(); skills = SkillRegistry(registry)
     item = skills.describe("bug_fix", include_content=True)
-    assert item["source"] == "project" and "builtin" in item["overridden"] and "Project flow" in item["content"]
-    assert skills.load(["bug_fix"]) == ["bug_fix"]
-    with pytest.raises(SkillError): skills.load(["bug_fix", "code_review", "web_research"])
+    assert item["source"] == "builtin" and "Project flow" not in item["content"]
+    assert (root / "SKILL.md").read_text(encoding="utf-8") == "# Project flow\n"
+    assert skills.load("bug_fix", "run") == {"bug_fix": "run"}
+    active = {}
+    for name in ("bug_fix", "code_review", "web_research"):
+        active = skills.load(name, "run", active)
+    assert active == {name: "run" for name in ("bug_fix", "code_review", "web_research")}
 
 
 def test_p5_docx_xlsx_pdf_and_optional_pptx(tmp_path):
     workspace, output, store, runtime = runtime_for(tmp_path, active=("docx_create", "docx_read", "xlsx_create", "xlsx_read", "pdf_create", "pdf_read"))
     doc = execute(runtime, "docx_create", {"path": "sample.docx", "title": "Report", "paragraphs": ["Hello"], "table": [["A", "B"]]})
     assert doc["ok"] and detect_file_type(output / "sample.docx") == "docx"
-    read_doc = execute(runtime, "docx_read", {"path": str(output / "sample.docx")}); assert read_doc["ok"] and any(p["text"] == "Hello" for p in read_doc["data"]["paragraphs"])
+    read_doc = execute(runtime, "docx_read", {"path": str(output / "sample.docx")}); assert read_doc["ok"] and any(p["text"] == "Hello" for p in read_doc["data"]["items"])
     book = execute(runtime, "xlsx_create", {"path": "sample.xlsx", "sheets": {"Data": [[1, 2], ["=A1+B1", None]]}})
     assert book["ok"] and detect_file_type(output / "sample.xlsx") == "xlsx"
     read_book = execute(runtime, "xlsx_read", {"path": str(output / "sample.xlsx")}); assert read_book["ok"] and read_book["data"]["formulas_not_recalculated"]

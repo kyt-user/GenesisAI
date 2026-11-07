@@ -1,4 +1,4 @@
 name: docx_create
 enabled: true
 category: office
-description: 创建基础 DOCX 并重新打开验证产物结构
+description: 创建DOCX或以source为基础批量追加；覆盖须overwrite和expected_sha256，保留备份并原子发布

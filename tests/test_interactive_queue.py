@@ -182,7 +182,10 @@ def test_cancellation_closes_actual_model_socket(monkeypatch, send_headers):
                     for item in model.stream_chat([]):
                         saw_chunk.set()
                 future = worker.submit(control.execute, consume)
-                assert waiting.wait(8)
+                reached_server = waiting.wait(8)
+                if not reached_server and future.done():
+                    future.result()  # Surface a client failure instead of a misleading server wait assertion.
+                assert reached_server
                 if send_headers:
                     assert saw_chunk.wait(3)
                 control.cancel()
@@ -191,7 +194,6 @@ def test_cancellation_closes_actual_model_socket(monkeypatch, send_headers):
                 assert disconnected.wait(3)
         finally:
             control.cancel()
-            model.client.close()
             server.shutdown()
             thread.join()
 

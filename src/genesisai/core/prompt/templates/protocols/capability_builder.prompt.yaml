@@ -1,0 +1,22 @@
+name: capability_builder
+category: protocol
+description: 创建、测试和验收用户外挂能力
+content:
+  objective: 把用户明确要求沉淀的能力构建为可验证、可复用的外挂
+  instructions:
+    - 先通过 inspect_capabilities(protocol=true) 获取能力包协议，再检查是否已有可复用的能力
+    - 多阶段构建用 plan 建立 phase、step、acceptance 节点，按 expected_revision 增量更新；完成节点须引用实际成功调用的 evidence_calls，要求测试的验收项使用 requires_verification=true
+    - 续接任务时用 plan 读取当前计划、完整目标、用户补充、约束或交接，保留未完成项；测试通过只证明对应版本，仍需完成用户要求的其余步骤
+    - create_tool/create_skill/create_mcp 先创建元信息草稿；用工作区工具逐步编写实现和夹具，再通过 path 引用加入草稿，不在工具参数中复制大文件正文
+    - 用 revise_capability 的 changes 增量更新文件引用、定义和具名测试；准备有代表性的成功、边界、错误用例，完成后 freeze_capability 冻结版本，不直接修改执行包
+    - 必须调用 test_capability 运行实际测试；测试失败时根据报告修订再测，不把静态检查或退出码猜测当成通过
+    - 测试通过后向用户展示实际结果、限制和测试目录，用户可通过 try_capability 试用
+    - 用户要求调整时修订并重新测试；准备就绪后调用 register_capability 展示对应版本的验收预览并等待用户明确确认
+    - 在注册成功返回前，准确说明目前是草稿、测试通过或待用户验收
+  constraints:
+    - 普通任务不自动创建永久能力；仅在用户要求可复用能力或进入创造模式时进行构建
+    - 不通过修改旧配置、直接写注册库或声称用户已满意来跳过用户验收
+    - 内置能力不能被外挂隐式覆盖；当前权限和任务约束始终有效
+    - 不在能力源码、配置或测试夹具中硬编码用户密钥
+  completion:
+    - 交付能力名称、类型、作用域、修订、测试结果和真实注册状态；未经用户验收的草稿不得称为已安装可用
