@@ -76,13 +76,70 @@ DEEPSEEK_API_KEY=replace_me
 
 ## 启动
 
-以下三种入口等价：
+### 使用项目虚拟环境
+
+完成安装后，在 GenesisAI 仓库根目录激活虚拟环境：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+在已激活对应环境且位于仓库根目录的前提下，以下三种入口调用同一套 CLI 主逻辑：
 
 ```powershell
 python cli.py
 python -m genesisai
 genesis
 ```
+
+`python cli.py` 需要当前目录中存在 `cli.py`；`python -m genesisai` 需要当前 Python 环境已安装 GenesisAI；`genesis` 需要对应的命令入口位于 PATH 中。如果 PowerShell 提示无法识别 `genesis`，可在仓库根目录直接使用虚拟环境中的入口，无需激活：
+
+```powershell
+.\.venv\Scripts\genesis.exe
+```
+
+### Windows 全局启动
+
+已完成上述安装后，可以把虚拟环境的 `Scripts` 目录加入当前用户的 PATH，以便在任意目录直接运行 `genesis`。在 GenesisAI 仓库根目录执行一次以下 PowerShell 命令，无需管理员权限：
+
+```powershell
+$genesisScripts = (Resolve-Path -LiteralPath '.\.venv\Scripts').Path
+if (-not (Test-Path -LiteralPath (Join-Path $genesisScripts 'genesis.exe'))) {
+    throw '未找到 genesis.exe，请先完成虚拟环境中的项目安装。'
+}
+
+$userPaths = @(
+    [Environment]::GetEnvironmentVariable('Path', 'User') -split ';' |
+        Where-Object { $_ }
+)
+
+if ($userPaths -notcontains $genesisScripts) {
+    [Environment]::SetEnvironmentVariable(
+        'Path',
+        (($userPaths + $genesisScripts) -join ';'),
+        'User'
+    )
+}
+
+# 让当前 PowerShell 立即生效
+if (($env:Path -split ';') -notcontains $genesisScripts) {
+    $env:Path += ";$genesisScripts"
+}
+```
+
+验证入口，并在需要处理的项目目录中启动：
+
+```powershell
+genesis --help
+cd E:\my-project
+genesis --workspace .
+```
+
+配置后无需激活虚拟环境，`genesis` 会使用其安装环境中的 Python；裸写 `python` 仍按 PATH 查找，不保证指向同一环境。此方式依赖现有仓库和 `.venv`，移动仓库或删除虚拟环境后需要更新 PATH 或重建安装。新终端若未识别命令，请完全退出并重新打开 Windows Terminal 或 VS Code。
+
+全局可调用不改变默认工作区：单独运行 `genesis` 仍使用下述默认目录；处理当前目录请使用 `genesis --workspace .`。
+
+### 会话与工作区
 
 普通启动先进入本地首页。直接输入第一条任务开始新会话，空输入框按 ↑ 选择当前工作区最近的五段对话，或用 `/sessions` 浏览所有工作区的历史。打开后按原顺序显示最近三轮，`/history` 显示当前对话全文。仅浏览历史无需模型密钥，也不会创建空会话。
 
@@ -113,25 +170,25 @@ genesis
 
 ## 主要命令
 
-| 命令                                                    | 用途                                     |
-| ------------------------------------------------------- | ---------------------------------------- |
-| `/help`、`/status`、`/history`、`/model`        | 查看使用方法和当前状态                   |
-| `/`、`/sessions`、`/new`、`/resume`、`/cancel`、`/exit` | 选择历史会话、创建会话或管理当前运行 |
-| `/answer 文字或编号`                                    | 回答当前任务的澄清问题                   |
-| `/tools`                                              | 按内置／外挂查看工具及可用状态           |
-| `/capabilities` | 查看内置与外挂的 Tool、Skill、MCP，以及草稿和报告 |
-| `/create_tool 需求`、`/create_skill 需求`、`/create_mcp 需求` | 让 Agent 构建、测试并提交用户验收 |
-| `/queue`、`/queue resume`、`/queue clear` | 查看、继续或清空本次交互的排队消息 |
-| `/pet` | 选择或切换毛球、雷伊桌宠，任务运行中也可使用 |
-| `/skills list\|search\|show\|load\|unload`                | 管理按需 Skill                           |
-| `/logs`                                               | 查看当前会话完整 JSONL 日志路径          |
-| `/project`、`/project rebuild`                         | 查看项目任务与知识，重建工程索引 |
-| `/permissions`、`/approve`、`/reject` | 查看或处理权限                           |
-| `/budget`、`/trace`、`/compact`                   | 查看预算、脱敏执行链和压缩上下文         |
-| `/diff` | 查看本次文件变更记录 |
-| `/details` | 展开或收起工具输出 |
-| `/workflow [名称]` | 列出工作区工作流，或展开指定工作流并执行 |
-| `/auth` | 配置提供商、密钥与模型 |
+| 命令                                                                | 用途                                              |
+| ------------------------------------------------------------------- | ------------------------------------------------- |
+| `/help`、`/status`、`/history`、`/model`                    | 查看使用方法和当前状态                            |
+| `/`、`/sessions`、`/new`、`/resume`、`/cancel`、`/exit` | 选择历史会话、创建会话或管理当前运行              |
+| `/answer 文字或编号`                                              | 回答当前任务的澄清问题                            |
+| `/tools`                                                          | 按内置／外挂查看工具及可用状态                    |
+| `/capabilities`                                                   | 查看内置与外挂的 Tool、Skill、MCP，以及草稿和报告 |
+| `/create_tool 需求`、`/create_skill 需求`、`/create_mcp 需求` | 让 Agent 构建、测试并提交用户验收                 |
+| `/queue`、`/queue resume`、`/queue clear`                     | 查看、继续或清空本次交互的排队消息                |
+| `/pet`                                                            | 选择或切换毛球、雷伊桌宠，任务运行中也可使用      |
+| `/skills list\|search\|show\|load\|unload`                            | 管理按需 Skill                                    |
+| `/logs`                                                           | 查看当前会话完整 JSONL 日志路径                   |
+| `/project`、`/project rebuild`                                  | 查看项目任务与知识，重建工程索引                  |
+| `/permissions`、`/approve`、`/reject`                         | 查看或处理权限                                    |
+| `/budget`、`/trace`、`/compact`                               | 查看预算、脱敏执行链和压缩上下文                  |
+| `/diff`                                                           | 查看本次文件变更记录                              |
+| `/details`                                                        | 展开或收起工具输出                                |
+| `/workflow [名称]`                                                | 列出工作区工作流，或展开指定工作流并执行          |
+| `/auth`                                                           | 配置提供商、密钥与模型                            |
 
 交互终端支持输入 `/` 实时选择命令、Tab 补全、Enter 发送、Alt+Enter 换行。`/help` 打开命令选择器，`/sessions` 选择历史会话，操作确认使用方向键和回车。
 
@@ -165,6 +222,10 @@ genesis
 代码与常用文本支持读取、搜索、创建、哈希保护补丁、移动和删除，并保持可识别的编码、BOM 与换行。DOCX/XLSX 支持读取、创建和有限修改；PPTX/PDF 支持读取和基础创建。办公能力需要 `.[office]`，公式不会在 GenesisAI 中重新计算，任意原稿的高保真编辑不在 V1 范围内。
 
 Office 默认写新路径；显式覆盖需要 `overwrite=true`、目标当前 `expected_sha256` 和有效写入授权，成功覆盖保留前态备份。OCR 使用 `.[ocr]`；音视频工具依赖 FFmpeg，语音转写另需 `.[speech]` 和本地 Whisper 模型。安装方式、分页、产物校验与识别边界见[本地文档与媒体能力](docs/本地文档与媒体能力.md)。
+
+## 阶段目标
+
+当前“单 Agent 开发底座与能力构建”阶段于 2026-11-09 收尾，交付与保留边界见[阶段收尾声明](todo/2026-11-09-stage-closeout.md)。[下一阶段主要目标](todo/2026-11-09-next-stage-goals.md)集中于 BUG 修复、能力扩展、长任务的计划实施与验收，以及前端 UI 制作与调试能力；清单中的目标尚待实施。
 
 ## 验证
 
